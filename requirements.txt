@@ -1,0 +1,25 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic
+pydantic-settings
+
+# Document Processing
+PyPDF2
+python-docx
+markdown
+pdfplumber # Better PDF extraction with layout
+pymupdf
+
+# For better table extraction
+tabulate
+
+# Vector Database
+chromadb
+
+# AWS Bedrock
+boto3
+botocore
+# Utilities
+python-dotenv
+aiofiles
