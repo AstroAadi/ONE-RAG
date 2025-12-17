@@ -1,54 +1,36 @@
 """
-Streamlined Document Text Extractor
-- NO JSON file generation (just markdown)
-- Treats tables/charts as images with LLM descriptions
-- Stores image paths with descriptions in markdown
-- Fast and efficient
+Page-by-Page PDF Extractor
+Converts tables, charts, graphs to images with LLM descriptions
+Preserves exact layout and reading order
+FIXED: Robust error handling for problematic PDFs
 """
 
 import os
 from typing import Tuple, List, Dict, Optional
-from docx import Document
-import nltk
 from pathlib import Path
 import base64
 import boto3
-import concurrent.futures
+import fitz  # PyMuPDF
+from PIL import Image
+import io
+import json
+import logging
 
-# Download required NLTK data
-def _download_nltk_data():
-    resources = [
-        ('tokenizers/punkt_tab', 'punkt_tab'),
-        ('taggers/averaged_perceptron_tagger_eng', 'averaged_perceptron_tagger_eng'),
-    ]
-    for path, name in resources:
-        try:
-            nltk.data.find(path)
-        except LookupError:
-            nltk.download(name, quiet=True)
-
-_download_nltk_data()
-
-# Import unstructured
-try:
-    from unstructured.partition.pdf import partition_pdf
-    import pandas as pd
-except ImportError:
-    raise ImportError("Install: pip install \"unstructured[all-docs]\" pandas pillow")
+logger = logging.getLogger(__name__)
 
 
-class DocumentTextExtractor:
+class PageByPagePDFExtractor:
     """
-    Streamlined extractor - outputs only markdown with image references
+    Extract PDF page-by-page, converting all non-text elements to images
     """
     
     def __init__(self, aws_region: str = "us-east-1", aws_profile: Optional[str] = None):
-        """Initialize with AWS Bedrock for image/table analysis"""
+        """Initialize with Bedrock for image descriptions"""
         self.aws_region = aws_region
         self.aws_profile = aws_profile
         self.bedrock_runtime = None
         
-        # Initialize Bedrock client
+        # Initialize Bedrock
         try:
             if aws_profile:
                 session = boto3.Session(profile_name=aws_profile, region_name=aws_region)
@@ -56,339 +38,467 @@ class DocumentTextExtractor:
             else:
                 self.bedrock_runtime = boto3.client('bedrock-runtime', region_name=aws_region)
         except Exception as e:
-            print(f"Warning: Bedrock not available for image analysis: {e}")
+            print(f"Warning: Bedrock not available: {e}")
             self.bedrock_runtime = None
-        
+    
     @staticmethod
     def extract_text_from_document(
-        file_path: str, 
+        file_path: str,
         file_extension: str,
         aws_region: str = "us-east-1",
         aws_profile: Optional[str] = None
     ) -> Tuple[str, bool]:
-        """
-        Extract text and return markdown only (no JSON)
+        """Main extraction entry point"""
         
-        Returns:
-            Tuple of (markdown_text, success)
-        """
-        extractor = DocumentTextExtractor(aws_region, aws_profile)
+        extractor = PageByPagePDFExtractor(aws_region, aws_profile)
         
         ext = file_extension.lower().lstrip('.')
         if ext == 'pdf':
-            return extractor.extract_text_from_pdf(file_path)
+            return extractor.extract_pdf_page_by_page(file_path)
         elif ext in ['docx', 'doc']:
-            return extractor.extract_text_from_docx(file_path)
+            # DOCX handled separately (simpler)
+            from docx import Document
+            return extractor.extract_docx_simple(file_path)
         else:
             return "", False
-
-    def extract_text_from_pdf(self, file_path: str) -> Tuple[str, bool]:
-        """PDF extraction with fallback strategies"""
-        result = self._extract_pdf_fast(file_path)  # Start with fast
-        if not result[1]:
-            result = self._extract_pdf_hi_res(file_path)
-        if not result[1]:
-            result = self._extract_pdf_basic(file_path)
-        return result
-
-    def _extract_pdf_fast(self, file_path: str) -> Tuple[str, bool]:
-        """Fast strategy - good for most PDFs"""
+    
+    def extract_pdf_page_by_page(self, pdf_path: str) -> Tuple[str, bool]:
+        """
+        Extract PDF page by page
+        Convert tables/images/charts to image files with descriptions
+        """
         try:
+            # Create image output directory
             image_output_dir = os.path.join(
-                os.path.dirname(file_path), 
+                os.path.dirname(pdf_path),
                 "extracted_images",
-                Path(file_path).stem
+                Path(pdf_path).stem
             )
             os.makedirs(image_output_dir, exist_ok=True)
-
-            elements = partition_pdf(
-                filename=file_path,
-                strategy="fast",
-                infer_table_structure=True,
-                languages=["eng"],
-                extract_images_in_pdf=True,
-                extract_image_block_types=["Image", "Table", "Figure"],
-                extract_image_block_output_dir=image_output_dir,
-            )
-
-            return self._process_elements(elements, file_path, image_output_dir)
-
-        except Exception as e:
-            print(f"Fast extraction failed: {str(e)}")
-            return "", False
-
-    def _extract_pdf_hi_res(self, file_path: str) -> Tuple[str, bool]:
-        """Hi-res strategy - for complex layouts"""
-        try:
-            image_output_dir = os.path.join(
-                os.path.dirname(file_path), 
-                "extracted_images",
-                Path(file_path).stem
-            )
-            os.makedirs(image_output_dir, exist_ok=True)
-
-            elements = partition_pdf(
-                filename=file_path,
-                strategy="hi_res",
-                infer_table_structure=True,
-                languages=["eng"],
-                extract_images_in_pdf=True,
-                extract_image_block_types=["Image", "Table", "Figure"],
-                extract_image_block_output_dir=image_output_dir,
-            )
-
-            return self._process_elements(elements, file_path, image_output_dir)
-
-        except Exception as e:
-            print(f"Hi-res extraction failed: {str(e)}")
-            return "", False
-
-    def _extract_pdf_basic(self, file_path: str) -> Tuple[str, bool]:
-        """Basic strategy - most compatible"""
-        try:
-            elements = partition_pdf(filename=file_path, strategy="auto")
-            return self._process_elements(elements, file_path)
-        except Exception as e:
-            print(f"Basic extraction failed: {str(e)}")
-            return "", False
-
-    def _process_elements(
-        self, 
-        elements, 
-        file_path: str,
-        image_dir: Optional[str] = None
-    ) -> Tuple[str, bool]:
-        """
-        Process elements into markdown with image references
-        """
-        try:
-            markdown_parts = []
-            current_section = None
             
-            # Collect all images/tables for batch processing
-            visual_elements = {}
+            # Open PDF
+            doc = fitz.open(pdf_path)
             
-            for idx, element in enumerate(elements):
-                element_type = self._get_element_type(element)
-                page_num = getattr(element.metadata, 'page_number', 0) if hasattr(element, 'metadata') else 0
-                
-                # Handle different element types
-                if element_type == 'heading':
-                    content = self._get_text_content(element)
-                    level = self._detect_heading_level(element)
-                    current_section = content
-                    markdown_parts.append(f"\n{'#' * level} {content}\n")
-                
-                elif element_type == 'text':
-                    content = self._get_text_content(element)
-                    if content.strip():
-                        markdown_parts.append(content)
-                
-                elif element_type == 'list':
-                    content = self._get_text_content(element)
-                    if content.strip():
-                        # Format as list if not already
-                        if not content.startswith(('- ', '* ', '1.')):
-                            content = f"- {content}"
-                        markdown_parts.append(content)
-                
-                elif element_type in ['table', 'image', 'figure', 'chart']:
-                    # Store for batch processing
-                    visual_elements[idx] = {
-                        'element': element,
-                        'type': element_type,
-                        'page': page_num,
-                        'section': current_section
-                    }
+            markdown_pages = []
+            total_images_created = 0
             
-            # Batch process visual elements
-            if visual_elements and self.bedrock_runtime:
-                print(f"Analyzing {len(visual_elements)} visual elements...")
-                visual_descriptions = self._batch_analyze_visuals(
-                    visual_elements, 
-                    image_dir, 
-                    file_path
-                )
-                
-                # Insert visual descriptions in order
-                for idx in sorted(visual_elements.keys()):
-                    if idx in visual_descriptions:
-                        markdown_parts.insert(
-                            self._find_insertion_point(markdown_parts, idx),
-                            visual_descriptions[idx]
-                        )
+            print(f"Processing {len(doc)} pages...")
             
-            markdown_content = "\n\n".join(markdown_parts)
-            
-            if not markdown_content.strip():
-                return "", False
-                
-            return markdown_content, True
-
-        except Exception as e:
-            print(f"Error processing elements: {str(e)}")
-            return "", False
-
-    def _batch_analyze_visuals(
-        self,
-        visual_elements: Dict,
-        image_dir: Optional[str],
-        file_path: str
-    ) -> Dict[int, str]:
-        """
-        Batch analyze all visual elements (images, tables, charts)
-        Returns markdown snippets with image references
-        """
-        results = {}
-        
-        # Process in parallel (max 3 concurrent)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            future_to_idx = {}
-            
-            for idx, visual_data in visual_elements.items():
-                element = visual_data['element']
-                visual_type = visual_data['type']
-                page = visual_data['page']
-                section = visual_data['section']
-                
-                # Get image path
-                image_path = None
-                if hasattr(element, 'metadata'):
-                    image_path = getattr(element.metadata, 'image_path', None)
-                
-                # Get initial caption/text
-                caption = ""
-                if hasattr(element, 'metadata'):
-                    caption = getattr(element.metadata, 'caption', '')
-                if not caption:
-                    caption = self._get_text_content(element)
-                
-                # Submit for analysis
-                if image_path and os.path.exists(image_path):
-                    future = executor.submit(
-                        self._analyze_and_format_visual,
-                        image_path,
-                        visual_type,
-                        caption,
-                        page,
-                        section,
-                        file_path
-                    )
-                    future_to_idx[future] = idx
-                else:
-                    # No image file - just use text content
-                    results[idx] = f"\n**[{visual_type.upper()}]** {caption}\n"
-            
-            # Collect results
-            for future in concurrent.futures.as_completed(future_to_idx):
-                idx = future_to_idx[future]
+            for page_num in range(len(doc)):
                 try:
-                    result = future.result(timeout=15)
-                    if result:
-                        results[idx] = result
-                        print(f"✓ Analyzed visual {idx}")
-                except Exception as e:
-                    print(f"✗ Visual {idx} analysis failed: {e}")
-                    # Fallback
-                    visual_data = visual_elements[idx]
-                    results[idx] = f"\n**[{visual_data['type'].upper()}]** (Page {visual_data['page']})\n"
+                    page = doc[page_num]
+                    
+                    print(f"\nProcessing page {page_num + 1}/{len(doc)}...")
+                    
+                    # Process page
+                    page_markdown, images_count = self._process_page(
+                        page,
+                        page_num,
+                        image_output_dir,
+                        pdf_path
+                    )
+                    
+                    markdown_pages.append(page_markdown)
+                    total_images_created += images_count
+                    
+                    print(f"  ✓ Page {page_num + 1}: {images_count} images created")
+                    
+                except Exception as page_error:
+                    print(f"  ⚠ Error processing page {page_num + 1}: {page_error}")
+                    # Add a placeholder for failed page
+                    markdown_pages.append(f"\n## Page {page_num + 1}\n\n[Error processing this page]\n")
+                    continue
+            
+            doc.close()
+            
+            # Combine all pages
+            final_markdown = "\n\n---PAGE BREAK---\n\n".join(markdown_pages)
+            
+            print(f"\n✓ Extraction complete: {total_images_created} total images")
+            
+            return final_markdown, True
+            
+        except Exception as e:
+            print(f"Error extracting PDF: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return "", False
+    
+    def _process_page(
+        self,
+        page,
+        page_num: int,
+        image_output_dir: str,
+        pdf_path: str
+    ) -> Tuple[str, int]:
+        """
+        Process a single page
+        Returns: (markdown_content, images_created_count)
+        """
         
-        return results
-
-    def _analyze_and_format_visual(
+        page_markdown = []
+        images_created = 0
+        
+        # Add page header
+        page_markdown.append(f"\n## Page {page_num + 1}\n")
+        
+        # Extract text blocks with position info
+        try:
+            blocks = page.get_text("dict")["blocks"]
+        except Exception as e:
+            logger.warning(f"Could not extract text blocks from page {page_num + 1}: {e}")
+            blocks = []
+        
+        # Extract images - with error handling
+        try:
+            image_list = page.get_images(full=True)  # Use full=True for complete image info
+        except Exception as e:
+            logger.warning(f"Could not extract image list from page {page_num + 1}: {e}")
+            image_list = []
+        
+        # Detect tables using heuristics
+        tables = self._detect_tables_on_page(page, blocks)
+        
+        # Process all elements in reading order (top to bottom)
+        all_elements = []
+        
+        # Add text blocks
+        for block_idx, block in enumerate(blocks):
+            if block.get("type") == 0:  # Text block
+                bbox = block["bbox"]
+                text = self._extract_text_from_block(block)
+                if text.strip():
+                    all_elements.append({
+                        'type': 'text',
+                        'bbox': bbox,
+                        'y_position': bbox[1],  # Top Y coordinate for sorting
+                        'content': text,
+                        'block_idx': block_idx
+                    })
+        
+        # Add tables
+        for table_idx, table_bbox in enumerate(tables):
+            all_elements.append({
+                'type': 'table',
+                'bbox': table_bbox,
+                'y_position': table_bbox[1],
+                'table_idx': table_idx
+            })
+        
+        # Add images - with robust error handling
+        for img_idx, img_info in enumerate(image_list):
+            try:
+                # Try to get bbox - this can fail for some PDFs
+                img_bbox = None
+                try:
+                    img_bbox = page.get_image_bbox(img_info)
+                except (ValueError, AttributeError) as e:
+                    # If get_image_bbox fails, try alternative method
+                    logger.debug(f"get_image_bbox failed for image {img_idx}: {e}")
+                    # Use a default position at the end of page
+                    img_bbox = fitz.Rect(0, 9999, 100, 10000)  # Will be sorted to end
+                
+                if img_bbox:
+                    all_elements.append({
+                        'type': 'image',
+                        'bbox': img_bbox,
+                        'y_position': img_bbox[1] if img_bbox else 9999,
+                        'img_idx': img_idx,
+                        'img_info': img_info
+                    })
+            except Exception as e:
+                logger.warning(f"Could not process image {img_idx} metadata: {e}")
+                continue
+        
+        # Sort by Y position (reading order: top to bottom)
+        all_elements.sort(key=lambda x: x['y_position'])
+        
+        # Process elements in order
+        for element in all_elements:
+            if element['type'] == 'text':
+                # Add text content
+                text = element['content']
+                
+                # Detect if it's a heading (larger font, bold, etc.)
+                if self._is_heading(text):
+                    # Count heading level (simple heuristic)
+                    if len(text) < 50 and text.isupper():
+                        page_markdown.append(f"### {text}\n")
+                    elif len(text) < 80:
+                        page_markdown.append(f"#### {text}\n")
+                    else:
+                        page_markdown.append(f"{text}\n")
+                else:
+                    page_markdown.append(f"{text}\n")
+            
+            elif element['type'] == 'table':
+                # Convert table to image
+                table_bbox = element['bbox']
+                
+                try:
+                    # Capture table as image
+                    image_path = os.path.join(
+                        image_output_dir,
+                        f"page{page_num + 1}_table{element['table_idx'] + 1}.png"
+                    )
+                    
+                    self._capture_region_as_image(
+                        page,
+                        table_bbox,
+                        image_path
+                    )
+                    
+                    # Generate description
+                    description = self._generate_description(
+                        image_path,
+                        "table",
+                        page_num + 1
+                    )
+                    
+                    # Add to markdown
+                    rel_path = os.path.relpath(image_path, start=os.path.dirname(pdf_path))
+                    
+                    page_markdown.append(f"\n---\n")
+                    page_markdown.append(f"**[TABLE]** Table {element['table_idx'] + 1}\n\n")
+                    page_markdown.append(f"IMAGE_PATH: {rel_path}\n")
+                    page_markdown.append(f"PAGE: {page_num + 1}\n")
+                    page_markdown.append(f"\nDESCRIPTION:\n{description}\n")
+                    page_markdown.append(f"---\n\n")
+                    
+                    images_created += 1
+                except Exception as table_error:
+                    logger.warning(f"Could not process table {element['table_idx'] + 1}: {table_error}")
+                    page_markdown.append(f"\n[Table {element['table_idx'] + 1} - extraction failed]\n\n")
+            
+            elif element['type'] == 'image':
+                # Extract and save image
+                try:
+                    img_info = element['img_info']
+                    xref = img_info[0]
+                    
+                    image_path = os.path.join(
+                        image_output_dir,
+                        f"page{page_num + 1}_image{element['img_idx'] + 1}.png"
+                    )
+                    
+                    # Extract image from PDF - with error handling
+                    try:
+                        base_image = page.parent.extract_image(xref)
+                        image_bytes = base_image["image"]
+                        
+                        # Save image
+                        with open(image_path, "wb") as img_file:
+                            img_file.write(image_bytes)
+                        
+                        # Generate description
+                        description = self._generate_description(
+                            image_path,
+                            "image",
+                            page_num + 1
+                        )
+                        
+                        # Add to markdown
+                        rel_path = os.path.relpath(image_path, start=os.path.dirname(pdf_path))
+                        
+                        page_markdown.append(f"\n---\n")
+                        page_markdown.append(f"**[IMAGE]** Image {element['img_idx'] + 1}\n\n")
+                        page_markdown.append(f"IMAGE_PATH: {rel_path}\n")
+                        page_markdown.append(f"PAGE: {page_num + 1}\n")
+                        page_markdown.append(f"\nDESCRIPTION:\n{description}\n")
+                        page_markdown.append(f"---\n\n")
+                        
+                        images_created += 1
+                    except Exception as extract_error:
+                        logger.warning(f"Could not extract image {element['img_idx'] + 1}: {extract_error}")
+                        page_markdown.append(f"\n[Image {element['img_idx'] + 1} - extraction failed]\n\n")
+                        
+                except Exception as img_error:
+                    logger.warning(f"Error processing image element: {img_error}")
+                    continue
+        
+        return "\n".join(page_markdown), images_created
+    
+    def _detect_tables_on_page(self, page, blocks) -> List[tuple]:
+        """
+        Detect tables using layout heuristics
+        Returns list of bounding boxes
+        """
+        tables = []
+        
+        try:
+            # Look for patterns: multiple aligned text blocks in grid
+            # Group blocks by Y coordinate (rows)
+            rows = {}
+            for block in blocks:
+                if block.get("type") == 0:  # Text
+                    bbox = block["bbox"]
+                    y = round(bbox[1], 0)  # Round Y to group rows
+                    
+                    if y not in rows:
+                        rows[y] = []
+                    rows[y].append(bbox)
+            
+            # Find potential table regions (multiple aligned rows)
+            table_rows = []
+            sorted_ys = sorted(rows.keys())
+            
+            for i, y in enumerate(sorted_ys):
+                row_boxes = rows[y]
+                
+                # If row has 2+ elements, could be table
+                if len(row_boxes) >= 2:
+                    # Check alignment with previous rows
+                    is_aligned = False
+                    if i > 0:
+                        prev_y = sorted_ys[i-1]
+                        prev_boxes = rows[prev_y]
+                        
+                        # Check if X positions are similar
+                        if len(prev_boxes) >= 2:
+                            x_positions = sorted([b[0] for b in row_boxes])
+                            prev_x_positions = sorted([b[0] for b in prev_boxes])
+                            
+                            # Similar X positions = aligned columns
+                            if self._are_positions_aligned(x_positions, prev_x_positions):
+                                is_aligned = True
+                    
+                    if is_aligned or len(row_boxes) >= 3:
+                        table_rows.append((y, row_boxes))
+            
+            # Group consecutive table rows into table regions
+            if table_rows:
+                current_table_rows = [table_rows[0]]
+                
+                for i in range(1, len(table_rows)):
+                    y, boxes = table_rows[i]
+                    prev_y, _ = table_rows[i-1]
+                    
+                    # If rows are close, add to current table
+                    if y - prev_y < 50:  # Within 50 points
+                        current_table_rows.append((y, boxes))
+                    else:
+                        # End current table, start new
+                        if len(current_table_rows) >= 2:
+                            bbox = self._get_table_bbox(current_table_rows)
+                            tables.append(bbox)
+                        current_table_rows = [(y, boxes)]
+                
+                # Add last table
+                if len(current_table_rows) >= 2:
+                    bbox = self._get_table_bbox(current_table_rows)
+                    tables.append(bbox)
+        
+        except Exception as e:
+            logger.warning(f"Table detection failed: {e}")
+        
+        return tables
+    
+    def _are_positions_aligned(self, positions1: List[float], positions2: List[float], tolerance: float = 10) -> bool:
+        """Check if two lists of positions are aligned"""
+        if len(positions1) != len(positions2):
+            return False
+        
+        for p1, p2 in zip(positions1, positions2):
+            if abs(p1 - p2) > tolerance:
+                return False
+        
+        return True
+    
+    def _get_table_bbox(self, table_rows: List[tuple]) -> tuple:
+        """Calculate bounding box for table region"""
+        all_boxes = []
+        for y, boxes in table_rows:
+            all_boxes.extend(boxes)
+        
+        x0 = min(b[0] for b in all_boxes)
+        y0 = min(b[1] for b in all_boxes)
+        x1 = max(b[2] for b in all_boxes)
+        y1 = max(b[3] for b in all_boxes)
+        
+        # Add small padding
+        padding = 5
+        return (x0 - padding, y0 - padding, x1 + padding, y1 + padding)
+    
+    def _extract_text_from_block(self, block: dict) -> str:
+        """Extract text from a text block"""
+        text_parts = []
+        
+        for line in block.get("lines", []):
+            line_text = ""
+            for span in line.get("spans", []):
+                line_text += span.get("text", "")
+            if line_text.strip():
+                text_parts.append(line_text.strip())
+        
+        return " ".join(text_parts)
+    
+    def _is_heading(self, text: str) -> bool:
+        """Heuristic to detect if text is a heading"""
+        # Short text, all caps, or ends with colon
+        return (
+            len(text) < 100 and
+            (text.isupper() or text.endswith(':') or text.endswith('-:'))
+        )
+    
+    def _capture_region_as_image(
+        self,
+        page,
+        bbox: tuple,
+        output_path: str,
+        zoom: float = 2.0
+    ):
+        """Capture a region of the page as an image"""
+        
+        # Create a rect from bbox
+        rect = fitz.Rect(bbox)
+        
+        # Render with higher resolution
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat, clip=rect)
+        
+        # Save as PNG
+        pix.save(output_path)
+    
+    def _generate_description(
         self,
         image_path: str,
-        visual_type: str,
-        caption: str,
-        page: int,
-        section: Optional[str],
-        file_path: str
+        element_type: str,
+        page_num: int
     ) -> str:
-        """
-        Analyze visual with LLM and format as markdown with image reference
+        """Generate description using Bedrock"""
         
-        Returns markdown like:
-        ---
-        **[TABLE/CHART/IMAGE]** Caption Here
-        
-        IMAGE_PATH: /path/to/image.png
-        PAGE: 5
-        SECTION: Financial Results
-        
-        DESCRIPTION: [LLM generated description]
-        The table shows quarterly revenue data with 4 columns and 5 rows...
-        ---
-        """
-        # Get LLM description
-        description = self._analyze_visual_with_bedrock(image_path, visual_type)
-        
-        if not description:
-            description = caption or f"Visual content from page {page}"
-        
-        # Build markdown with metadata
-        relative_path = os.path.relpath(image_path, start=os.path.dirname(file_path))
-        
-        markdown = f"\n---\n"
-        markdown += f"**[{visual_type.upper()}]** {caption or f'{visual_type.title()} from page {page}'}\n\n"
-        markdown += f"IMAGE_PATH: {relative_path}\n"
-        markdown += f"PAGE: {page}\n"
-        if section:
-            markdown += f"SECTION: {section}\n"
-        markdown += f"\nDESCRIPTION:\n{description}\n"
-        markdown += f"---\n"
-        
-        return markdown
-
-    def _analyze_visual_with_bedrock(
-        self, 
-        image_path: str, 
-        visual_type: str
-    ) -> Optional[str]:
-        """
-        Use Bedrock to analyze image/table/chart
-        """
         if not self.bedrock_runtime:
-            return None
+            return f"{element_type.title()} from page {page_num} (AI description unavailable)"
         
         try:
-            # Read and encode image
+            # Read image
             with open(image_path, 'rb') as f:
                 image_data = base64.standard_b64encode(f.read()).decode('utf-8')
             
-            # Determine media type
-            ext = Path(image_path).suffix.lower()
-            media_types = {
-                '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
-                '.png': 'image/png', '.gif': 'image/gif', '.webp': 'image/webp'
-            }
-            media_type = media_types.get(ext, 'image/jpeg')
-            
-            # Customize prompt based on visual type
-            if visual_type == 'table':
+            # Customize prompt by type
+            if element_type == 'table':
                 prompt = """Describe this table in detail:
-1. What data does it show?
-2. Column headers and row structure
-3. Key values and patterns
-4. Any notable trends or outliers
-Be specific about numbers and labels."""
-            elif visual_type in ['chart', 'figure']:
+1. What data does it show? What is the table about?
+2. How many rows and columns?
+3. Column headers (if visible)
+
+Be specific and detailed."""
+            
+            elif element_type == 'chart':
                 prompt = """Describe this chart/graph:
-1. Type of chart (bar, line, pie, etc.)
-2. What data is being visualized?
-3. Axis labels and scale
-4. Key trends and insights
-5. Any important data points"""
+1. Type (bar, line, pie, etc.)
+2. Title and labels
+3. Data being shown"""
+            
             else:  # image
-                prompt = """Describe this image from a document:
-1. What is shown in the image?
-2. Any text, labels, or captions visible
-3. Relevant details for understanding the document
-4. Key visual elements"""
+                prompt = """Describe this image:
+1. What does it show?
+2. Any text or labels visible?"""
             
             # Call Bedrock
             request_body = {
                 "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": 400,
+                "max_tokens": 300,
                 "messages": [{
                     "role": "user",
                     "content": [
@@ -396,7 +506,7 @@ Be specific about numbers and labels."""
                             "type": "image",
                             "source": {
                                 "type": "base64",
-                                "media_type": media_type,
+                                "media_type": "image/png",
                                 "data": image_data
                             }
                         },
@@ -407,143 +517,69 @@ Be specific about numbers and labels."""
             
             response = self.bedrock_runtime.invoke_model(
                 modelId="us.anthropic.claude-3-5-sonnet-20241022-v2:0",
-                body=__import__('json').dumps(request_body)
+                body=json.dumps(request_body)
             )
             
-            response_body = __import__('json').loads(response['body'].read())
+            response_body = json.loads(response['body'].read())
             
             if 'content' in response_body and response_body['content']:
                 return response_body['content'][0]['text']
             
-            return None
+            return f"{element_type.title()} from page {page_num}"
             
         except Exception as e:
-            print(f"Visual analysis error: {str(e)}")
-            return None
-
-    def _get_element_type(self, element) -> str:
-        """Determine element type from category"""
-        if hasattr(element, 'category'):
-            category = element.category.lower()
-            if 'title' in category or category == 'heading':
-                return 'heading'
-            elif 'table' in category:
-                return 'table'
-            elif 'image' in category:
-                return 'image'
-            elif 'figure' in category or 'figcaption' in category:
-                return 'figure'
-            elif 'list' in category:
-                return 'list'
-        return 'text'
-
-    def _detect_heading_level(self, element) -> int:
-        """Detect heading level (1-6)"""
-        level = 1
-        if hasattr(element, 'metadata'):
-            if hasattr(element.metadata, 'emphasized_text_tag'):
-                tag = element.metadata.emphasized_text_tag
-                if tag and 'h' in str(tag).lower():
-                    try:
-                        level = int(str(tag).lower().replace('h', ''))
-                    except:
-                        pass
-        return min(level, 6)
-
-    def _get_text_content(self, element) -> str:
-        """Extract text content"""
-        if hasattr(element, 'text'):
-            return element.text
-        elif hasattr(element, 'to_markdown'):
-            return element.to_markdown()
-        return str(element)
-
-    def _find_insertion_point(self, markdown_parts: List[str], idx: int) -> int:
-        """Find appropriate insertion point for visual element"""
-        # Insert after corresponding text position
-        # This is a simple heuristic - you might want to improve this
-        return min(idx, len(markdown_parts))
-
-    # =========================================================================
-    # DOCX EXTRACTION
-    # =========================================================================
-
-    def extract_text_from_docx(self, file_path: str) -> Tuple[str, bool]:
-        """DOCX extraction - outputs markdown only"""
+            print(f"  ⚠ Description generation failed: {e}")
+            return f"{element_type.title()} from page {page_num}"
+    
+    def extract_docx_simple(self, file_path: str) -> Tuple[str, bool]:
+        """Simple DOCX extraction"""
         try:
+            from docx import Document
+            
             doc = Document(file_path)
             markdown_parts = []
-            current_section = None
             
             for element in doc.element.body:
-                # Handle Paragraphs
                 if element.tag.endswith('p'):
                     para_obj = next((p for p in doc.paragraphs if p._element == element), None)
-                    
                     if para_obj and para_obj.text.strip():
-                        style = para_obj.style.name.lower()
                         text = para_obj.text.strip()
+                        style = para_obj.style.name.lower()
                         
-                        if 'heading' in style or 'title' in style:
+                        if 'heading' in style:
                             level = 1
-                            if 'heading' in style:
-                                try:
-                                    level = int(style.split()[-1])
-                                except:
-                                    level = 1
-                            current_section = text
-                            markdown_parts.append(f"\n{'#' * level} {text}\n")
-                        
-                        elif 'list' in style:
-                            markdown_parts.append(f"- {text}")
-                        
+                            try:
+                                level = int(style.split()[-1])
+                            except:
+                                pass
+                            markdown_parts.append(f"\n{'#' * (level + 1)} {text}\n")
                         else:
-                            if para_obj.runs and para_obj.runs[0].bold and len(text) < 100:
-                                markdown_parts.append(f"**{text}**")
-                            else:
-                                markdown_parts.append(text)
+                            markdown_parts.append(text)
                 
-                # Handle Tables
                 elif element.tag.endswith('tbl'):
                     table_obj = next((t for t in doc.tables if t._element == element), None)
-                    
                     if table_obj:
                         rows = []
                         for row in table_obj.rows:
-                            cell_data = [cell.text.strip().replace('\n', ' ') for cell in row.cells]
-                            rows.append(cell_data)
+                            cells = [cell.text.strip() for cell in row.cells]
+                            rows.append(cells)
                         
                         if rows:
-                            markdown_table = self._convert_table_to_markdown(rows)
-                            markdown_parts.append(markdown_table)
+                            # Convert to markdown table
+                            max_cols = max(len(r) for r in rows)
+                            rows = [r + [''] * (max_cols - len(r)) for r in rows]
+                            
+                            md_table = ["\n"]
+                            md_table.append("| " + " | ".join(rows[0]) + " |")
+                            md_table.append("| " + " | ".join(["---"] * max_cols) + " |")
+                            for row in rows[1:]:
+                                md_table.append("| " + " | ".join(row) + " |")
+                            md_table.append("")
+                            
+                            markdown_parts.append("\n".join(md_table))
             
-            markdown_content = "\n\n".join(markdown_parts)
-            return markdown_content, True
+            return "\n\n".join(markdown_parts), True
             
         except Exception as e:
-            print(f"Error extracting DOCX: {e}")
+            print(f"DOCX extraction error: {e}")
             return "", False
-
-    @staticmethod
-    def _convert_table_to_markdown(rows: List[List[str]]) -> str:
-        """Convert table to markdown"""
-        if not rows:
-            return ""
-        
-        rows = [r for r in rows if any(str(c).strip() for c in r)]
-        if not rows:
-            return ""
-
-        max_cols = max(len(r) for r in rows)
-        rows = [r + [""] * (max_cols - len(r)) for r in rows]
-        
-        header = rows[0]
-        md = ["\n"]
-        md.append("| " + " | ".join(str(c).replace("|", "\\|") for c in header) + " |")
-        md.append("| " + " | ".join(["---"] * max_cols) + " |")
-        
-        for row in rows[1:]:
-            md.append("| " + " | ".join(str(c).replace("|", "\\|") for c in row) + " |")
-        
-        md.append("")
-        return "\n".join(md)

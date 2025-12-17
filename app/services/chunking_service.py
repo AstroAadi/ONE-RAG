@@ -2,6 +2,7 @@
 Streamlined Chunking Service
 Works with simple markdown text (no complex structured data needed)
 Preserves image references in chunks
+FIXED: Ensures chunks never exceed max_chunk_size for embeddings
 """
 
 from typing import List, Dict, Any, Optional
@@ -20,9 +21,13 @@ class SemanticChunkingService:
         chunk_overlap: int = 200,
         max_chunk_size: int = 1800
     ):
-        self.chunk_size = min(chunk_size, max_chunk_size)
-        self.chunk_overlap = chunk_overlap
-        self.max_chunk_size = max_chunk_size
+        # CRITICAL: Cohere embedding model max is 2048 chars
+        # Set max_chunk_size to safe limit with buffer
+        self.max_chunk_size = min(max_chunk_size, 1800)
+        self.chunk_size = min(chunk_size, self.max_chunk_size)
+        self.chunk_overlap = min(chunk_overlap, self.chunk_size // 2)
+        
+        print(f"Chunking config: chunk_size={self.chunk_size}, max={self.max_chunk_size}, overlap={self.chunk_overlap}")
     
     def split_document_into_chunks(
         self,
@@ -42,11 +47,25 @@ class SemanticChunkingService:
         # Split by visual content blocks (images/tables) first
         sections = self._split_by_visual_blocks(markdown_text)
         
+        print(f"Split into {len(sections)} sections by visual blocks")
+        
         chunk_index = 0
-        for section in sections:
+        for i, section in enumerate(sections):
             section_chunks = self._chunk_section(section, chunk_index, base_metadata)
-            chunks.extend(section_chunks)
-            chunk_index += len(section_chunks)
+            
+            # CRITICAL: Validate all chunks are under max size
+            for chunk in section_chunks:
+                if len(chunk['text']) > self.max_chunk_size:
+                    print(f"WARNING: Chunk {chunk['chunk_id']} exceeds max size: {len(chunk['text'])} chars")
+                    # Force split this chunk
+                    sub_chunks = self._force_split_chunk(chunk, chunk_index, base_metadata)
+                    chunks.extend(sub_chunks)
+                    chunk_index += len(sub_chunks)
+                else:
+                    chunks.append(chunk)
+                    chunk_index += 1
+        
+        print(f"Created {len(chunks)} total chunks")
         
         # Add parent-child relationships
         chunks = self._create_parent_child_relationships(chunks)
@@ -73,18 +92,26 @@ class SemanticChunkingService:
             if part.startswith('---') and part.endswith('---\n'):
                 # Add visual block to current section
                 current_section += part
-                # Visual blocks should stay with their context
-                sections.append(current_section)
-                current_section = ""
+                
+                # If section is getting large, save it
+                if len(current_section) > self.chunk_size * 1.5:
+                    sections.append(current_section)
+                    current_section = ""
             else:
                 # Regular text
-                current_section += part
+                if len(current_section) + len(part) > self.chunk_size * 2:
+                    # Save current section if it's getting large
+                    if current_section.strip():
+                        sections.append(current_section)
+                    current_section = part
+                else:
+                    current_section += part
         
         # Add remaining text
         if current_section.strip():
             sections.append(current_section)
         
-        return sections
+        return sections if sections else [text]
     
     def _chunk_section(
         self,
@@ -98,7 +125,7 @@ class SemanticChunkingService:
         chunks = []
         
         # Check if section contains visual content
-        has_visual = 'IMAGE_PATH:' in section
+        has_visual = 'IMAGE_PATH:' in section or '**[TABLE]**' in section
         
         # If section is small enough, keep as one chunk
         if len(section) <= self.chunk_size:
@@ -159,8 +186,21 @@ class SemanticChunkingService:
                     ))
                     chunk_index += 1
                 
-                # Start new chunk
-                current_chunk = part
+                # If part itself is too large, force split it
+                if len(part) > self.max_chunk_size:
+                    sub_parts = self._split_large_text(part, self.chunk_size)
+                    for sub_part in sub_parts:
+                        has_vis = 'IMAGE_PATH:' in sub_part
+                        chunks.append(self._create_chunk_dict(
+                            text=sub_part.strip(),
+                            chunk_index=chunk_index,
+                            base_metadata=base_metadata,
+                            has_visual=has_vis
+                        ))
+                        chunk_index += 1
+                    current_chunk = ""
+                else:
+                    current_chunk = part
             else:
                 current_chunk += part
         
@@ -211,18 +251,21 @@ class SemanticChunkingService:
                     
                     # Add overlap
                     overlap = self._get_overlap_text(current_chunk)
-                    current_chunk = overlap + "\n\n" + para
+                    current_chunk = overlap
+                
+                # If paragraph too large, split by sentences
+                if len(para) > self.max_chunk_size:
+                    sentence_chunks = self._split_by_sentences(
+                        para, 
+                        chunk_index, 
+                        base_metadata
+                    )
+                    chunks.extend(sentence_chunks)
+                    chunk_index += len(sentence_chunks)
+                    current_chunk = ""
                 else:
-                    # Paragraph too large, split by sentences
-                    if len(para) > self.max_chunk_size:
-                        sentence_chunks = self._split_by_sentences(
-                            para, 
-                            chunk_index, 
-                            base_metadata
-                        )
-                        chunks.extend(sentence_chunks)
-                        chunk_index += len(sentence_chunks)
-                        current_chunk = ""
+                    if current_chunk:
+                        current_chunk += "\n\n" + para
                     else:
                         current_chunk = para
             else:
@@ -256,7 +299,7 @@ class SemanticChunkingService:
         chunk_index = start_index
         
         for sentence in sentences:
-            if len(current_chunk) + len(sentence) <= self.max_chunk_size:
+            if len(current_chunk) + len(sentence) <= self.chunk_size:
                 current_chunk += (" " if current_chunk else "") + sentence
             else:
                 if current_chunk:
@@ -284,6 +327,50 @@ class SemanticChunkingService:
         
         return chunks
     
+    def _split_large_text(self, text: str, target_size: int) -> List[str]:
+        """Force split large text into smaller pieces"""
+        parts = []
+        while len(text) > target_size:
+            # Try to find a good break point
+            break_point = text.rfind('\n', 0, target_size)
+            if break_point == -1 or break_point < target_size // 2:
+                break_point = text.rfind('. ', 0, target_size)
+            if break_point == -1 or break_point < target_size // 2:
+                break_point = text.rfind(' ', 0, target_size)
+            if break_point == -1:
+                break_point = target_size
+            
+            parts.append(text[:break_point].strip())
+            text = text[break_point:].strip()
+        
+        if text:
+            parts.append(text)
+        
+        return parts
+    
+    def _force_split_chunk(
+        self,
+        chunk: Dict,
+        start_index: int,
+        base_metadata: Dict
+    ) -> List[Dict]:
+        """Force split a chunk that's too large"""
+        text = chunk['text']
+        sub_chunks = []
+        
+        parts = self._split_large_text(text, self.chunk_size)
+        
+        for i, part in enumerate(parts):
+            sub_chunk = self._create_chunk_dict(
+                text=part,
+                chunk_index=start_index + i,
+                base_metadata=base_metadata,
+                has_visual='IMAGE_PATH:' in part
+            )
+            sub_chunks.append(sub_chunk)
+        
+        return sub_chunks
+    
     def _get_overlap_text(self, text: str) -> str:
         """Get overlap text from end of chunk"""
         if len(text) <= self.chunk_overlap:
@@ -306,6 +393,11 @@ class SemanticChunkingService:
         has_visual: bool = False
     ) -> Dict:
         """Create chunk dictionary with metadata"""
+        
+        # CRITICAL: Enforce max size
+        if len(text) > self.max_chunk_size:
+            print(f"WARNING: Truncating chunk from {len(text)} to {self.max_chunk_size} chars")
+            text = text[:self.max_chunk_size - 3] + "..."
         
         chunk_id = self._generate_chunk_id(text, chunk_index, base_metadata)
         
@@ -376,8 +468,14 @@ class SemanticChunkingService:
             batch = chunks[i:i + parent_size]
             
             if len(batch) > 1:
-                # Create parent chunk
-                parent_text = "\n\n".join([c['text'] for c in batch])
+                # Create parent chunk from children
+                parent_texts = [c['text'] for c in batch]
+                parent_text = "\n\n".join(parent_texts)
+                
+                # CRITICAL: Ensure parent doesn't exceed max size
+                if len(parent_text) > self.max_chunk_size:
+                    parent_text = parent_text[:self.max_chunk_size - 3] + "..."
+                
                 parent_id = f"parent_{batch[0]['chunk_id']}"
                 
                 parent_metadata = {
@@ -387,7 +485,7 @@ class SemanticChunkingService:
                 }
                 
                 parent_chunk = {
-                    'text': parent_text[:self.max_chunk_size],
+                    'text': parent_text,
                     'chunk_id': parent_id,
                     'chunk_index': batch[0]['chunk_index'],
                     'char_count': len(parent_text),

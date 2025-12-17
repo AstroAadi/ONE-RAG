@@ -13,7 +13,7 @@ from datetime import datetime
 
 from app.models.schemas import FileUploadResponse, DocumentProcessResponse
 from app.utils.file_validator import FileValidator
-from app.services.text_extractor import DocumentTextExtractor
+from app.services.text_extractor import PageByPagePDFExtractor as DocumentTextExtractor
 from app.utils.markdown_converter import MarkdownConverter
 from app.services.chunking_service import SemanticChunkingService
 from app.services.vector_store_service import EnhancedVectorStoreService

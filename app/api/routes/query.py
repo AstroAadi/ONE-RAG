@@ -1,7 +1,10 @@
 """
 Enhanced Query Route with Advanced RAG Capabilities
 Supports hybrid search, conversation history, and intelligent retrieval
-FIXED: Removed duplicate code, optimized query classification
+
+FIXED: 
+- Removed unused /expand-query endpoint
+- Removed unused generate_query_variations() functionality
 """
 
 from fastapi import APIRouter, HTTPException
@@ -280,29 +283,6 @@ async def clear_conversation(conversation_id: str):
         raise HTTPException(
             status_code=500,
             detail=f"Error clearing conversation: {str(e)}"
-        )
-
-
-@router.post("/expand-query")
-async def expand_query(question: str):
-    """
-    Generate query variations for improved retrieval
-    
-    Useful for complex or ambiguous queries
-    """
-    try:
-        variations = llm_service.generate_query_variations(question)
-        
-        return {
-            "original_query": question,
-            "variations": variations,
-            "count": len(variations)
-        }
-    
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error expanding query: {str(e)}"
         )
 
 
