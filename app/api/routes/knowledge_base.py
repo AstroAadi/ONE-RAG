@@ -1,12 +1,12 @@
 from fastapi import APIRouter, HTTPException
 
 from app.models.schemas import KnowledgeBaseStatus
-from app.services.vector_store_service import VectorStoreService
+from app.services.vector_store_service import EnhancedVectorStoreService
 
 router = APIRouter(prefix="/api/knowledge-base", tags=["Knowledge Base"])
 
 # Initialize services
-vector_store = VectorStoreService()
+vector_store = EnhancedVectorStoreService()
 
 
 @router.get("/status", response_model=KnowledgeBaseStatus)

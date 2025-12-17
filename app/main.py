@@ -1,18 +1,25 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api.routes import upload, query, knowledge_base
+from app.api.routes import upload, query, knowledge_base, settings
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
 # Initialize FastAPI app
 app = FastAPI(
     title="RAG Knowledge Base API",
-    description="API for building and querying a RAG-based knowledge base using AWS Bedrock",
-    version="1.0.0"
+    description="Simple RAG system using Claude 3.5 Sonnet and LangChain",
+    version="2.0.0"
 )
 
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify your frontend domain
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -22,6 +29,7 @@ app.add_middleware(
 app.include_router(upload.router)
 app.include_router(query.router)
 app.include_router(knowledge_base.router)
+app.include_router(settings.router)
 
 
 @app.get("/")
@@ -29,14 +37,23 @@ async def root():
     """Root endpoint with API information"""
     return {
         "message": "RAG Knowledge Base API",
-        "version": "1.0.0",
+        "version": "2.0.0",
+        "model": "Claude 3.5 Sonnet",
+        "features": [
+            "Simple RAG with single model",
+            "PDF and DOCX support",
+            "Vector search with ChromaDB",
+            "Runtime model switching"
+        ],
         "endpoints": {
             "upload_file": "POST /api/upload/",
             "process_document": "POST /api/upload/process/{file_id}",
-            "query_knowledge_base": "POST /api/query/",
-            "get_kb_status": "GET /api/knowledge-base/status",
+            "query": "POST /api/query/",
+            "get_status": "GET /api/knowledge-base/status",
             "delete_document": "DELETE /api/knowledge-base/document/{file_id}",
-            "reset_kb": "DELETE /api/knowledge-base/reset",
+            "reset": "DELETE /api/knowledge-base/reset",
+            "get_model": "GET /api/settings/model",
+            "update_model": "POST /api/settings/model",
             "docs": "GET /docs"
         }
     }
@@ -45,7 +62,10 @@ async def root():
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    return {"status": "healthy"}
+    return {
+        "status": "healthy",
+        "rag_enabled": True
+    }
 
 
 if __name__ == "__main__":

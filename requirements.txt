@@ -1,25 +1,96 @@
-fastapi
-uvicorn[standard]
-python-multipart
-pydantic
-pydantic-settings
+# ==================== Core Framework ====================
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+pydantic==2.9.2
+pydantic-settings==2.6.0
+python-multipart==0.0.12
+python-dotenv==1.0.1
 
-# Document Processing
-PyPDF2
-python-docx
-markdown
-pdfplumber # Better PDF extraction with layout
-pymupdf
+# ==================== Document Processing ====================
+# Unstructured with all document support
+unstructured[all-docs]==0.16.9
 
-# For better table extraction
-tabulate
+# PDF processing
+PyMuPDF==1.24.14  # fitz
+pdfplumber==0.11.4
+pypdf==5.1.0
 
-# Vector Database
-chromadb
+# DOCX processing
+python-docx==1.1.2
 
+# OCR support
+pytesseract==0.3.13
+pillow==11.0.0
+opencv-python==4.10.0.84
+
+# Table processing
+pandas==2.2.3
+tabulate==0.9.0
+
+# ==================== AI & Embeddings ====================
 # AWS Bedrock
-boto3
-botocore
-# Utilities
-python-dotenv
-aiofiles
+boto3==1.35.63
+langchain-aws==0.2.6
+
+# LangChain core
+langchain==0.3.7
+langchain-core==0.3.19
+langchain-community==0.3.7
+
+# Anthropic (for image analysis)
+anthropic==0.39.0
+
+# ==================== Vector Database ====================
+chromadb==0.5.20
+langchain-chroma==0.1.4
+
+# ==================== NLP & Text Processing ====================
+nltk==3.9.1
+sentence-transformers==3.3.1
+
+# ==================== Utilities ====================
+# File handling
+aiofiles==24.1.0
+
+# HTTP requests
+requests==2.32.3
+httpx==0.27.2
+
+# JSON handling
+orjson==3.10.11
+
+# Logging
+structlog==24.4.0
+
+# Testing (optional but recommended)
+pytest==8.3.4
+pytest-asyncio==0.24.0
+pytest-cov==6.0.0
+httpx==0.27.2  # For testing API endpoints
+
+# ==================== Development Tools ====================
+# Code formatting
+black==24.10.0
+isort==5.13.2
+
+# Type checking
+mypy==1.13.0
+
+# Linting
+flake8==7.1.1
+pylint==3.3.2
+
+# ==================== Optional but Recommended ====================
+# For better performance
+# uvloop==0.21.0  # Uncomment on Unix-like systems
+
+# For monitoring
+# prometheus-client==0.21.0  # Uncomment if you want metrics
+
+# ==================== Version Notes ====================
+# Python 3.9+ required
+# Tesseract OCR must be installed separately (system package)
+# For hi-res PDF extraction: tesseract-ocr
+#   Ubuntu: sudo apt-get install tesseract-ocr
+#   macOS: brew install tesseract
+#   Windows: Download from https://github.com/UB-Mannheim/tesseract/wiki
