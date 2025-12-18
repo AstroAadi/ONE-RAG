@@ -6,14 +6,14 @@ pydantic-settings==2.6.0
 python-multipart==0.0.12
 python-dotenv==1.0.1
 
-# ==================== PDF Processing ====================
-# PyMuPDF for page-by-page processing
-PyMuPDF==1.24.14
+# ==================== Document Processing ====================
+# Docling for intelligent document extraction
+docling==2.15.0
 
 # Pillow for image handling
 pillow==11.0.0
 
-# python-docx for DOCX files
+# python-docx for DOCX files (fallback)
 python-docx==1.1.2
 
 # ==================== AI & Embeddings ====================
@@ -41,9 +41,11 @@ pytest-asyncio==0.24.0
 httpx==0.27.2
 
 # ==================== Notes ====================
-# Removed: unstructured library (too slow and complex)
-# Using: PyMuPDF (fitz) for direct PDF page processing
-# - Faster extraction
-# - Better table detection
-# - Direct image extraction
-# - Layout-aware processing
+# Using: IBM Docling for document extraction
+# - AI-powered table detection
+# - Automatic chart/graph recognition
+# - Built-in OCR support
+# - Better layout understanding
+# - Professional-grade extraction
+# Removed: PyMuPDF (replaced by Docling)
+# Removed: unstructured (too slow and complex)
