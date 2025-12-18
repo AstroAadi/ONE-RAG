@@ -8,6 +8,9 @@ FIXED: Ensures chunks never exceed max_chunk_size for embeddings
 from typing import List, Dict, Any, Optional
 import re
 import hashlib
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class SemanticChunkingService:
@@ -19,11 +22,11 @@ class SemanticChunkingService:
         self, 
         chunk_size: int = 1000,
         chunk_overlap: int = 200,
-        max_chunk_size: int = 1800
+        max_chunk_size: int = 6000
     ):
-        # CRITICAL: Cohere embedding model max is 2048 chars
-        # Set max_chunk_size to safe limit with buffer
-        self.max_chunk_size = min(max_chunk_size, 1800)
+        # FIXED: Cohere embed-english-v3 max is 2048 tokens (~6000-8000 chars for English)
+        # Using 6000 chars as safe limit with buffer for non-English and special chars
+        self.max_chunk_size = min(max_chunk_size, 6000)
         self.chunk_size = min(chunk_size, self.max_chunk_size)
         self.chunk_overlap = min(chunk_overlap, self.chunk_size // 2)
         
@@ -394,7 +397,7 @@ class SemanticChunkingService:
     ) -> Dict:
         """Create chunk dictionary with metadata"""
         
-        # CRITICAL: Enforce max size
+        # FIXED: Enforce max size (6000 chars for Cohere embed-english-v3)
         if len(text) > self.max_chunk_size:
             print(f"WARNING: Truncating chunk from {len(text)} to {self.max_chunk_size} chars")
             text = text[:self.max_chunk_size - 3] + "..."
@@ -460,9 +463,16 @@ class SemanticChunkingService:
         self,
         chunks: List[Dict]
     ) -> List[Dict]:
-        """Create parent-child relationships"""
+        """
+        Create parent-child relationships
+        FIXED: Ensure parent chunks respect embedding token limits (2048 tokens ~= 1500 chars safe)
+        """
         parent_size = 4
         enhanced_chunks = []
+        
+        # Safe character limit for parent chunks (conservative for tokens)
+        # Cohere: 2048 tokens ≈ 1500 chars safe limit (accounting for non-English, special chars)
+        PARENT_SAFE_LIMIT = 1500
         
         for i in range(0, len(chunks), parent_size):
             batch = chunks[i:i + parent_size]
@@ -472,9 +482,11 @@ class SemanticChunkingService:
                 parent_texts = [c['text'] for c in batch]
                 parent_text = "\n\n".join(parent_texts)
                 
-                # CRITICAL: Ensure parent doesn't exceed max size
-                if len(parent_text) > self.max_chunk_size:
-                    parent_text = parent_text[:self.max_chunk_size - 3] + "..."
+                # CRITICAL: Ensure parent doesn't exceed safe token limit
+                if len(parent_text) > PARENT_SAFE_LIMIT:
+                    # Truncate to safe limit
+                    parent_text = parent_text[:PARENT_SAFE_LIMIT - 3] + "..."
+                    logger.warning(f"Parent chunk truncated from {len(''.join(parent_texts))} to {PARENT_SAFE_LIMIT} chars")
                 
                 parent_id = f"parent_{batch[0]['chunk_id']}"
                 

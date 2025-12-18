@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     )
     
     # Model Parameters
-    temperature: float = float(os.getenv("TEMPERATURE", "0.7"))
+    temperature: float = float(os.getenv("TEMPERATURE", "0.5"))  # FIXED: Lowered from 0.7 to 0.5 for more factual answers
     max_tokens: int = int(os.getenv("MAX_TOKENS", "4000"))  # Increased for detailed answers
     
     # ==================== Image Analysis Configuration ====================
@@ -62,9 +62,13 @@ class Settings(BaseSettings):
     chunk_overlap: int = int(os.getenv("CHUNK_OVERLAP", "200"))
     
     # Maximum chunk size (hard limit for embeddings)
-    max_chunk_size: int = int(os.getenv("MAX_CHUNK_SIZE", "1800"))
+    # IMPORTANT: Cohere embed-english-v3 limit is 2048 TOKENS (not chars)
+    # Safe char limit: ~1500-1800 chars (conservative for tokens)
+    # For child chunks we use 6000 as most are smaller, but parent chunks are limited to 1500
+    max_chunk_size: int = int(os.getenv("MAX_CHUNK_SIZE", "6000"))
     
     # Parent chunk size multiplier (parent chunks are larger)
+    # Note: Parent chunks are automatically limited to ~1500 chars for embedding safety
     parent_chunk_multiplier: int = int(os.getenv("PARENT_CHUNK_MULTIPLIER", "4"))
     
     # ==================== RAG Configuration ====================

@@ -11,6 +11,8 @@ from app.core.config import settings
 import logging
 from collections import defaultdict
 import json
+import time
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +51,41 @@ class EnhancedVectorStoreService:
         )
         
         logger.info("Enhanced VectorStore initialized with parent-child collections")
+    
+    def _retry_with_backoff(self, func, max_retries=3, base_delay=1):
+        """
+        Retry function with exponential backoff for API throttling
+        
+        Args:
+            func: Function to retry
+            max_retries: Maximum number of retries
+            base_delay: Base delay in seconds
+        """
+        for attempt in range(max_retries):
+            try:
+                return func()
+            except ClientError as e:
+                error_code = e.response.get('Error', {}).get('Code', '')
+                
+                # Retry on throttling errors
+                if error_code in ['ThrottlingException', 'TooManyRequestsException', 'ServiceUnavailableException']:
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (2 ** attempt)  # Exponential backoff
+                        logger.warning(f"API throttled, retrying in {delay}s... (attempt {attempt + 1}/{max_retries})")
+                        time.sleep(delay)
+                        continue
+                    else:
+                        logger.error(f"Max retries reached for throttling error: {e}")
+                        raise
+                else:
+                    # Non-throttling error, raise immediately
+                    logger.error(f"Non-retriable error: {e}")
+                    raise
+            except Exception as e:
+                logger.error(f"Unexpected error in retry wrapper: {e}")
+                raise
+        
+        raise Exception(f"Failed after {max_retries} retries")
     
     def add_document_chunks(
         self, 
@@ -90,15 +127,15 @@ class EnhancedVectorStoreService:
                     "chunk_id": chunk.get('chunk_id', f"{file_id}_chunk_{i}"),
                     "chunk_type": metadata.get('chunk_type', 'text'),
                     "page_number": metadata.get('page_number', 0),
-                    "section_hierarchy": json.dumps(metadata.get('section_hierarchy', [])),
+                    "section_hierarchy": str(metadata.get('section_hierarchy', '')),  # Store as string, not JSON
                     "parent_chunk_id": metadata.get('parent_chunk_id', ''),
-                    "is_parent": metadata.get('is_parent', False)
+                    "is_parent": bool(metadata.get('is_parent', False))  # Store as boolean
                 }
                 
-                # Add structured data reference if available
+                # Add structured data reference if available (as booleans)
                 if structured_data:
-                    enhanced_metadata['has_images'] = structured_data.get('statistics', {}).get('images', 0) > 0
-                    enhanced_metadata['has_tables'] = structured_data.get('statistics', {}).get('tables', 0) > 0
+                    enhanced_metadata['has_images'] = bool(structured_data.get('statistics', {}).get('images', 0) > 0)
+                    enhanced_metadata['has_tables'] = bool(structured_data.get('statistics', {}).get('tables', 0) > 0)
                 
                 doc = LangChainDocument(
                     page_content=chunk['text'],
@@ -113,14 +150,30 @@ class EnhancedVectorStoreService:
                     child_docs.append(doc)
                     child_ids.append(enhanced_metadata['chunk_id'])
             
-            # Add to respective vectorstores
+            # Add to respective vectorstores with retry logic
             if child_docs:
-                self.child_vectorstore.add_documents(documents=child_docs, ids=child_ids)
-                logger.info(f"Added {len(child_docs)} child chunks")
+                try:
+                    def add_child_docs():
+                        self.child_vectorstore.add_documents(documents=child_docs, ids=child_ids)
+                        return True
+                    
+                    self._retry_with_backoff(add_child_docs)
+                    logger.info(f"Added {len(child_docs)} child chunks")
+                except Exception as e:
+                    logger.error(f"Failed to add child chunks after retries: {e}")
+                    raise Exception(f"Embedding generation failed for child chunks: {str(e)}")
             
             if parent_docs:
-                self.parent_vectorstore.add_documents(documents=parent_docs, ids=parent_ids)
-                logger.info(f"Added {len(parent_docs)} parent chunks")
+                try:
+                    def add_parent_docs():
+                        self.parent_vectorstore.add_documents(documents=parent_docs, ids=parent_ids)
+                        return True
+                    
+                    self._retry_with_backoff(add_parent_docs)
+                    logger.info(f"Added {len(parent_docs)} parent chunks")
+                except Exception as e:
+                    logger.error(f"Failed to add parent chunks after retries: {e}")
+                    raise Exception(f"Embedding generation failed for parent chunks: {str(e)}")
             
             total_added = len(child_docs) + len(parent_docs)
             logger.info(f"Total chunks added for file {file_id}: {total_added}")

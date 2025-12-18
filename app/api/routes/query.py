@@ -42,24 +42,10 @@ async def query_knowledge_base(request: QueryRequest):
     start_time = time.time()
     
     try:
-        # Step 1: Classify query for optimal retrieval strategy
-        # FIXED: Made optional to speed up queries
-        search_mode = "hybrid"  # default
+        # Use hybrid search mode by default (query classification removed as requested)
+        search_mode = "hybrid"
         
-        try:
-            query_classification = llm_service.classify_query_intent(request.question)
-            logger.info(f"Query classified as: {query_classification}")
-            
-            # Step 2: Determine search strategy based on classification
-            if query_classification.get('needs_table_data'):
-                search_mode = "hybrid"  # Prioritize structured data
-            elif query_classification.get('complexity') == 'complex':
-                search_mode = "parent"  # Use broader context
-        except Exception as e:
-            logger.warning(f"Query classification failed, using hybrid mode: {e}")
-            search_mode = "hybrid"
-        
-        # Step 3: Hybrid search with intelligent retrieval
+        # Hybrid search with intelligent retrieval
         documents, metadatas, distances = vector_store.hybrid_search(
             query=request.question,
             top_k=request.top_k,
@@ -112,13 +98,6 @@ async def query_knowledge_base(request: QueryRequest):
             # Calculate enhanced relevance score
             relevance_score = max(0.0, 1.0 - (distance / 2.0))
             
-            # Boost score for exact chunk type matches
-            try:
-                if query_classification.get('needs_table_data') and chunk_type == 'table':
-                    relevance_score = min(1.0, relevance_score * 1.2)
-            except:
-                pass
-            
             # Prepare source for response
             sources.append(SourceDocument(
                 content=doc[:500] + "..." if len(doc) > 500 else doc,
@@ -137,7 +116,8 @@ async def query_knowledge_base(request: QueryRequest):
             question=request.question,
             context=context,
             conversation_id=None,  # For basic query, no conversation
-            include_citations=True
+            include_citations=True,
+            temperature=request.temperature  # Pass user-specified temperature
         )
         
         # Step 6: Detect potential hallucinations
@@ -180,14 +160,8 @@ async def query_with_conversation(request: ConversationQueryRequest):
     try:
         conversation_id = request.conversation_id
         
-        # Classify query (optional, with error handling)
+        # Use specified search mode or default to hybrid (query classification removed)
         search_mode = request.search_mode or "hybrid"
-        
-        try:
-            query_classification = llm_service.classify_query_intent(request.question)
-            logger.info(f"Query classified as: {query_classification}")
-        except Exception as e:
-            logger.warning(f"Query classification failed: {e}")
         
         # Retrieve relevant chunks
         documents, metadatas, distances = vector_store.hybrid_search(
@@ -239,7 +213,8 @@ async def query_with_conversation(request: ConversationQueryRequest):
             question=request.question,
             context=context,
             conversation_id=conversation_id,
-            include_citations=True
+            include_citations=True,
+            temperature=request.temperature  # Pass user-specified temperature
         )
         
         # Detect hallucinations

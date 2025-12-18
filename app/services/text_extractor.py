@@ -378,13 +378,13 @@ class PageByPagePDFExtractor:
                         current_table_rows.append((y, boxes))
                     else:
                         # End current table, start new
-                        if len(current_table_rows) >= 2:
+                        if len(current_table_rows) >= 3:  # FIXED: Require minimum 3 rows to reduce false positives
                             bbox = self._get_table_bbox(current_table_rows)
                             tables.append(bbox)
                         current_table_rows = [(y, boxes)]
                 
                 # Add last table
-                if len(current_table_rows) >= 2:
+                if len(current_table_rows) >= 3:  # FIXED: Require minimum 3 rows
                     bbox = self._get_table_bbox(current_table_rows)
                     tables.append(bbox)
         
@@ -393,16 +393,24 @@ class PageByPagePDFExtractor:
         
         return tables
     
-    def _are_positions_aligned(self, positions1: List[float], positions2: List[float], tolerance: float = 10) -> bool:
-        """Check if two lists of positions are aligned"""
-        if len(positions1) != len(positions2):
+    def _are_positions_aligned(self, positions1: List[float], positions2: List[float], tolerance: float = 15) -> bool:
+        """
+        Check if two lists of positions are aligned
+        FIXED: Increased tolerance and allow partial alignment
+        """
+        if abs(len(positions1) - len(positions2)) > 1:  # Allow 1 column difference
             return False
         
-        for p1, p2 in zip(positions1, positions2):
-            if abs(p1 - p2) > tolerance:
-                return False
+        # Check alignment for common positions
+        min_len = min(len(positions1), len(positions2))
+        aligned_count = 0
         
-        return True
+        for i in range(min_len):
+            if abs(positions1[i] - positions2[i]) < tolerance:
+                aligned_count += 1
+        
+        # Require 70% alignment instead of 100%
+        return aligned_count >= min_len * 0.7
     
     def _get_table_bbox(self, table_rows: List[tuple]) -> tuple:
         """Calculate bounding box for table region"""

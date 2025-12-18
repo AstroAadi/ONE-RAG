@@ -30,6 +30,7 @@ class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1, description="Question to ask")
     top_k: int = Field(default=5, ge=1, le=20, description="Number of chunks to retrieve")
     file_id: Optional[str] = Field(None, description="Optional file ID to search within")
+    temperature: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="LLM temperature (0.0-1.0). Lower = more factual")
 
 
 class EnhancedQueryRequest(QueryRequest):

@@ -14,27 +14,38 @@ import json
 import base64
 import os
 import boto3
+from threading import Lock
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
 
 class ConversationHistory:
-    """Manage conversation history"""
+    """Manage conversation history with expiration"""
     
-    def __init__(self, max_turns: int = 5):
+    def __init__(self, max_turns: int = 5, ttl_minutes: int = 5):
         self.max_turns = max_turns
+        self.ttl_minutes = ttl_minutes
         self.history: List[Dict[str, str]] = []
+        self.last_accessed = datetime.now()
     
     def add_turn(self, question: str, answer: str, context_used: str):
+        # Store only summary of context, not full text
+        context_summary = context_used[:500] + "..." if len(context_used) > 500 else context_used
+        
         self.history.append({
             'question': question,
             'answer': answer,
-            'context_used': context_used
+            'context_summary': context_summary
         })
         if len(self.history) > self.max_turns:
             self.history = self.history[-self.max_turns:]
+        
+        self.last_accessed = datetime.now()
     
     def get_formatted_history(self) -> str:
+        self.last_accessed = datetime.now()
+        
         if not self.history:
             return ""
         formatted = "Previous conversation:\n"
@@ -42,8 +53,13 @@ class ConversationHistory:
             formatted += f"\nQ{i}: {turn['question']}\nA{i}: {turn['answer'][:200]}...\n"
         return formatted
     
+    def is_expired(self) -> bool:
+        """Check if conversation has expired"""
+        return datetime.now() - self.last_accessed > timedelta(minutes=self.ttl_minutes)
+    
     def clear(self):
         self.history = []
+        self.last_accessed = datetime.now()
 
 
 class EnhancedLLMService:
@@ -63,6 +79,7 @@ class EnhancedLLMService:
         self.model_id = settings.bedrock_model_id
         self._llm = None
         self.conversations: Dict[str, ConversationHistory] = {}
+        self._conversation_lock = Lock()  # FIXED: Thread-safe conversation access
         
         # Initialize Bedrock runtime for vision
         try:
@@ -97,24 +114,45 @@ class EnhancedLLMService:
             logger.info("Created new ChatBedrock instance")
         return self._llm
     
+    def _cleanup_expired_conversations(self):
+        """Remove expired conversations to prevent memory leak"""
+        with self._conversation_lock:
+            expired_ids = [
+                conv_id for conv_id, conv in self.conversations.items()
+                if conv.is_expired()
+            ]
+            for conv_id in expired_ids:
+                del self.conversations[conv_id]
+                logger.info(f"Cleaned up expired conversation: {conv_id}")
+    
     def generate_answer(
         self,
         question: str,
         context: str,
         conversation_id: Optional[str] = None,
-        include_citations: bool = True
+        include_citations: bool = True,
+        temperature: Optional[float] = None
     ) -> str:
         """
         Generate answer with automatic image detection and inclusion
+        FIXED: Thread-safe conversation handling with automatic cleanup
+        
+        Args:
+            temperature: Optional temperature override (0.0-1.0)
         """
         try:
+            # Cleanup expired conversations before processing
+            self._cleanup_expired_conversations()
+            
             # Extract image references from context
             image_refs = self._extract_image_references(context)
             
-            # Get conversation history if available
+            # Get conversation history if available (thread-safe)
             history_text = ""
-            if conversation_id and conversation_id in self.conversations:
-                history_text = self.conversations[conversation_id].get_formatted_history()
+            if conversation_id:
+                with self._conversation_lock:
+                    if conversation_id in self.conversations:
+                        history_text = self.conversations[conversation_id].get_formatted_history()
             
             # If images found, use vision-enabled generation
             if image_refs and self.bedrock_runtime:
@@ -123,25 +161,28 @@ class EnhancedLLMService:
                     question=question,
                     context=context,
                     image_refs=image_refs,
-                    history=history_text
+                    history=history_text,
+                    temperature=temperature
                 )
             else:
                 # Standard text-only generation
                 answer = self._generate_text_only(
                     question=question,
                     context=context,
-                    history=history_text
+                    history=history_text,
+                    temperature=temperature
                 )
             
             # Verify citations
             if include_citations:
                 answer = self._verify_citations(answer, context)
             
-            # Update conversation history
+            # Update conversation history (thread-safe)
             if conversation_id:
-                if conversation_id not in self.conversations:
-                    self.conversations[conversation_id] = ConversationHistory()
-                self.conversations[conversation_id].add_turn(question, answer, context)
+                with self._conversation_lock:
+                    if conversation_id not in self.conversations:
+                        self.conversations[conversation_id] = ConversationHistory()
+                    self.conversations[conversation_id].add_turn(question, answer, context)
             
             return answer
             
@@ -201,13 +242,21 @@ class EnhancedLLMService:
         question: str,
         context: str,
         image_refs: List[Dict[str, str]],
-        history: str = ""
+        history: str = "",
+        temperature: Optional[float] = None
     ) -> str:
         """
         Generate answer using Bedrock with vision (direct API call)
         Includes images in the request
+        FIXED: Added context compression to prevent overflow
         """
         try:
+            # Use provided temperature or default
+            temp = temperature if temperature is not None else settings.temperature
+            
+            # FIXED: Compress context before building request to prevent overflow
+            compressed_context = self._compress_context(context, question, max_length=6000)
+            
             # Build content array with text and images
             content_parts = []
             
@@ -222,7 +271,7 @@ class EnhancedLLMService:
             clean_context = re.sub(
                 r'---\n\*\*\[.*?\]\*\*.*?IMAGE_PATH:.*?---\n',
                 '',
-                context,
+                compressed_context,  # Use compressed context
                 flags=re.DOTALL
             )
             
@@ -277,7 +326,7 @@ class EnhancedLLMService:
             request_body = {
                 "anthropic_version": "bedrock-2023-05-31",
                 "max_tokens": settings.max_tokens,
-                "temperature": settings.temperature,
+                "temperature": temp,  # Use provided or default temperature
                 "messages": [{
                     "role": "user",
                     "content": content_parts
@@ -304,11 +353,22 @@ class EnhancedLLMService:
         self,
         question: str,
         context: str,
-        history: str = ""
+        history: str = "",
+        temperature: Optional[float] = None
     ) -> str:
         """Standard text-only generation using LangChain"""
         try:
-            llm = self.get_llm()
+            # Use provided temperature or default
+            temp = temperature if temperature is not None else settings.temperature
+            
+            llm = ChatBedrock(
+                model_id=self.model_id,
+                model_kwargs={
+                    "temperature": temp,
+                    "max_tokens": settings.max_tokens
+                },
+                **self.aws_config
+            )
             
             # Compress context if needed
             compressed_context = self._compress_context(context, question)
@@ -423,38 +483,6 @@ Answer:"""
         
         return answer
     
-    def classify_query_intent(self, question: str) -> Dict[str, any]:
-        """Classify query intent (simplified version)"""
-        try:
-            # Simple keyword-based classification (fast)
-            question_lower = question.lower()
-            
-            classification = {
-                "query_type": "factual",
-                "needs_table_data": any(kw in question_lower for kw in ['table', 'data', 'number', 'statistics', 'figure']),
-                "needs_visual_data": any(kw in question_lower for kw in ['chart', 'graph', 'image', 'diagram', 'visual', 'picture']),
-                "is_temporal": any(kw in question_lower for kw in ['when', 'date', 'time', 'year', 'month']),
-                "complexity": "medium"
-            }
-            
-            # Determine complexity
-            if len(question.split()) > 20 or '?' in question[:-1]:
-                classification["complexity"] = "complex"
-            elif len(question.split()) < 8:
-                classification["complexity"] = "simple"
-            
-            return classification
-            
-        except Exception as e:
-            logger.error(f"Error classifying query: {str(e)}")
-            return {
-                "query_type": "factual",
-                "needs_table_data": False,
-                "needs_visual_data": False,
-                "is_temporal": False,
-                "complexity": "medium"
-            }
-    
     def detect_hallucination(self, answer: str, context: str) -> Tuple[bool, float]:
         """Simple hallucination detection"""
         try:
@@ -489,10 +517,11 @@ Answer:"""
             return False, 1.0
     
     def clear_conversation(self, conversation_id: str):
-        """Clear conversation history"""
-        if conversation_id in self.conversations:
-            self.conversations[conversation_id].clear()
-            logger.info(f"Cleared conversation {conversation_id}")
+        """Clear conversation history (thread-safe)"""
+        with self._conversation_lock:
+            if conversation_id in self.conversations:
+                self.conversations[conversation_id].clear()
+                logger.info(f"Cleared conversation {conversation_id}")
     
     def update_model(self, new_model_id: str) -> bool:
         """Update model ID"""
