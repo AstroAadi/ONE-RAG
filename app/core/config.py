@@ -57,6 +57,10 @@ class Settings(BaseSettings):
     max_top_k: int = int(os.getenv("MAX_TOP_K", "20"))
     max_context_length: int = int(os.getenv("MAX_CONTEXT_LENGTH", "8000"))
     
+    # Hybrid Search Weights (must sum to 1.0)
+    default_keyword_weight: float = float(os.getenv("KEYWORD_WEIGHT", "0.3"))
+    default_semantic_weight: float = float(os.getenv("SEMANTIC_WEIGHT", "0.7"))
+    
     # Conversation history
     max_conversation_turns: int = int(os.getenv("MAX_CONVERSATION_TURNS", "5"))
     

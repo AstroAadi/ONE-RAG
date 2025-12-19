@@ -103,11 +103,11 @@ async def process_and_index_document(file_id: str):
     
     # Try versioned filename
     if not file_path:
-        for file in upload_dir.glob(f"*{file_id[:8]}*"):
-            if file.is_file():
-                file_path = file
-                file_extension = file.suffix.lstrip('.')
-                actual_filename = file.name
+        for found_file in upload_dir.glob(f"*{file_id[:8]}*"):
+            if found_file.is_file():
+                file_path = found_file
+                file_extension = found_file.suffix.lstrip('.')
+                actual_filename = found_file.name
                 break
     
     # Last resort: most recent file
@@ -117,7 +117,7 @@ async def process_and_index_document(file_id: str):
             if files:
                 file_path = max(files, key=lambda p: p.stat().st_mtime)
                 file_extension = ext
-                actual_filename = file.name
+                actual_filename = file_path.name
                 logger.warning(f"Using most recent file: {actual_filename}")
                 break
     

@@ -1,6 +1,6 @@
 """
-Clean Query Route
-Simple semantic search with conversation support
+Query Route with Hybrid Search
+Combines BM25 keyword and semantic search
 """
 
 from fastapi import APIRouter, HTTPException
@@ -25,16 +25,35 @@ llm_service = EnhancedLLMService()
 @router.post("/", response_model=QueryResponse)
 async def query_knowledge_base(request: QueryRequest):
     """
-    Query knowledge base with semantic search
+    Query with hybrid search (BM25 + Semantic)
+    
+    Default weights:
+    - Keyword (BM25): 0.3
+    - Semantic: 0.7
+    
+    You can adjust weights, but they must sum to 1.0
     """
     start_time = time.time()
     
     try:
-        # Semantic search
-        documents, metadatas, distances = vector_store.search(
+        # Validate and normalize weights
+        keyword_weight = request.keyword_weight if request.keyword_weight is not None else 0.3
+        semantic_weight = request.semantic_weight if request.semantic_weight is not None else 0.7
+        
+        # Ensure they sum to 1.0
+        total = keyword_weight + semantic_weight
+        if abs(total - 1.0) > 0.01:
+            keyword_weight = keyword_weight / total
+            semantic_weight = semantic_weight / total
+            logger.info(f"Normalized weights: keyword={keyword_weight:.2f}, semantic={semantic_weight:.2f}")
+        
+        # Hybrid search
+        documents, metadatas, scores = vector_store.hybrid_search(
             query=request.question,
             top_k=request.top_k,
-            file_id=getattr(request, 'file_id', None)
+            file_id=getattr(request, 'file_id', None),
+            keyword_weight=keyword_weight,
+            semantic_weight=semantic_weight
         )
         
         if not documents:
@@ -47,7 +66,7 @@ async def query_knowledge_base(request: QueryRequest):
         context_parts = []
         sources = []
         
-        for i, (doc, metadata, distance) in enumerate(zip(documents, metadatas, distances)):
+        for i, (doc, metadata, score) in enumerate(zip(documents, metadatas, scores)):
             source_header = f"[Source {i+1}]"
             
             # Add page number
@@ -62,17 +81,16 @@ async def query_knowledge_base(request: QueryRequest):
             
             context_parts.append(f"{source_header}:\n{doc}\n")
             
-            # Calculate relevance score
-            relevance_score = max(0.0, 1.0 - (distance / 2.0))
-            
             # Prepare source
             sources.append(SourceDocument(
                 content=doc[:500] + "..." if len(doc) > 500 else doc,
                 filename=metadata.get('filename', 'unknown'),
                 chunk_id=metadata.get('chunk_id', f'chunk_{i}'),
-                relevance_score=round(relevance_score, 3),
+                relevance_score=round(float(score), 3),
                 page_number=page,
-                chunk_type=chunk_type
+                chunk_type=chunk_type,
+                semantic_score=None,  # Can add if needed
+                keyword_score=None    # Can add if needed
             ))
         
         context = "\n\n".join(context_parts)
@@ -100,8 +118,10 @@ async def query_knowledge_base(request: QueryRequest):
             answer=answer,
             sources=sources,
             processing_time=round(processing_time, 2),
-            search_strategy="semantic",
-            confidence_score=round(confidence, 3)
+            search_strategy="hybrid",
+            confidence_score=round(confidence, 3),
+            keyword_weight=round(keyword_weight, 2),
+            semantic_weight=round(semantic_weight, 2)
         )
     
     except HTTPException:
@@ -116,15 +136,26 @@ async def query_knowledge_base(request: QueryRequest):
 
 @router.post("/conversation", response_model=QueryResponse)
 async def query_with_conversation(request: ConversationQueryRequest):
-    """Multi-turn conversational query"""
+    """Multi-turn conversational query with hybrid search"""
     start_time = time.time()
     
     try:
-        # Retrieve chunks
-        documents, metadatas, distances = vector_store.search(
+        # Validate and normalize weights
+        keyword_weight = request.keyword_weight if request.keyword_weight is not None else 0.3
+        semantic_weight = request.semantic_weight if request.semantic_weight is not None else 0.7
+        
+        total = keyword_weight + semantic_weight
+        if abs(total - 1.0) > 0.01:
+            keyword_weight = keyword_weight / total
+            semantic_weight = semantic_weight / total
+        
+        # Retrieve chunks with hybrid search
+        documents, metadatas, scores = vector_store.hybrid_search(
             query=request.question,
             top_k=request.top_k,
-            file_id=request.file_id
+            file_id=request.file_id,
+            keyword_weight=keyword_weight,
+            semantic_weight=semantic_weight
         )
         
         if not documents:
@@ -137,7 +168,7 @@ async def query_with_conversation(request: ConversationQueryRequest):
         context_parts = []
         sources = []
         
-        for i, (doc, metadata, distance) in enumerate(zip(documents, metadatas, distances)):
+        for i, (doc, metadata, score) in enumerate(zip(documents, metadatas, scores)):
             source_header = f"[Source {i+1}]"
             
             page = metadata.get('page_number', 0)
@@ -150,13 +181,11 @@ async def query_with_conversation(request: ConversationQueryRequest):
             
             context_parts.append(f"{source_header}:\n{doc}\n")
             
-            relevance_score = max(0.0, 1.0 - (distance / 2.0))
-            
             sources.append(SourceDocument(
                 content=doc[:500] + "..." if len(doc) > 500 else doc,
                 filename=metadata.get('filename', 'unknown'),
                 chunk_id=metadata.get('chunk_id', f'chunk_{i}'),
-                relevance_score=round(relevance_score, 3),
+                relevance_score=round(float(score), 3),
                 page_number=page,
                 chunk_type=chunk_type
             ))
@@ -185,9 +214,11 @@ async def query_with_conversation(request: ConversationQueryRequest):
             answer=answer,
             sources=sources,
             processing_time=round(processing_time, 2),
-            search_strategy="semantic",
+            search_strategy="hybrid",
             confidence_score=round(confidence, 3),
-            conversation_id=request.conversation_id
+            conversation_id=request.conversation_id,
+            keyword_weight=round(keyword_weight, 2),
+            semantic_weight=round(semantic_weight, 2)
         )
     
     except HTTPException:
