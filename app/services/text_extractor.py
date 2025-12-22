@@ -273,7 +273,10 @@ class DoclingDocumentExtractor:
         pdf_stem: str,
         total_pages: int
     ) -> str:
-        """Build final markdown with page numbers for each image"""
+        """
+        Build final markdown with page numbers for each image.
+        Detects figure captions that appear after images and places them as headings above the image.
+        """
         lines = markdown_content.split('\n')
         result_lines = []
         
@@ -282,9 +285,61 @@ class DoclingDocumentExtractor:
         result_lines.append(f"**Total Pages**: {total_pages}\n")
         
         placeholder_pattern = r'\[IMAGE:\{[^\}]+\}\]'
-        image_counter = [1]
+        # Pattern to detect figure captions (case-insensitive)
+        # Matches: "Figure 1:", "Fig. 2:", "Figure 3.1:", "FIGURE 4", etc.
+        caption_pattern = r'^(Figure|Fig\.?|FIGURE|FIG\.?)\s*(\d+\.?\d*)\s*[:\-\.]?\s*(.*)$'
         
-        for line in lines:
+        image_counter = [1]
+        processed_caption_indices = set()  # Track which lines are captions we've already used
+        
+        # First pass: find all image positions and their associated captions
+        image_caption_map = {}  # Maps image index to (caption_text, caption_line_idx)
+        
+        for i, line in enumerate(lines):
+            if re.search(placeholder_pattern, line):
+                idx = image_counter[0]
+                
+                # Look ahead for figure caption in the next few lines
+                lookahead_limit = 5  # Check next 5 lines for caption
+                
+                for j in range(i + 1, min(i + 1 + lookahead_limit, len(lines))):
+                    potential_caption = lines[j].strip()
+                    
+                    # Skip empty lines
+                    if not potential_caption:
+                        continue
+                    
+                    # Check if this line matches a figure caption pattern
+                    caption_match = re.match(caption_pattern, potential_caption, re.IGNORECASE)
+                    if caption_match:
+                        figure_label = caption_match.group(1)  # "Figure" or "Fig"
+                        figure_number = caption_match.group(2)  # The number
+                        figure_desc = caption_match.group(3).strip()  # Description after the number
+                        
+                        # Build the caption text
+                        if figure_desc:
+                            caption_text = f"Figure {figure_number}: {figure_desc}"
+                        else:
+                            caption_text = f"Figure {figure_number}"
+                        
+                        image_caption_map[idx] = (caption_text, j)
+                        processed_caption_indices.add(j)
+                        break
+                    
+                    # Stop if we hit another image or heading
+                    if re.search(placeholder_pattern, potential_caption) or potential_caption.startswith('#'):
+                        break
+                
+                image_counter[0] += 1
+        
+        # Second pass: build the result with proper ordering
+        image_counter[0] = 1
+        
+        for i, line in enumerate(lines):
+            # Skip lines that are captions we've already processed
+            if i in processed_caption_indices:
+                continue
+            
             # Track headings
             if line.startswith('#'):
                 result_lines.append(line)
@@ -298,12 +353,16 @@ class DoclingDocumentExtractor:
                     image_info = image_mapping[idx]
                     filename = image_info['filename']
                     page_number = image_info['page_number']
-                    
                     rel_path = os.path.join("extracted_images", pdf_stem, filename)
                     
-                    # Add page marker
+                    # Add page marker if needed
                     if not result_lines or not result_lines[-1].startswith(f"## Page {page_number}"):
                         result_lines.append(f"\n## Page {page_number}\n")
+                    
+                    # Add caption as heading if found
+                    if idx in image_caption_map:
+                        caption_text, _ = image_caption_map[idx]
+                        result_lines.append(f"### {caption_text}\n")
                     
                     # Add image path and page tag
                     result_lines.append(f"IMAGE_PATH: {rel_path}")
