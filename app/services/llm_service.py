@@ -62,7 +62,7 @@ class ConversationHistory:
         self.last_accessed = datetime.now()
 
 
-class EnhancedLLMService:
+class LLMService:
     """
     LLM service that detects and includes images from context
     """
@@ -418,7 +418,7 @@ Answer:"""
         self,
         context: str,
         question: str,
-        max_length: int = 8000
+        max_length: int = 8000 
     ) -> str:
         """Compress context by removing less relevant parts"""
         if len(context) <= max_length:

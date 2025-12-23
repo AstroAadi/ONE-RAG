@@ -17,7 +17,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
-class EnhancedVectorStoreService:
+class VectorStoreService:
     """Vector store with hybrid search (BM25 + Semantic)"""
     
     def __init__(self):

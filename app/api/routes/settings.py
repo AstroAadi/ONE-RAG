@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from app.services.llm_service import EnhancedLLMService
+from app.services.llm_service import LLMService
 from app.core.config import settings
 import logging
 
@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/settings", tags=["Settings"])
 
 # Initialize LLM service
-llm_service = EnhancedLLMService()
+llm_service = LLMService()
 
 
 class ModelUpdateRequest(BaseModel):

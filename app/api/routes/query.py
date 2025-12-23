@@ -8,8 +8,8 @@ from app.models.schemas import (
     QueryRequest, QueryResponse, SourceDocument,
     ConversationQueryRequest
 )
-from app.services.vector_store_service import EnhancedVectorStoreService
-from app.services.llm_service import EnhancedLLMService
+from app.services.vector_store_service import VectorStoreService
+from app.services.llm_service import LLMService
 import time
 import logging
 
@@ -18,8 +18,8 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/query", tags=["Query"])
 
 # Initialize services
-vector_store = EnhancedVectorStoreService()
-llm_service = EnhancedLLMService()
+vector_store = VectorStoreService()
+llm_service = LLMService()
 
 
 @router.post("/", response_model=QueryResponse)

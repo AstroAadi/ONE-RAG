@@ -1,7 +1,8 @@
 """
-Simplified Chunking Service - No Parent-Child Complexity
-Respects configured chunk_size and chunk_overlap
-Clean, maintainable, and efficient
+Enhanced Chunking Service
+- Clean semantic chunking
+- Respects chunk_size and chunk_overlap
+- Supports both PAGE and SLIDE markers
 """
 
 from typing import List, Dict, Any, Optional
@@ -14,8 +15,7 @@ logger = logging.getLogger(__name__)
 
 class SemanticChunkingService:
     """
-    Clean semantic chunking without parent-child complexity
-    Respects chunk_size configuration
+    Clean semantic chunking with page/slide support
     """
     
     def __init__(
@@ -25,7 +25,6 @@ class SemanticChunkingService:
         max_chunk_size: int = 6000
     ):
         # Cohere embed-english-v3 max is 2048 tokens (~6000-8000 chars for English)
-        # Using 6000 chars as safe limit
         self.max_chunk_size = min(max_chunk_size, 6000)
         self.chunk_size = min(chunk_size, self.max_chunk_size)
         self.chunk_overlap = min(chunk_overlap, self.chunk_size // 2)
@@ -40,7 +39,6 @@ class SemanticChunkingService:
     ) -> List[Dict]:
         """
         Split markdown into semantic chunks
-        Simple and clean - no parent-child complexity
         """
         if not markdown_text or not markdown_text.strip():
             logger.warning("Empty markdown text provided")
@@ -48,7 +46,7 @@ class SemanticChunkingService:
         
         chunks = []
         
-        # Split by visual content blocks first (images, tables, charts)
+        # Split by visual content blocks
         sections = self._split_by_visual_blocks(markdown_text)
         
         logger.info(f"Split into {len(sections)} sections by visual blocks")
@@ -61,19 +59,15 @@ class SemanticChunkingService:
         
         logger.info(f"Created {len(chunks)} total chunks")
         
-        # Validate all chunks are under max size
+        # Validate all chunks
         for chunk in chunks:
             if len(chunk['text']) > self.max_chunk_size:
-                logger.error(f"Chunk {chunk['chunk_id']} exceeds max size: {len(chunk['text'])} chars - THIS SHOULD NOT HAPPEN")
+                logger.error(f"Chunk {chunk['chunk_id']} exceeds max size: {len(chunk['text'])} chars")
         
         return chunks
     
     def _split_by_visual_blocks(self, text: str) -> List[str]:
-        """
-        Split text by visual content blocks
-        Each image/table/chart stays with its surrounding text
-        """
-        # Pattern to match IMAGE_PATH lines and surrounding context
+        """Split text by visual content blocks"""
         sections = []
         current_section = ""
         
@@ -82,12 +76,11 @@ class SemanticChunkingService:
         for line in lines:
             current_section += line + '\n'
             
-            # Check if this line has an image reference
+            # Keep collecting context after images
             if line.strip().startswith('IMAGE_PATH:'):
-                # Keep collecting a bit more context after the image
                 continue
             
-            # If section is getting large, split it
+            # Split if section is getting large
             if len(current_section) > self.chunk_size * 2:
                 sections.append(current_section.strip())
                 current_section = ""
@@ -104,15 +97,12 @@ class SemanticChunkingService:
         start_index: int,
         base_metadata: Dict
     ) -> List[Dict]:
-        """
-        Chunk a section respecting chunk_size
-        """
+        """Chunk a section respecting chunk_size"""
         chunks = []
         
-        # Check if section has visual content
         has_visual = 'IMAGE_PATH:' in section
         
-        # If section is small enough, return as single chunk
+        # Small section - return as single chunk
         if len(section) <= self.chunk_size:
             chunks.append(self._create_chunk_dict(
                 text=section,
@@ -132,11 +122,10 @@ class SemanticChunkingService:
             if not para.strip():
                 continue
             
-            # Check if adding this paragraph exceeds chunk_size
-            potential_size = len(current_chunk) + len(para) + 2  # +2 for \n\n
+            potential_size = len(current_chunk) + len(para) + 2
             
             if potential_size > self.chunk_size:
-                # Save current chunk if it has content
+                # Save current chunk
                 if current_chunk.strip():
                     has_vis = 'IMAGE_PATH:' in current_chunk
                     chunks.append(self._create_chunk_dict(
@@ -147,17 +136,14 @@ class SemanticChunkingService:
                     ))
                     chunk_index += 1
                     
-                    # Add overlap from end of previous chunk
+                    # Add overlap
                     overlap = self._get_overlap_text(current_chunk)
                     current_chunk = overlap
                 
                 # Handle very large paragraphs
                 if len(para) > self.chunk_size:
-                    # Split large paragraph by sentences
                     sentence_chunks = self._split_large_paragraph(
-                        para,
-                        chunk_index,
-                        base_metadata
+                        para, chunk_index, base_metadata
                     )
                     chunks.extend(sentence_chunks)
                     chunk_index += len(sentence_chunks)
@@ -185,10 +171,8 @@ class SemanticChunkingService:
         start_index: int,
         base_metadata: Dict
     ) -> List[Dict]:
-        """Split a large paragraph by sentences"""
+        """Split large paragraph by sentences"""
         chunks = []
-        
-        # Split by sentences
         sentences = re.split(r'(?<=[.!?])\s+', paragraph)
         
         current_chunk = ""
@@ -198,7 +182,6 @@ class SemanticChunkingService:
             if len(current_chunk) + len(sentence) + 1 <= self.chunk_size:
                 current_chunk = (current_chunk + " " + sentence if current_chunk else sentence)
             else:
-                # Save current chunk
                 if current_chunk.strip():
                     has_vis = 'IMAGE_PATH:' in current_chunk
                     chunks.append(self._create_chunk_dict(
@@ -209,15 +192,13 @@ class SemanticChunkingService:
                     ))
                     chunk_index += 1
                 
-                # Start new chunk with this sentence
-                # If sentence itself is too long, truncate it
+                # Truncate if sentence is too long
                 if len(sentence) > self.max_chunk_size:
                     logger.warning(f"Sentence too long ({len(sentence)} chars), truncating")
                     sentence = sentence[:self.max_chunk_size - 3] + "..."
                 
                 current_chunk = sentence
         
-        # Add remaining chunk
         if current_chunk.strip():
             has_vis = 'IMAGE_PATH:' in current_chunk
             chunks.append(self._create_chunk_dict(
@@ -236,7 +217,7 @@ class SemanticChunkingService:
         
         overlap_text = text[-self.chunk_overlap:]
         
-        # Try to start from a sentence boundary
+        # Try to start from sentence boundary
         sentence_start = re.search(r'[.!?]\s+', overlap_text)
         if sentence_start:
             overlap_text = overlap_text[sentence_start.end():]
@@ -252,7 +233,7 @@ class SemanticChunkingService:
     ) -> Dict:
         """Create chunk dictionary with metadata"""
         
-        # Safety check - should never exceed max_chunk_size
+        # Safety check
         if len(text) > self.max_chunk_size:
             logger.error(f"CRITICAL: Chunk exceeds max size ({len(text)} > {self.max_chunk_size}), truncating")
             text = text[:self.max_chunk_size - 3] + "..."
@@ -262,7 +243,7 @@ class SemanticChunkingService:
         # Detect chunk type
         chunk_type = 'text'
         if has_visual:
-            if '**[TABLE]**' in text:
+            if '**[TABLE]**' in text or '| --- |' in text:
                 chunk_type = 'table'
             elif '**[CHART]**' in text or '**[FIGURE]**' in text:
                 chunk_type = 'chart'
@@ -271,18 +252,25 @@ class SemanticChunkingService:
             else:
                 chunk_type = 'mixed'
         
-        # Extract page number if available
-        # Look for "## Page X" or "PAGE: X" patterns
+        # Extract page/slide number - ENHANCED to support SLIDE markers
         page_number = 0
-        page_match = re.search(r'##\s*Page\s+(\d+)|PAGE:\s*(\d+)', text, re.IGNORECASE)
-        if page_match:
-            page_number = int(page_match.group(1) or page_match.group(2))
         
-        # Extract section hierarchy if available
+        # Try to match Page or Slide markers
+        page_match = re.search(
+            r'##\s*(Page|Slide)\s+(\d+)|(?:PAGE|SLIDE):\s*(\d+)', 
+            text, 
+            re.IGNORECASE
+        )
+        
+        if page_match:
+            # Extract the number from whichever group matched
+            page_number = int(page_match.group(2) or page_match.group(3))
+        
+        # Extract section hierarchy
         section_hierarchy = []
         section_matches = re.findall(r'^(#{1,6})\s+(.+)$', text, re.MULTILINE)
         if section_matches:
-            section_hierarchy = [match[1].strip() for match in section_matches[:3]]  # Keep top 3 headings
+            section_hierarchy = [match[1].strip() for match in section_matches[:3]]
         
         metadata = {
             'chunk_id': chunk_id,
