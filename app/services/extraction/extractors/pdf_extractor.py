@@ -196,14 +196,35 @@ class PDFExtractor(BaseExtractor):
             if re.search(placeholder_pattern, line):
                 idx = image_counter[0]
                 
-                # Look ahead for caption
-                caption_info = CaptionDetector.find_caption_in_range(
-                    lines, i + 1, lookahead=5, caption_type='figure'
-                )
+                # Look ahead for caption in next few lines (FIXED)
+                caption_info = None
+                for j in range(i + 1, min(i + 6, len(lines))):
+                    check_line = lines[j].strip()
+                    if not check_line:
+                        continue
+                    
+                    # Try to detect caption
+                    result = CaptionDetector.detect_caption(check_line)
+                    if result:
+                        caption_type, number, description = result
+                        # Only accept figure captions for images
+                        if caption_type == 'figure':
+                            caption_info = {
+                                'type': caption_type,
+                                'number': number,
+                                'description': description,
+                                'line_idx': j,
+                                'full_text': check_line
+                            }
+                            processed_caption_indices.add(j)
+                            break
+                    
+                    # Stop if we hit structural elements
+                    if check_line.startswith('#') or '[IMAGE:' in check_line:
+                        break
                 
                 if caption_info:
                     image_caption_map[idx] = caption_info
-                    processed_caption_indices.add(caption_info['line_idx'])
                 
                 image_counter[0] += 1
         
@@ -235,7 +256,7 @@ class PDFExtractor(BaseExtractor):
                     # Add caption as heading if found
                     if idx in image_caption_map:
                         caption = image_caption_map[idx]
-                        heading = CaptionDetector.format_caption_as_heading(
+                        heading = CaptionDetector.format_as_heading(
                             caption['type'], caption['number'], caption['description']
                         )
                         result_lines.append(f"{heading}\n")

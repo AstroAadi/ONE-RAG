@@ -1,11 +1,10 @@
 """
-Caption Detector Processor
-Detects and extracts figure and table captions from text
-Shared across all extractors
+Caption Detector with Missing Helper Methods
+Added find_caption_in_range, find_caption_before, and format_caption_as_heading
 """
 
 import re
-from typing import Tuple, Optional, Dict, List
+from typing import Optional, Tuple, Dict, List
 import logging
 
 logger = logging.getLogger(__name__)
@@ -13,126 +12,98 @@ logger = logging.getLogger(__name__)
 
 class CaptionDetector:
     """
-    Utility class for detecting and extracting captions
+    Caption detection for figures and tables
     
-    Supports:
-    - Figure captions: "Figure 1:", "Fig. 2:", "FIGURE 3.1 -"
-    - Table captions: "Table 1:", "Tbl. 2:", "TABLE 3 -"
-    - Chart captions: "Chart 1:", "Graph 2:"
+    Includes helper methods for searching around image placeholders
     """
     
-    # Regex patterns for different caption types
-    FIGURE_PATTERN = r'^(Figure|Fig\.?|FIGURE|FIG\.?)\s*(\d+\.?\d*)\s*[:\-\.]?\s*(.*)$'
-    TABLE_PATTERN = r'^(Table|TABLE|Tbl\.?|TBL\.?)\s*(\d+\.?\d*)\s*[:\-\.]?\s*(.*)$'
-    CHART_PATTERN = r'^(Chart|CHART|Graph|GRAPH)\s*(\d+\.?\d*)\s*[:\-\.]?\s*(.*)$'
-    
-    # Combined pattern for any caption type
-    COMBINED_PATTERN = r'^(Figure|Fig\.?|FIGURE|FIG\.?|Table|TABLE|Tbl\.?|TBL\.?|Chart|CHART|Graph|GRAPH)\s*(\d+\.?\d*)\s*[:\-\.]?\s*(.*)$'
+    # Simple patterns
+    CAPTION_PATTERN = re.compile(
+        r'^(Figure|Fig\.?|Table|Tbl\.?|Chart|Graph)\s*(\d+\.?\d*)\s*[:\-\.]?\s*(.*)$',
+        re.IGNORECASE
+    )
     
     @classmethod
-    def detect_caption(
-        cls, 
-        text: str, 
-        caption_type: Optional[str] = None
-    ) -> Optional[Tuple[str, str, str]]:
+    def detect_caption(cls, text: str) -> Optional[Tuple[str, str, str]]:
         """
-        Detect caption in a text line
+        Detect caption in text line
         
         Args:
-            text: Text line to check for caption
-            caption_type: Type of caption to detect:
-                         'figure', 'table', 'chart', or None for any
-            
+            text: Text line to check
+        
         Returns:
-            Tuple of (caption_type, number, description) or None
-            Example: ('figure', '1', 'Revenue Analysis Chart')
+            Tuple of (type, number, description) or None
+            Example: ('figure', '1', 'Revenue Chart')
         """
         text = text.strip()
-        
         if not text:
             return None
         
-        # Select pattern based on caption type
-        if caption_type == 'figure':
-            pattern = cls.FIGURE_PATTERN
-        elif caption_type == 'table':
-            pattern = cls.TABLE_PATTERN
-        elif caption_type == 'chart':
-            pattern = cls.CHART_PATTERN
+        match = cls.CAPTION_PATTERN.match(text)
+        if not match:
+            return None
+        
+        label = match.group(1).lower()
+        number = match.group(2)
+        description = match.group(3).strip()
+        
+        # Normalize label
+        if 'fig' in label:
+            caption_type = 'figure'
+        elif 'tabl' in label or 'tbl' in label:
+            caption_type = 'table'
+        elif 'chart' in label or 'graph' in label:
+            caption_type = 'chart'
         else:
-            pattern = cls.COMBINED_PATTERN
+            caption_type = label
         
-        match = re.match(pattern, text, re.IGNORECASE)
-        
-        if match:
-            label = match.group(1).lower()  # figure, fig, table, etc.
-            number = match.group(2)
-            description = match.group(3).strip()
-            
-            # Normalize label
-            if 'fig' in label:
-                normalized_type = 'figure'
-            elif 'tabl' in label or 'tbl' in label:
-                normalized_type = 'table'
-            elif 'chart' in label or 'graph' in label:
-                normalized_type = 'chart'
-            else:
-                normalized_type = label
-            
-            return (normalized_type, number, description)
-        
-        return None
+        return (caption_type, number, description)
     
     @classmethod
     def find_caption_in_range(
         cls,
         lines: List[str],
         start_idx: int,
-        lookahead: int = 5,
-        caption_type: Optional[str] = None
+        lookahead: int = 10
     ) -> Optional[Dict]:
         """
-        Search for caption in a range of lines after a given position
+        Search for caption in lines after start_idx
         
         Args:
             lines: List of text lines
-            start_idx: Index to start searching from
-            lookahead: Number of lines to search (default: 5)
-            caption_type: Type of caption to search for (None = any)
+            start_idx: Starting line index
+            lookahead: Number of lines to search ahead
             
         Returns:
-            Dictionary with caption information or None:
-            {
-                'type': 'figure',
-                'number': '1',
-                'description': 'Revenue Analysis',
-                'line_idx': 42,
-                'full_text': 'Figure 1: Revenue Analysis'
-            }
+            Dictionary with caption info or None
         """
-        for i in range(start_idx, min(start_idx + lookahead, len(lines))):
+        end_idx = min(start_idx + lookahead, len(lines))
+        
+        for i in range(start_idx, end_idx):
+            if i >= len(lines):
+                break
+                
             line = lines[i].strip()
             
             # Skip empty lines
             if not line:
                 continue
             
-            # Try to detect caption
-            result = cls.detect_caption(line, caption_type)
+            # Stop at structural elements
+            if line.startswith('#') or '[IMAGE' in line.upper():
+                break
             
+            # Try to detect caption
+            result = cls.detect_caption(line)
             if result:
-                cap_type, number, description = result
+                caption_type, number, description = result
                 return {
-                    'type': cap_type,
+                    'type': caption_type,
                     'number': number,
                     'description': description,
                     'line_idx': i,
                     'full_text': line
                 }
-            
-            # Stop search if we hit structural elements
-            if cls._is_structural_element(line):
-                break
         
         return None
     
@@ -140,48 +111,77 @@ class CaptionDetector:
     def find_caption_before(
         cls,
         lines: List[str],
-        current_idx: int,
-        lookback: int = 3,
-        caption_type: Optional[str] = None
+        image_idx: int,
+        lookback: int = 10
     ) -> Optional[Dict]:
         """
-        Search for caption in lines before current position
-        Useful when caption appears above the image
+        Search for caption in lines before image_idx
         
         Args:
             lines: List of text lines
-            current_idx: Current position
-            lookback: Number of lines to search backwards (default: 3)
-            caption_type: Type of caption to search for
+            image_idx: Image line index
+            lookback: Number of lines to search backward
             
         Returns:
-            Dictionary with caption information or None
+            Dictionary with caption info or None
         """
-        start_idx = max(0, current_idx - lookback)
+        start_idx = max(0, image_idx - lookback)
         
-        for i in range(current_idx - 1, start_idx - 1, -1):
+        # Search backward from image_idx
+        for i in range(image_idx - 1, start_idx - 1, -1):
+            if i < 0:
+                break
+                
             line = lines[i].strip()
             
+            # Skip empty lines
             if not line:
                 continue
             
-            result = cls.detect_caption(line, caption_type)
+            # Stop at structural elements
+            if line.startswith('#'):
+                break
             
+            # Try to detect caption
+            result = cls.detect_caption(line)
             if result:
-                cap_type, number, description = result
+                caption_type, number, description = result
                 return {
-                    'type': cap_type,
+                    'type': caption_type,
                     'number': number,
                     'description': description,
                     'line_idx': i,
                     'full_text': line
                 }
-            
-            # Stop if we hit structural elements
-            if cls._is_structural_element(line):
-                break
         
         return None
+    
+    @classmethod
+    def format_as_heading(
+        cls,
+        caption_type: str,
+        number: str,
+        description: str,
+        level: int = 3
+    ) -> str:
+        """
+        Format caption as markdown heading
+        
+        Args:
+            caption_type: 'figure', 'table', or 'chart'
+            number: Caption number
+            description: Caption description
+            level: Heading level (default 3 for ###)
+        
+        Returns:
+            Formatted markdown heading
+        """
+        heading_prefix = '#' * level
+        cap_type = caption_type.capitalize()
+        
+        if description:
+            return f"{heading_prefix} {cap_type} {number}: {description}"
+        return f"{heading_prefix} {cap_type} {number}"
     
     @classmethod
     def format_caption_as_heading(
@@ -189,119 +189,35 @@ class CaptionDetector:
         caption_type: str,
         number: str,
         description: str,
-        heading_level: int = 3
+        level: int = 3
     ) -> str:
         """
-        Format caption as a markdown heading
+        Alias for format_as_heading for backward compatibility
         
         Args:
             caption_type: 'figure', 'table', or 'chart'
             number: Caption number
             description: Caption description
-            heading_level: Markdown heading level (default: 3 for ###)
-            
+            level: Heading level (default 3 for ###)
+        
         Returns:
             Formatted markdown heading
-            
-        Example:
-            format_caption_as_heading('figure', '1', 'Revenue Chart', 3)
-            Returns: "### Figure 1: Revenue Chart"
         """
-        # Capitalize caption type
-        cap_type_formatted = caption_type.capitalize()
-        
-        # Build heading
-        heading_prefix = '#' * heading_level
-        
-        if description:
-            return f"{heading_prefix} {cap_type_formatted} {number}: {description}"
-        else:
-            return f"{heading_prefix} {cap_type_formatted} {number}"
-    
-    @classmethod
-    def extract_all_captions(cls, text: str) -> List[Dict]:
-        """
-        Extract all captions from text
-        
-        Args:
-            text: Full text to search
-            
-        Returns:
-            List of caption dictionaries
-        """
-        lines = text.split('\n')
-        captions = []
-        
-        for idx, line in enumerate(lines):
-            result = cls.detect_caption(line)
-            if result:
-                cap_type, number, description = result
-                captions.append({
-                    'type': cap_type,
-                    'number': number,
-                    'description': description,
-                    'line_idx': idx,
-                    'full_text': line.strip()
-                })
-        
-        return captions
-    
-    @staticmethod
-    def _is_structural_element(line: str) -> bool:
-        """
-        Check if line is a structural element that should stop caption search
-        
-        Args:
-            line: Text line to check
-            
-        Returns:
-            True if structural element, False otherwise
-        """
-        line = line.strip()
-        
-        # Markdown headings
-        if line.startswith('#'):
-            return True
-        
-        # Image placeholders
-        if re.match(r'^\[IMAGE:', line, re.IGNORECASE):
-            return True
-        
-        # Table markers
-        if line.startswith('|') and line.endswith('|'):
-            return True
-        
-        # Horizontal rules
-        if re.match(r'^[-*_]{3,}$', line):
-            return True
-        
-        return False
+        return cls.format_as_heading(caption_type, number, description, level)
 
 
-# Convenience functions for backward compatibility
+# Simple helper functions for backward compatibility
 def detect_figure_caption(text: str) -> Optional[Tuple[str, str]]:
-    """
-    Detect figure caption (legacy interface)
-    
-    Returns:
-        Tuple of (number, description) or None
-    """
-    result = CaptionDetector.detect_caption(text, caption_type='figure')
-    if result:
-        _, number, description = result
-        return (number, description)
+    """Detect figure caption - returns (number, description)"""
+    result = CaptionDetector.detect_caption(text)
+    if result and result[0] == 'figure':
+        return (result[1], result[2])
     return None
 
 
 def detect_table_caption(text: str) -> Optional[Tuple[str, str]]:
-    """
-    Detect table caption (legacy interface)
-    
-    Returns:
-        Tuple of (number, description) or None
-    """
-    result = CaptionDetector.detect_caption(text, caption_type='table')
-    if result:
-        _, number, description = result
-        return (number, description)
+    """Detect table caption - returns (number, description)"""
+    result = CaptionDetector.detect_caption(text)
+    if result and result[0] == 'table':
+        return (result[1], result[2])
     return None

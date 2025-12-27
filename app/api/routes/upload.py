@@ -3,14 +3,15 @@ Upload Route with ExtractorFactory Integration
 Handles document upload and processing with automatic format detection
 """
 
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from typing import Optional
+from fastapi import APIRouter, Header, UploadFile, File, HTTPException
 from pathlib import Path
 import uuid
 import shutil
 from datetime import datetime
 import logging
 
-from app.models.schemas import FileUploadResponse, DocumentProcessResponse
+from app.models.schemas import FileUploadResponse, DocumentProcessResponse, ProcessingStatus
 from app.utils.file_validator import FileValidator
 from app.services.extraction.extractor_factory import ExtractorFactory
 from app.utils.markdown_converter import MarkdownConverter
@@ -32,7 +33,7 @@ vector_store = VectorStoreService()
 
 
 @router.post("/", response_model=FileUploadResponse)
-async def upload_file(file: UploadFile = File(...)):
+async def upload_file(file: UploadFile = File(...), x_user_id: Optional[str] = Header(None)):
     """
     Upload a document file
     
@@ -41,6 +42,11 @@ async def upload_file(file: UploadFile = File(...)):
     Returns:
         FileUploadResponse with file_id for processing
     """
+
+        
+    # Get user_id with default fallback
+    user_id = x_user_id if x_user_id else "default_user"
+    
     # Validate filename
     is_valid_name, name_error = FileValidator.validate_filename(file.filename)
     if not is_valid_name:
@@ -93,8 +99,9 @@ async def upload_file(file: UploadFile = File(...)):
             file_id=file_id,
             filename=safe_filename,
             file_type=file_extension,
+            file_size_bytes=file_size,
             upload_time=datetime.now(),
-            status="uploaded",
+            status=ProcessingStatus.UPLOADED,  # Use enum value
             message=f"File '{safe_filename}' uploaded successfully. Use /process/{file_id} to extract and index."
         )
     
@@ -106,9 +113,11 @@ async def upload_file(file: UploadFile = File(...)):
         logger.error(f"Upload error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Upload error: {str(e)}")
 
-
 @router.post("/process/{file_id}", response_model=DocumentProcessResponse)
-async def process_and_index_document(file_id: str):
+async def process_and_index_document(
+    file_id: str,
+    x_user_id: Optional[str] = Header(None)
+):
     """
     Process document and index to vector store
     
@@ -117,10 +126,14 @@ async def process_and_index_document(file_id: str):
     
     Args:
         file_id: Unique file identifier from upload
+        x_user_id: Optional user ID from header (defaults to 'default_user')
         
     Returns:
         DocumentProcessResponse with processing status and statistics
     """
+    # Get user_id with default fallback
+    user_id = x_user_id if x_user_id else "default_user"
+    
     upload_dir = Path(settings.upload_dir)
     file_path = None
     file_extension = None
@@ -136,7 +149,7 @@ async def process_and_index_document(file_id: str):
         )
     
     try:
-        logger.info(f"Processing: {actual_filename} (type: {file_extension})")
+        logger.info(f"Processing: {actual_filename} (type: {file_extension}) for user: {user_id}")
         
         # Get appropriate extractor using factory
         extractor = ExtractorFactory.get_extractor(
@@ -195,12 +208,13 @@ async def process_and_index_document(file_id: str):
         else:
             logger.info(f"✓ Saved markdown: {markdown_path.name}")
         
-        # Prepare metadata for chunking
+        # Prepare metadata for chunking (WITH USER_ID)
         chunk_metadata = {
             "file_id": file_id,
             "filename": actual_filename,
             "file_type": file_extension,
-            "original_filename": actual_filename
+            "original_filename": actual_filename,
+            "user_id": user_id  # CRITICAL: ADDED THIS
         }
         
         # Add extraction metadata
@@ -270,7 +284,7 @@ async def process_and_index_document(file_id: str):
         return DocumentProcessResponse(
             file_id=file_id,
             filename=actual_filename,
-            status="processed",
+            status=ProcessingStatus.COMPLETED,  # Use enum value
             markdown_path=str(markdown_path) if markdown_saved else None,
             chunks_created=chunks_added,
             message="\n".join(message_parts)
@@ -286,8 +300,8 @@ async def process_and_index_document(file_id: str):
             status_code=500,
             detail=f"Processing error: {str(e)}"
         )
-
-
+    
+    
 def _find_uploaded_file(upload_dir: Path, file_id: str) -> tuple:
     """
     Find uploaded file using multiple strategies

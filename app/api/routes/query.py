@@ -1,6 +1,7 @@
 """
 Query Route with Hybrid Search
 Combines BM25 keyword and semantic search
+Fixed: Safe metadata access with type conversion
 """
 
 from fastapi import APIRouter, HTTPException
@@ -20,6 +21,32 @@ router = APIRouter(prefix="/api/query", tags=["Query"])
 # Initialize services
 vector_store = VectorStoreService()
 llm_service = LLMService()
+
+
+def safe_get_int(metadata: dict, key: str, default: int = 0) -> int:
+    """Safely get integer from metadata (handles both str and int)"""
+    try:
+        value = metadata.get(key, default)
+        return int(value) if value is not None else default
+    except (ValueError, TypeError):
+        return default
+
+
+def safe_get_str(metadata: dict, key: str, default: str = '') -> str:
+    """Safely get string from metadata"""
+    try:
+        value = metadata.get(key, default)
+        return str(value) if value is not None else default
+    except (ValueError, TypeError):
+        return default
+
+
+def safe_get_score(score: float) -> float:
+    """Safely clamp score to valid range [0.0, 1.0]"""
+    try:
+        return max(0.0, min(1.0, float(score)))
+    except (ValueError, TypeError):
+        return 0.0
 
 
 @router.post("/", response_model=QueryResponse)
@@ -69,28 +96,28 @@ async def query_knowledge_base(request: QueryRequest):
         for i, (doc, metadata, score) in enumerate(zip(documents, metadatas, scores)):
             source_header = f"[Source {i+1}]"
             
-            # Add page number
-            page = metadata.get('page_number', 0)
+            # Add page number - safe conversion
+            page = safe_get_int(metadata, 'page_number', 0)
             if page > 0:
                 source_header += f" [Page {page}]"
             
-            # Add content type
-            chunk_type = metadata.get('chunk_type', 'text')
+            # Add content type - safe conversion
+            chunk_type = safe_get_str(metadata, 'chunk_type', 'text')
             if chunk_type != 'text':
                 source_header += f" [{chunk_type.upper()}]"
             
             context_parts.append(f"{source_header}:\n{doc}\n")
             
-            # Prepare source
+            # Prepare source - safe metadata access
             sources.append(SourceDocument(
                 content=doc[:500] + "..." if len(doc) > 500 else doc,
-                filename=metadata.get('filename', 'unknown'),
-                chunk_id=metadata.get('chunk_id', f'chunk_{i}'),
-                relevance_score=round(float(score), 3),
+                filename=safe_get_str(metadata, 'filename', 'unknown'),
+                chunk_id=safe_get_str(metadata, 'chunk_id', f'chunk_{i}'),
+                relevance_score=safe_get_score(score),  # Clamp to valid range
                 page_number=page,
                 chunk_type=chunk_type,
-                semantic_score=None,  # Can add if needed
-                keyword_score=None    # Can add if needed
+                semantic_score=None,
+                keyword_score=None
             ))
         
         context = "\n\n".join(context_parts)
@@ -128,6 +155,8 @@ async def query_knowledge_base(request: QueryRequest):
         raise
     except Exception as e:
         logger.error(f"Query error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(
             status_code=500,
             detail=f"Error processing query: {str(e)}"
@@ -164,18 +193,19 @@ async def query_with_conversation(request: ConversationQueryRequest):
                 detail="No documents found."
             )
         
-        # Build context
+        # Build context with safe metadata access
         context_parts = []
         sources = []
         
         for i, (doc, metadata, score) in enumerate(zip(documents, metadatas, scores)):
             source_header = f"[Source {i+1}]"
             
-            page = metadata.get('page_number', 0)
+            # Safe metadata access
+            page = safe_get_int(metadata, 'page_number', 0)
             if page > 0:
                 source_header += f" [Page {page}]"
             
-            chunk_type = metadata.get('chunk_type', 'text')
+            chunk_type = safe_get_str(metadata, 'chunk_type', 'text')
             if chunk_type != 'text':
                 source_header += f" [{chunk_type.upper()}]"
             
@@ -183,9 +213,9 @@ async def query_with_conversation(request: ConversationQueryRequest):
             
             sources.append(SourceDocument(
                 content=doc[:500] + "..." if len(doc) > 500 else doc,
-                filename=metadata.get('filename', 'unknown'),
-                chunk_id=metadata.get('chunk_id', f'chunk_{i}'),
-                relevance_score=round(float(score), 3),
+                filename=safe_get_str(metadata, 'filename', 'unknown'),
+                chunk_id=safe_get_str(metadata, 'chunk_id', f'chunk_{i}'),
+                relevance_score=safe_get_score(score),  # Clamp to valid range
                 page_number=page,
                 chunk_type=chunk_type
             ))
@@ -225,6 +255,8 @@ async def query_with_conversation(request: ConversationQueryRequest):
         raise
     except Exception as e:
         logger.error(f"Conversation query error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(
             status_code=500,
             detail=f"Error: {str(e)}"

@@ -1,544 +1,509 @@
 """
-Vector Store Service with Hybrid Search
-Combines BM25 keyword search with semantic search
+Improved Vector Store Service
+- Proper user isolation via metadata filtering
+- Better ChromaDB usage (minimal metadata)
+- Separation of concerns (store only embeddings, use SQL for metadata)
+- Better error handling
 """
 
-from langchain_chroma import Chroma
-from langchain_aws import BedrockEmbeddings
-from langchain.docstore.document import Document as LangChainDocument
-from typing import List, Dict, Tuple, Optional
-from app.core.config import settings
+import chromadb
+from chromadb.config import Settings as ChromaSettings
+from typing import List, Dict, Any, Tuple, Optional
 import logging
-import time
-from botocore.exceptions import ClientError
-from rank_bm25 import BM25Okapi
-import numpy as np
 
-logger = logging.getLogger(__name__)
+from rank_bm25 import BM25Okapi
+
+from app.core.config import settings
+from app.core.exceptions import (
+    VectorStoreException, 
+    EmbeddingError, 
+    SearchError,
+    NoDocumentsFoundError  # ADDED THIS IMPORT
+)
+from app.core.monitoring import get_logger
+
+logger = get_logger(__name__)
 
 
 class VectorStoreService:
-    """Vector store with hybrid search (BM25 + Semantic)"""
+    """
+    Vector store service with user isolation
+    
+    Stores document chunks with embeddings in ChromaDB
+    Filters by user_id for isolation
+    """
     
     def __init__(self):
-        """Initialize vector store and BM25"""
-        aws_config = {"region_name": settings.aws_region}
-
-        if hasattr(settings, "aws_profile_name") and settings.aws_profile_name:
-            aws_config["credentials_profile_name"] = settings.aws_profile_name
-
-        self.embeddings = BedrockEmbeddings(
-            model_id=settings.embedding_model_id,
-            **aws_config
-        )
-
-        # Single vectorstore for all chunks
-        self.vectorstore = Chroma(
-            collection_name="kb_chunks",
-            embedding_function=self.embeddings,
-            persist_directory=settings.chroma_persist_dir
-        )
-        
-        # BM25 index (will be built when documents are added)
-        self.bm25_index = None
-        self.bm25_docs = []  # Store documents for BM25
-        self.bm25_ids = []   # Store IDs for BM25
-        
-        logger.info("VectorStore with hybrid search initialized")
-    
-    def _rebuild_bm25_index(self):
-        """Rebuild BM25 index from vector store"""
+        """Initialize ChromaDB client and collection"""
         try:
-            collection = self.vectorstore._collection
-            all_data = collection.get()
+            self.client = chromadb.PersistentClient(
+                path=str(settings.chroma_persist_dir),
+                settings=ChromaSettings(
+                    anonymized_telemetry=False,
+                    allow_reset=True
+                )
+            )
             
-            documents = all_data.get('documents', [])
-            ids = all_data.get('ids', [])
+            # Get or create collection
+            self.collection = self.client.get_or_create_collection(
+                name=settings.chroma_collection_name,
+                metadata={"description": "RAG document chunks with user isolation"}
+            )
             
-            if documents:
-                # Tokenize documents for BM25
-                tokenized_docs = [doc.lower().split() for doc in documents]
-                self.bm25_index = BM25Okapi(tokenized_docs)
-                self.bm25_docs = documents
-                self.bm25_ids = ids
-                logger.info(f"BM25 index rebuilt with {len(documents)} documents")
-            else:
-                self.bm25_index = None
-                self.bm25_docs = []
-                self.bm25_ids = []
-                logger.info("No documents for BM25 index")
-                
+            # BM25 index (in-memory)
+            self.bm25_index: Optional[BM25Okapi] = None
+            self.bm25_documents: List[str] = []
+            self.bm25_metadatas: List[Dict] = []
+            
+            logger.info(f"Vector store initialized: {self.collection.name}")
+            
         except Exception as e:
-            logger.error(f"Error rebuilding BM25 index: {str(e)}")
-            self.bm25_index = None
-    
-    def _retry_with_backoff(self, func, max_retries=3, base_delay=1):
-        """Retry with exponential backoff for API throttling"""
-        for attempt in range(max_retries):
-            try:
-                return func()
-            except ClientError as e:
-                error_code = e.response.get('Error', {}).get('Code', '')
-                
-                if error_code in ['ThrottlingException', 'TooManyRequestsException']:
-                    if attempt < max_retries - 1:
-                        delay = base_delay * (2 ** attempt)
-                        logger.warning(f"API throttled, retrying in {delay}s...")
-                        time.sleep(delay)
-                        continue
-                    else:
-                        logger.error(f"Max retries reached")
-                        raise
-                else:
-                    raise
-            except Exception as e:
-                logger.error(f"Error in retry: {e}")
-                raise
-        
-        raise Exception(f"Failed after {max_retries} retries")
+            logger.error(f"Failed to initialize vector store: {e}", exc_info=True)
+            raise VectorStoreException(f"Failed to initialize vector store: {str(e)}")
     
     def add_document_chunks(
-        self, 
-        chunks: List[Dict], 
+        self,
+        chunks: List[Dict[str, Any]],
         file_id: str,
         filename: str,
         structured_data: Optional[Dict] = None
     ) -> int:
-        """Add chunks to vector store and rebuild BM25 index"""
-        try:
-            if not chunks:
-                logger.warning("No chunks to add")
-                return 0
+        """
+        Add document chunks to vector store
+        
+        Args:
+            chunks: List of chunk dictionaries with 'text', 'chunk_id', and 'metadata'
+            file_id: Document file ID
+            filename: Document filename
+            structured_data: Additional structured data (optional)
             
-            # Prepare documents for vector store
-            documents = []
-            metadatas = []
+        Returns:
+            Number of chunks added
+            
+        Note:
+            User ID must be in chunk metadata for isolation
+        """
+        if not chunks:
+            logger.warning(f"No chunks provided for {file_id}")
+            return 0
+        
+        try:
+            texts = []
             ids = []
+            metadatas = []
             
             for chunk in chunks:
-                # Skip if marked as parent (from old system)
-                if chunk.get('metadata', {}).get('is_parent', False):
-                    continue
-                
+                # Extract data
                 text = chunk.get('text', '')
-                if not text.strip():
+                chunk_id = chunk.get('chunk_id', '')
+                metadata = chunk.get('metadata', {})
+                
+                if not text or not chunk_id:
+                    logger.warning(f"Skipping invalid chunk: {chunk_id}")
                     continue
                 
-                doc = LangChainDocument(
-                    page_content=text,
-                    metadata=chunk.get('metadata', {})
-                )
+                # Ensure user_id is in metadata (CRITICAL for isolation)
+                if 'user_id' not in metadata:
+                    logger.error(f"Chunk {chunk_id} missing user_id!")
+                    raise VectorStoreException(
+                        f"Cannot add chunk without user_id: {chunk_id}"
+                    )
                 
-                documents.append(doc)
-                metadatas.append(chunk.get('metadata', {}))
-                ids.append(chunk.get('chunk_id', f"chunk_{len(ids)}"))
+                # Prepare minimal metadata for ChromaDB
+                # Store only essential fields (ChromaDB has size limits)
+                chroma_metadata = {
+                    'file_id': str(metadata.get('file_id', file_id)),
+                    'user_id': str(metadata.get('user_id')),  # CRITICAL
+                    'filename': str(metadata.get('filename', filename)),
+                    'chunk_type': str(metadata.get('chunk_type', 'text')),
+                    'page_number': int(metadata.get('page_number', 0)),  # Keep as int
+                    'chunk_index': int(metadata.get('chunk_index', 0)),  # Keep as int
+                    'chunk_id': str(chunk_id)  # Add chunk_id for easier lookup
+                }
+                
+                texts.append(text)
+                ids.append(chunk_id)
+                metadatas.append(chroma_metadata)
             
-            if not documents:
-                logger.warning("No valid documents to add")
+            if not texts:
+                logger.warning(f"No valid chunks to add for {file_id}")
                 return 0
             
-            # Add to vector store with retry
-            def add_docs():
-                self.vectorstore.add_documents(
-                    documents=documents,
-                    ids=ids
-                )
-                return len(documents)
+            # Add to ChromaDB (will auto-generate embeddings)
+            self.collection.add(
+                documents=texts,
+                ids=ids,
+                metadatas=metadatas
+            )
             
-            added_count = self._retry_with_backoff(add_docs)
-            logger.info(f"Added {added_count} chunks to vector store")
-            
-            # Rebuild BM25 index after adding documents
+            # Rebuild BM25 index
             self._rebuild_bm25_index()
             
-            return added_count
+            logger.info(
+                f"Added {len(texts)} chunks to vector store",
+                extra={"file_id": file_id, "chunks": len(texts)}
+            )
             
-        except Exception as e:
-            logger.error(f"Error adding chunks: {str(e)}")
+            return len(texts)
+            
+        except VectorStoreException:
             raise
-    
-    def semantic_search(
-        self,
-        query: str,
-        top_k: int = 5,
-        file_id: Optional[str] = None
-    ) -> Tuple[List[str], List[Dict], List[float]]:
-        """
-        Pure semantic search using embeddings
-        
-        Returns:
-            Tuple of (documents, metadatas, distances)
-        """
-        try:
-            # Build filter
-            where_filter = None
-            if file_id:
-                where_filter = {"file_id": file_id}
-            
-            # Perform search with retry
-            def do_search():
-                if where_filter:
-                    return self.vectorstore.similarity_search_with_score(
-                        query,
-                        k=top_k,
-                        filter=where_filter
-                    )
-                else:
-                    return self.vectorstore.similarity_search_with_score(
-                        query,
-                        k=top_k
-                    )
-            
-            results = self._retry_with_backoff(do_search)
-            
-            # Parse results
-            documents = []
-            metadatas = []
-            distances = []
-            
-            for doc, score in results:
-                documents.append(doc.page_content)
-                metadatas.append(doc.metadata)
-                distances.append(score)
-            
-            return documents, metadatas, distances
-            
         except Exception as e:
-            logger.error(f"Semantic search error: {str(e)}")
-            raise
-    
-    def keyword_search(
-        self,
-        query: str,
-        top_k: int = 5,
-        file_id: Optional[str] = None
-    ) -> Tuple[List[str], List[Dict], List[float]]:
-        """
-        Keyword search using BM25
-        
-        Returns:
-            Tuple of (documents, metadatas, scores)
-        """
-        try:
-            if not self.bm25_index:
-                logger.warning("BM25 index not available, rebuilding...")
-                self._rebuild_bm25_index()
-                
-                if not self.bm25_index:
-                    logger.warning("No documents for keyword search")
-                    return [], [], []
-            
-            # Tokenize query
-            tokenized_query = query.lower().split()
-            
-            # Get BM25 scores
-            bm25_scores = self.bm25_index.get_scores(tokenized_query)
-            
-            # Get top-k indices
-            top_indices = np.argsort(bm25_scores)[::-1][:top_k * 3]  # Get more for filtering
-            
-            # Get full metadata from vector store
-            collection = self.vectorstore._collection
-            
-            documents = []
-            metadatas = []
-            scores = []
-            
-            for idx in top_indices:
-                if idx >= len(self.bm25_ids):
-                    continue
-                    
-                chunk_id = self.bm25_ids[idx]
-                score = float(bm25_scores[idx])
-                
-                # Get metadata from vector store
-                result = collection.get(
-                    ids=[chunk_id],
-                    include=['documents', 'metadatas']
-                )
-                
-                if result and result['documents']:
-                    doc_text = result['documents'][0]
-                    doc_metadata = result['metadatas'][0]
-                    
-                    # Apply file filter if specified
-                    if file_id and doc_metadata.get('file_id') != file_id:
-                        continue
-                    
-                    documents.append(doc_text)
-                    metadatas.append(doc_metadata)
-                    scores.append(score)
-                    
-                    if len(documents) >= top_k:
-                        break
-            
-            return documents, metadatas, scores
-            
-        except Exception as e:
-            logger.error(f"Keyword search error: {str(e)}")
-            return [], [], []
+            logger.error(f"Error adding chunks: {str(e)}", exc_info=True)
+            raise VectorStoreException(f"Failed to add chunks: {str(e)}")
     
     def hybrid_search(
         self,
         query: str,
         top_k: int = 5,
+        user_id: Optional[str] = None,
         file_id: Optional[str] = None,
         keyword_weight: float = 0.3,
         semantic_weight: float = 0.7
     ) -> Tuple[List[str], List[Dict], List[float]]:
         """
-        Hybrid search combining BM25 keyword and semantic search
+        Hybrid search combining BM25 and semantic search with user isolation
         
         Args:
             query: Search query
             top_k: Number of results to return
-            file_id: Optional file filter
-            keyword_weight: Weight for keyword search (0-1)
-            semantic_weight: Weight for semantic search (0-1)
+            user_id: User ID for isolation (optional for backward compatibility)
+            file_id: Filter by specific file (optional)
+            keyword_weight: Weight for BM25 keyword search
+            semantic_weight: Weight for semantic search
             
         Returns:
-            Tuple of (documents, metadatas, combined_scores)
+            Tuple of (documents, metadatas, scores)
+            
+        Raises:
+            SearchError: If search fails
+            NoDocumentsFoundError: If no documents in collection
         """
         try:
-            # Validate weights
-            total_weight = keyword_weight + semantic_weight
-            if abs(total_weight - 1.0) > 0.01:
-                logger.warning(f"Weights don't sum to 1.0 ({total_weight}), normalizing...")
-                keyword_weight = keyword_weight / total_weight
-                semantic_weight = semantic_weight / total_weight
+            # Check if collection is empty
+            collection_count = self.collection.count()
+            if collection_count == 0:
+                raise NoDocumentsFoundError()
             
-            logger.info(f"Hybrid search: keyword={keyword_weight:.2f}, semantic={semantic_weight:.2f}")
+            # Build where filter for user isolation
+            where_filter = {}
+            if user_id:
+                where_filter['user_id'] = user_id
+            if file_id:
+                where_filter['file_id'] = file_id
             
-            # Perform both searches (get more results for merging)
-            search_k = min(top_k * 3, 30)  # Get 3x results for better fusion
+            # Perform semantic search
+            semantic_results = self.collection.query(
+                query_texts=[query],
+                n_results=min(top_k * 2, 50),  # Get more for hybrid ranking
+                where=where_filter if where_filter else None
+            )
             
-            # Semantic search
-            sem_docs, sem_metas, sem_distances = self.semantic_search(query, search_k, file_id)
-            
-            # Keyword search
-            kw_docs, kw_metas, kw_scores = self.keyword_search(query, search_k, file_id)
-            
-            # If one search returns no results, use the other
-            if not sem_docs and not kw_docs:
-                logger.warning("Both searches returned no results")
+            if not semantic_results or not semantic_results['documents']:
+                logger.warning(f"No semantic results for query")
                 return [], [], []
-            elif not sem_docs:
-                logger.info("Using keyword search only")
-                return kw_docs[:top_k], kw_metas[:top_k], kw_scores[:top_k]
-            elif not kw_docs:
-                logger.info("Using semantic search only")
-                return sem_docs[:top_k], sem_metas[:top_k], sem_distances[:top_k]
             
-            # Normalize scores to 0-1 range
-            # For semantic: lower distance is better, so invert
-            sem_scores_norm = []
-            if sem_distances:
-                max_dist = max(sem_distances) if max(sem_distances) > 0 else 1.0
-                sem_scores_norm = [1.0 - (d / max_dist) for d in sem_distances]
+            # Extract semantic results
+            semantic_docs = semantic_results['documents'][0]
+            semantic_metas = semantic_results['metadatas'][0]
+            semantic_distances = semantic_results['distances'][0]
             
-            # For keyword: higher score is better
-            kw_scores_norm = []
-            if kw_scores:
-                max_score = max(kw_scores) if max(kw_scores) > 0 else 1.0
-                kw_scores_norm = [s / max_score for s in kw_scores]
+            # Convert distances to similarity scores (cosine distance -> similarity)
+            # ChromaDB returns L2 distances, ensure scores are always positive
+            semantic_scores = []
+            for d in semantic_distances:
+                # Convert distance to similarity (0 to 1 range)
+                # For L2 distance: similarity = 1 / (1 + distance)
+                similarity = max(0.0, min(1.0, 1.0 / (1.0 + abs(d))))
+                semantic_scores.append(similarity)
             
-            # Create scoring dictionaries
-            semantic_dict = {}
-            for doc, meta, score in zip(sem_docs, sem_metas, sem_scores_norm):
-                chunk_id = meta.get('chunk_id', doc[:50])  # Use chunk_id or first 50 chars
-                semantic_dict[chunk_id] = {
-                    'document': doc,
-                    'metadata': meta,
-                    'score': score
-                }
-            
-            keyword_dict = {}
-            for doc, meta, score in zip(kw_docs, kw_metas, kw_scores_norm):
-                chunk_id = meta.get('chunk_id', doc[:50])
-                keyword_dict[chunk_id] = {
-                    'document': doc,
-                    'metadata': meta,
-                    'score': score
-                }
-            
-            # Combine scores using weighted sum
-            all_chunk_ids = set(semantic_dict.keys()) | set(keyword_dict.keys())
-            
-            combined_results = []
-            for chunk_id in all_chunk_ids:
-                sem_score = semantic_dict.get(chunk_id, {}).get('score', 0.0)
-                kw_score = keyword_dict.get(chunk_id, {}).get('score', 0.0)
+            # Perform BM25 keyword search
+            if self.bm25_index and keyword_weight > 0:
+                keyword_results = self._bm25_search(
+                    query, top_k * 2, user_id, file_id
+                )
                 
-                # Weighted combination
-                combined_score = (semantic_weight * sem_score) + (keyword_weight * kw_score)
-                
-                # Get document and metadata (prefer semantic if available)
-                if chunk_id in semantic_dict:
-                    doc = semantic_dict[chunk_id]['document']
-                    meta = semantic_dict[chunk_id]['metadata']
-                else:
-                    doc = keyword_dict[chunk_id]['document']
-                    meta = keyword_dict[chunk_id]['metadata']
-                
-                combined_results.append({
-                    'document': doc,
-                    'metadata': meta,
-                    'combined_score': combined_score,
-                    'semantic_score': sem_score,
-                    'keyword_score': kw_score
-                })
+                # Combine scores
+                final_results = self._combine_search_results(
+                    semantic_docs, semantic_metas, semantic_scores,
+                    keyword_results,
+                    keyword_weight, semantic_weight,
+                    top_k
+                )
+            else:
+                # Semantic only
+                final_results = list(zip(
+                    semantic_docs[:top_k],
+                    semantic_metas[:top_k],
+                    semantic_scores[:top_k]
+                ))
             
-            # Sort by combined score (descending)
-            combined_results.sort(key=lambda x: x['combined_score'], reverse=True)
+            if not final_results:
+                logger.info(f"No results for query after filtering")
+                return [], [], []
             
-            # Take top-k
-            top_results = combined_results[:top_k]
+            # Unzip results
+            documents, metadatas, scores = zip(*final_results)
             
-            # Extract results
-            final_docs = [r['document'] for r in top_results]
-            final_metas = [r['metadata'] for r in top_results]
-            final_scores = [r['combined_score'] for r in top_results]
+            return list(documents), list(metadatas), list(scores)
             
-            logger.info(f"Hybrid search returned {len(final_docs)} results")
-            
-            return final_docs, final_metas, final_scores
-            
+        except NoDocumentsFoundError:
+            raise
         except Exception as e:
-            logger.error(f"Hybrid search error: {str(e)}")
-            # Fallback to semantic search
-            logger.info("Falling back to semantic search")
-            return self.semantic_search(query, top_k, file_id)
+            logger.error(f"Search error: {str(e)}", exc_info=True)
+            raise SearchError(f"Search failed: {str(e)}")
     
-    def search(
+    def _bm25_search(
         self,
         query: str,
-        top_k: int = 5,
+        top_k: int,
+        user_id: Optional[str] = None,
         file_id: Optional[str] = None
-    ) -> Tuple[List[str], List[Dict], List[float]]:
-        """
-        Default search (uses hybrid with default weights)
-        """
-        return self.hybrid_search(
-            query, 
-            top_k, 
-            file_id,
-            keyword_weight=settings.default_keyword_weight,
-            semantic_weight=settings.default_semantic_weight
-        )
-    
-    def search_by_metadata(
-        self,
-        filters: Dict,
-        limit: int = 10
-    ) -> List[Dict]:
-        """Search by metadata filters"""
-        try:
-            results = self.vectorstore.similarity_search(
-                query="",
-                k=limit,
-                filter=filters
-            )
-            
-            return [
-                {
-                    "content": doc.page_content,
-                    "metadata": doc.metadata
-                }
-                for doc in results
-            ]
-            
-        except Exception as e:
-            logger.error(f"Metadata search error: {str(e)}")
+    ) -> List[Tuple[str, Dict, float]]:
+        """Perform BM25 keyword search with filtering"""
+        if not self.bm25_index:
             return []
+        
+        # Tokenize query
+        tokenized_query = query.lower().split()
+        
+        # Get BM25 scores
+        scores = self.bm25_index.get_scores(tokenized_query)
+        
+        # Filter and rank
+        results = []
+        for idx, score in enumerate(scores):
+            if idx >= len(self.bm25_documents):
+                break
+            
+            metadata = self.bm25_metadatas[idx]
+            
+            # Apply filters
+            if user_id and metadata.get('user_id') != user_id:
+                continue
+            if file_id and metadata.get('file_id') != file_id:
+                continue
+            
+            if score > 0:
+                results.append((
+                    self.bm25_documents[idx],
+                    metadata,
+                    float(score)
+                ))
+        
+        # Sort by score and return top_k
+        results.sort(key=lambda x: x[2], reverse=True)
+        return results[:top_k]
     
-    def get_collection_stats(self) -> Dict:
-        """Get statistics about the collection"""
-        try:
-            collection = self.vectorstore._collection
-            count = collection.count()
-            
-            # Get unique file IDs
-            all_data = collection.get()
-            metadatas = all_data.get('metadatas', [])
-            
-            file_docs = {}
-            for metadata in metadatas:
-                file_id = metadata.get('file_id', 'unknown')
-                filename = metadata.get('filename', 'unknown')
-                
-                if file_id not in file_docs:
-                    file_docs[file_id] = {
-                        'file_id': file_id,
-                        'filename': filename,
-                        'chunk_count': 0
-                    }
-                
-                file_docs[file_id]['chunk_count'] += 1
-            
-            return {
-                'total_documents': len(file_docs),
-                'total_chunks': count,
-                'documents': list(file_docs.values()),
-                'bm25_indexed': len(self.bm25_docs) if self.bm25_docs else 0
+    def _combine_search_results(
+        self,
+        semantic_docs: List[str],
+        semantic_metas: List[Dict],
+        semantic_scores: List[float],
+        keyword_results: List[Tuple[str, Dict, float]],
+        keyword_weight: float,
+        semantic_weight: float,
+        top_k: int
+    ) -> List[Tuple[str, Dict, float]]:
+        """Combine semantic and keyword search results"""
+        
+        # Create document map for combining
+        doc_map = {}
+        
+        # Add semantic results
+        for idx, (doc, meta, score) in enumerate(zip(semantic_docs, semantic_metas, semantic_scores)):
+            # Use chunk_id if available, otherwise use index as unique identifier
+            chunk_id = str(meta.get('chunk_id', f'semantic_{idx}'))
+            doc_map[chunk_id] = {
+                'doc': doc,
+                'meta': meta,
+                'semantic_score': score,
+                'keyword_score': 0.0
             }
+        
+        # Add keyword results
+        for idx, (doc, meta, score) in enumerate(keyword_results):
+            chunk_id = str(meta.get('chunk_id', f'keyword_{idx}'))
+            if chunk_id in doc_map:
+                doc_map[chunk_id]['keyword_score'] = score
+            else:
+                doc_map[chunk_id] = {
+                    'doc': doc,
+                    'meta': meta,
+                    'semantic_score': 0.0,
+                    'keyword_score': score
+                }
+        
+        # Normalize scores
+        max_semantic = max((v['semantic_score'] for v in doc_map.values()), default=1.0)
+        max_keyword = max((v['keyword_score'] for v in doc_map.values()), default=1.0)
+        
+        # Calculate combined scores
+        combined_results = []
+        for chunk_id, data in doc_map.items():
+            normalized_semantic = data['semantic_score'] / max_semantic if max_semantic > 0 else 0
+            normalized_keyword = data['keyword_score'] / max_keyword if max_keyword > 0 else 0
             
-        except Exception as e:
-            logger.error(f"Error getting stats: {str(e)}")
-            return {
-                'total_documents': 0,
-                'total_chunks': 0,
-                'documents': [],
-                'bm25_indexed': 0
-            }
-    
-    def delete_document_by_file_id(self, file_id: str) -> bool:
-        """Delete all chunks for a file"""
-        try:
-            collection = self.vectorstore._collection
-            
-            # Get all IDs for this file
-            results = collection.get(
-                where={"file_id": file_id}
+            combined_score = (
+                semantic_weight * normalized_semantic +
+                keyword_weight * normalized_keyword
             )
             
-            ids_to_delete = results.get('ids', [])
+            combined_results.append((
+                data['doc'],
+                data['meta'],
+                combined_score
+            ))
+        
+        # Sort by combined score
+        combined_results.sort(key=lambda x: x[2], reverse=True)
+        
+        return combined_results[:top_k]
+    
+    def _rebuild_bm25_index(self) -> None:
+        """Rebuild BM25 index from all documents"""
+        try:
+            # Get all documents
+            all_docs = self.collection.get()
             
-            if ids_to_delete:
-                collection.delete(ids=ids_to_delete)
-                logger.info(f"Deleted {len(ids_to_delete)} chunks for file {file_id}")
-                
-                # Rebuild BM25 index
-                self._rebuild_bm25_index()
-                
-                return True
-            else:
-                logger.warning(f"No chunks found for file {file_id}")
+            if not all_docs or not all_docs['documents']:
+                self.bm25_index = None
+                self.bm25_documents = []
+                self.bm25_metadatas = []
+                return
+            
+            self.bm25_documents = all_docs['documents']
+            self.bm25_metadatas = all_docs['metadatas']
+            
+            # Tokenize documents
+            tokenized_docs = [doc.lower().split() for doc in self.bm25_documents]
+            
+            # Create BM25 index
+            self.bm25_index = BM25Okapi(tokenized_docs)
+            
+            logger.info(f"BM25 index rebuilt with {len(self.bm25_documents)} documents")
+            
+        except Exception as e:
+            logger.error(f"Failed to rebuild BM25 index: {e}")
+            self.bm25_index = None
+    
+    def delete_document_by_file_id(
+        self,
+        file_id: str,
+        user_id: Optional[str] = None
+    ) -> bool:
+        """
+        Delete all chunks for a specific file with user verification
+        
+        Args:
+            file_id: File ID to delete
+            user_id: User ID for verification (optional)
+            
+        Returns:
+            True if deleted, False if not found
+        """
+        try:
+            # Build where filter
+            where_filter = {'file_id': file_id}
+            if user_id:
+                where_filter['user_id'] = user_id
+            
+            # Get matching documents
+            results = self.collection.get(where=where_filter)
+            
+            if not results or not results['ids']:
                 return False
             
-        except Exception as e:
-            logger.error(f"Error deleting document: {str(e)}")
-            return False
-    
-    def reset_collection(self) -> bool:
-        """Reset entire collection"""
-        try:
-            collection = self.vectorstore._collection
+            # Delete by IDs
+            self.collection.delete(ids=results['ids'])
             
-            # Get all IDs
-            all_data = collection.get()
-            ids = all_data.get('ids', [])
+            # Rebuild BM25
+            self._rebuild_bm25_index()
             
-            if ids:
-                collection.delete(ids=ids)
-                logger.info(f"Reset collection - deleted {len(ids)} chunks")
-            
-            # Clear BM25 index
-            self.bm25_index = None
-            self.bm25_docs = []
-            self.bm25_ids = []
+            logger.info(
+                f"Deleted {len(results['ids'])} chunks for file {file_id}",
+                extra={"file_id": file_id, "user_id": user_id}
+            )
             
             return True
             
         except Exception as e:
-            logger.error(f"Error resetting collection: {str(e)}")
-            return False
+            logger.error(f"Error deleting document: {str(e)}", exc_info=True)
+            raise VectorStoreException(f"Failed to delete document: {str(e)}")
+    
+    def get_collection_stats(self, user_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Get collection statistics with optional user filtering
+        
+        Args:
+            user_id: Filter by user ID (optional)
+            
+        Returns:
+            Dictionary with statistics
+        """
+        try:
+            # Get all documents with optional filtering
+            where_filter = {'user_id': user_id} if user_id else None
+            results = self.collection.get(where=where_filter)
+            
+            if not results or not results['metadatas']:
+                return {
+                    'total_documents': 0,
+                    'total_chunks': 0,
+                    'documents': []
+                }
+            
+            # Count unique files
+            file_ids = {}
+            for meta in results['metadatas']:
+                fid = meta.get('file_id', 'unknown')
+                if fid not in file_ids:
+                    file_ids[fid] = {
+                        'file_id': fid,
+                        'filename': meta.get('filename', 'unknown'),
+                        'chunk_count': 0
+                    }
+                file_ids[fid]['chunk_count'] += 1
+            
+            return {
+                'total_documents': len(file_ids),
+                'total_chunks': len(results['ids']),
+                'documents': list(file_ids.values()),
+                'user_id': user_id
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting stats: {str(e)}", exc_info=True)
+            return {
+                'total_documents': 0,
+                'total_chunks': 0,
+                'documents': [],
+                'error': str(e)
+            }
+    
+    def reset_collection(self) -> bool:
+        """
+        Reset entire collection (admin function - use with caution)
+        
+        Returns:
+            True if successful
+        """
+        try:
+            self.client.delete_collection(name=settings.chroma_collection_name)
+            
+            self.collection = self.client.create_collection(
+                name=settings.chroma_collection_name,
+                metadata={"description": "RAG document chunks with user isolation"}
+            )
+            
+            self.bm25_index = None
+            self.bm25_documents = []
+            self.bm25_metadatas = []
+            
+            logger.warning("Collection reset - all data deleted")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error resetting collection: {str(e)}", exc_info=True)
+            raise VectorStoreException(f"Failed to reset collection: {str(e)}")
