@@ -1,18 +1,24 @@
 """
-Query Route with Hybrid Search
-Combines BM25 keyword and semantic search
-Fixed: Safe metadata access with type conversion
+Query Route with MANDATORY USER AUTH and DATABASE-BACKED CONVERSATION HISTORY
+- All queries require X-User-ID header
+- Full user isolation in vector search
+- Conversation history stored in database (FIFO)
+- Query logging to database
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
+from sqlalchemy.orm import Session
 from app.models.schemas import (
     QueryRequest, QueryResponse, SourceDocument,
     ConversationQueryRequest
 )
 from app.services.vector_store_service import VectorStoreService
 from app.services.llm_service import LLMService
+from app.core.dependencies import get_user_id, get_database_session
+from app.db.models import QueryLog
 import time
 import logging
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -50,15 +56,25 @@ def safe_get_score(score: float) -> float:
 
 
 @router.post("/", response_model=QueryResponse)
-async def query_knowledge_base(request: QueryRequest):
+async def query_knowledge_base(
+    request: QueryRequest,
+    user_id: str = Depends(get_user_id),  # MANDATORY USER AUTH
+    db: Session = Depends(get_database_session)
+):
     """
-    Query with hybrid search (BM25 + Semantic)
+    Query with hybrid search (BM25 + Semantic) and USER ISOLATION
+    
+    Headers:
+        X-User-ID: User identifier (REQUIRED)
     
     Default weights:
     - Keyword (BM25): 0.3
     - Semantic: 0.7
     
     You can adjust weights, but they must sum to 1.0
+    
+    Returns:
+        QueryResponse with answer and sources
     """
     start_time = time.time()
     
@@ -74,10 +90,11 @@ async def query_knowledge_base(request: QueryRequest):
             semantic_weight = semantic_weight / total
             logger.info(f"Normalized weights: keyword={keyword_weight:.2f}, semantic={semantic_weight:.2f}")
         
-        # Hybrid search
+        # Hybrid search with USER ISOLATION
         documents, metadatas, scores = vector_store.hybrid_search(
             query=request.question,
             top_k=request.top_k,
+            user_id=user_id,  # CRITICAL: USER ISOLATION
             file_id=getattr(request, 'file_id', None),
             keyword_weight=keyword_weight,
             semantic_weight=semantic_weight
@@ -113,7 +130,7 @@ async def query_knowledge_base(request: QueryRequest):
                 content=doc[:500] + "..." if len(doc) > 500 else doc,
                 filename=safe_get_str(metadata, 'filename', 'unknown'),
                 chunk_id=safe_get_str(metadata, 'chunk_id', f'chunk_{i}'),
-                relevance_score=safe_get_score(score),  # Clamp to valid range
+                relevance_score=safe_get_score(score),
                 page_number=page,
                 chunk_type=chunk_type,
                 semantic_score=None,
@@ -122,11 +139,13 @@ async def query_knowledge_base(request: QueryRequest):
         
         context = "\n\n".join(context_parts)
         
-        # Generate answer
+        # Generate answer with DATABASE-BACKED history
         answer = llm_service.generate_answer(
             question=request.question,
             context=context,
-            conversation_id=None,
+            user_id=user_id,  # For conversation isolation
+            db=db,  # For database-backed history
+            conversation_id=None,  # No conversation for single query
             include_citations=True,
             temperature=request.temperature
         )
@@ -139,6 +158,27 @@ async def query_knowledge_base(request: QueryRequest):
             answer += f"\n\n⚠️ Note: Lower confidence ({confidence:.2f}). Please verify."
         
         processing_time = time.time() - start_time
+        
+        # LOG QUERY TO DATABASE
+        try:
+            query_log = QueryLog(
+                user_id=user_id,
+                question=request.question,
+                answer=answer,
+                top_k=request.top_k,
+                keyword_weight=keyword_weight,
+                semantic_weight=semantic_weight,
+                chunks_retrieved=len(documents),
+                processing_time_seconds=processing_time,
+                confidence_score=confidence,
+                queried_at=datetime.utcnow(),
+                conversation_id=None
+            )
+            db.add(query_log)
+            db.commit()
+        except Exception as e:
+            logger.warning(f"Failed to log query: {e}")
+            # Don't fail the request if logging fails
         
         return QueryResponse(
             question=request.question,
@@ -164,8 +204,26 @@ async def query_knowledge_base(request: QueryRequest):
 
 
 @router.post("/conversation", response_model=QueryResponse)
-async def query_with_conversation(request: ConversationQueryRequest):
-    """Multi-turn conversational query with hybrid search"""
+async def query_with_conversation(
+    request: ConversationQueryRequest,
+    user_id: str = Depends(get_user_id),  # MANDATORY USER AUTH
+    db: Session = Depends(get_database_session)
+):
+    """
+    Multi-turn conversational query with DATABASE-BACKED HISTORY (FIFO)
+    
+    Headers:
+        X-User-ID: User identifier (REQUIRED)
+    
+    Conversation history:
+    - Stored in database (not in-memory)
+    - Last 4 Q&A pairs kept per conversation
+    - Oldest pairs deleted automatically (FIFO)
+    - Fully user-isolated
+    
+    Returns:
+        QueryResponse with answer and sources
+    """
     start_time = time.time()
     
     try:
@@ -178,10 +236,11 @@ async def query_with_conversation(request: ConversationQueryRequest):
             keyword_weight = keyword_weight / total
             semantic_weight = semantic_weight / total
         
-        # Retrieve chunks with hybrid search
+        # Retrieve chunks with hybrid search and USER ISOLATION
         documents, metadatas, scores = vector_store.hybrid_search(
             query=request.question,
             top_k=request.top_k,
+            user_id=user_id,  # CRITICAL: USER ISOLATION
             file_id=request.file_id,
             keyword_weight=keyword_weight,
             semantic_weight=semantic_weight
@@ -215,18 +274,20 @@ async def query_with_conversation(request: ConversationQueryRequest):
                 content=doc[:500] + "..." if len(doc) > 500 else doc,
                 filename=safe_get_str(metadata, 'filename', 'unknown'),
                 chunk_id=safe_get_str(metadata, 'chunk_id', f'chunk_{i}'),
-                relevance_score=safe_get_score(score),  # Clamp to valid range
+                relevance_score=safe_get_score(score),
                 page_number=page,
                 chunk_type=chunk_type
             ))
         
         context = "\n\n".join(context_parts)
         
-        # Generate answer with conversation history
+        # Generate answer with DATABASE-BACKED conversation history
         answer = llm_service.generate_answer(
             question=request.question,
             context=context,
-            conversation_id=request.conversation_id,
+            user_id=user_id,  # For conversation isolation
+            db=db,  # For database-backed history
+            conversation_id=request.conversation_id,  # Enable conversation
             include_citations=True,
             temperature=request.temperature
         )
@@ -238,6 +299,26 @@ async def query_with_conversation(request: ConversationQueryRequest):
             answer += f"\n\n⚠️ Note: Lower confidence ({confidence:.2f})."
         
         processing_time = time.time() - start_time
+        
+        # LOG QUERY TO DATABASE
+        try:
+            query_log = QueryLog(
+                user_id=user_id,
+                question=request.question,
+                answer=answer,
+                top_k=request.top_k,
+                keyword_weight=keyword_weight,
+                semantic_weight=semantic_weight,
+                chunks_retrieved=len(documents),
+                processing_time_seconds=processing_time,
+                confidence_score=confidence,
+                queried_at=datetime.utcnow(),
+                conversation_id=request.conversation_id
+            )
+            db.add(query_log)
+            db.commit()
+        except Exception as e:
+            logger.warning(f"Failed to log query: {e}")
         
         return QueryResponse(
             question=request.question,
@@ -264,16 +345,147 @@ async def query_with_conversation(request: ConversationQueryRequest):
 
 
 @router.post("/clear-conversation/{conversation_id}")
-async def clear_conversation(conversation_id: str):
-    """Clear conversation history"""
+async def clear_conversation(
+    conversation_id: str,
+    user_id: str = Depends(get_user_id),
+    db: Session = Depends(get_database_session)
+):
+    """
+    Clear conversation history from DATABASE
+    
+    Headers:
+        X-User-ID: User identifier (REQUIRED)
+    
+    Args:
+        conversation_id: Conversation identifier to clear
+        
+    Returns:
+        Success message
+    """
     try:
-        llm_service.clear_conversation(conversation_id)
+        # Clear from database with user isolation
+        llm_service.clear_conversation(conversation_id, user_id, db)
+        
         return {
             "message": f"Conversation {conversation_id} cleared",
-            "conversation_id": conversation_id
+            "conversation_id": conversation_id,
+            "user_id": user_id
         }
     except Exception as e:
         raise HTTPException(
             status_code=500,
             detail=f"Error clearing conversation: {str(e)}"
+        )
+
+
+@router.get("/history/{conversation_id}")
+async def get_conversation_history(
+    conversation_id: str,
+    user_id: str = Depends(get_user_id),
+    db: Session = Depends(get_database_session)
+):
+    """
+    Get conversation history from DATABASE
+    
+    Headers:
+        X-User-ID: User identifier (REQUIRED)
+    
+    Args:
+        conversation_id: Conversation identifier
+        
+    Returns:
+        Conversation history (last 4 Q&A pairs)
+    """
+    try:
+        from app.db.models import ConversationHistory
+        from sqlalchemy import desc
+        
+        # Get last 8 messages (4 Q&A pairs) with user isolation
+        messages = db.query(ConversationHistory).filter(
+            ConversationHistory.conversation_id == conversation_id,
+            ConversationHistory.user_id == user_id  # USER ISOLATION
+        ).order_by(
+            desc(ConversationHistory.created_at)
+        ).limit(8).all()
+        
+        # Reverse to chronological order
+        messages.reverse()
+        
+        # Format history
+        history = []
+        for msg in messages:
+            history.append({
+                "role": msg.role,
+                "content": msg.content,
+                "timestamp": msg.created_at.isoformat()
+            })
+        
+        return {
+            "conversation_id": conversation_id,
+            "user_id": user_id,
+            "message_count": len(history),
+            "messages": history
+        }
+        
+    except Exception as e:
+        logger.error(f"Error retrieving history: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error retrieving conversation history: {str(e)}"
+        )
+
+
+@router.get("/my-queries")
+async def get_my_queries(
+    user_id: str = Depends(get_user_id),
+    db: Session = Depends(get_database_session),
+    limit: int = 20
+):
+    """
+    Get recent queries for current user
+    
+    Headers:
+        X-User-ID: User identifier (REQUIRED)
+    
+    Query Parameters:
+        limit: Number of queries to return (default: 20, max: 100)
+        
+    Returns:
+        List of recent queries
+    """
+    try:
+        from sqlalchemy import desc
+        
+        # Limit to reasonable range
+        limit = min(max(1, limit), 100)
+        
+        # Get recent queries with user isolation
+        queries = db.query(QueryLog).filter(
+            QueryLog.user_id == user_id
+        ).order_by(
+            desc(QueryLog.queried_at)
+        ).limit(limit).all()
+        
+        query_list = []
+        for query in queries:
+            query_list.append({
+                "id": query.id,
+                "question": query.question[:100] + "..." if len(query.question) > 100 else query.question,
+                "queried_at": query.queried_at.isoformat(),
+                "processing_time": query.processing_time_seconds,
+                "confidence_score": query.confidence_score,
+                "conversation_id": query.conversation_id
+            })
+        
+        return {
+            "user_id": user_id,
+            "total_queries": len(query_list),
+            "queries": query_list
+        }
+        
+    except Exception as e:
+        logger.error(f"Error retrieving queries: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error retrieving query history: {str(e)}"
         )

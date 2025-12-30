@@ -1,12 +1,17 @@
 """
-Enhanced LLM Service with Vision Support
-Detects image references in context and includes them in LLM calls
+Enhanced LLM Service with Vision Support and DATABASE-BACKED CONVERSATION HISTORY
+- Stores conversation history in database (last 4 turns per user)
+- FIFO deletion when exceeding limit
+- Proper user isolation
 """
 
 from langchain_aws import ChatBedrock
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from app.core.config import settings
+from app.db.models import ConversationHistory
+from sqlalchemy.orm import Session
+from sqlalchemy import desc
 import logging
 from typing import List, Dict, Optional, Tuple
 import re
@@ -14,57 +19,19 @@ import json
 import base64
 import os
 import boto3
-from threading import Lock
-from datetime import datetime, timedelta
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
 
-class ConversationHistory:
-    """Manage conversation history with expiration"""
-    
-    def __init__(self, max_turns: int = 5, ttl_minutes: int = 5):
-        self.max_turns = max_turns
-        self.ttl_minutes = ttl_minutes
-        self.history: List[Dict[str, str]] = []
-        self.last_accessed = datetime.now()
-    
-    def add_turn(self, question: str, answer: str, context_used: str):
-        # Store only summary of context, not full text
-        context_summary = context_used[:500] + "..." if len(context_used) > 500 else context_used
-        
-        self.history.append({
-            'question': question,
-            'answer': answer,
-            'context_summary': context_summary
-        })
-        if len(self.history) > self.max_turns:
-            self.history = self.history[-self.max_turns:]
-        
-        self.last_accessed = datetime.now()
-    
-    def get_formatted_history(self) -> str:
-        self.last_accessed = datetime.now()
-        
-        if not self.history:
-            return ""
-        formatted = "Previous conversation:\n"
-        for i, turn in enumerate(self.history, 1):
-            formatted += f"\nQ{i}: {turn['question']}\nA{i}: {turn['answer'][:200]}...\n"
-        return formatted
-    
-    def is_expired(self) -> bool:
-        """Check if conversation has expired"""
-        return datetime.now() - self.last_accessed > timedelta(minutes=self.ttl_minutes)
-    
-    def clear(self):
-        self.history = []
-        self.last_accessed = datetime.now()
-
-
 class LLMService:
     """
-    LLM service that detects and includes images from context
+    LLM service with DATABASE-BACKED conversation history
+    
+    Key changes:
+    - Stores conversation in database, not in-memory
+    - FIFO deletion: keeps only last 4 Q&A pairs per conversation
+    - User-isolated conversations
     """
     
     def __init__(self):
@@ -78,8 +45,6 @@ class LLMService:
         
         self.model_id = settings.bedrock_model_id
         self._llm = None
-        self.conversations: Dict[str, ConversationHistory] = {}
-        self._conversation_lock = Lock()  # FIXED: Thread-safe conversation access
         
         # Initialize Bedrock runtime for vision
         try:
@@ -114,45 +79,166 @@ class LLMService:
             logger.info("Created new ChatBedrock instance")
         return self._llm
     
-    def _cleanup_expired_conversations(self):
-        """Remove expired conversations to prevent memory leak"""
-        with self._conversation_lock:
-            expired_ids = [
-                conv_id for conv_id, conv in self.conversations.items()
-                if conv.is_expired()
-            ]
-            for conv_id in expired_ids:
-                del self.conversations[conv_id]
-                logger.info(f"Cleaned up expired conversation: {conv_id}")
+    def get_conversation_history(
+        self, 
+        conversation_id: str, 
+        user_id: str,
+        db: Session,
+        max_turns: int = 4
+    ) -> str:
+        """
+        Get conversation history from DATABASE (last N turns)
+        
+        Args:
+            conversation_id: Conversation identifier
+            user_id: User identifier (for isolation)
+            db: Database session
+            max_turns: Maximum number of Q&A pairs to retrieve (default: 4)
+            
+        Returns:
+            Formatted conversation history string
+        """
+        try:
+            # Get last N*2 messages (N questions + N answers)
+            messages = db.query(ConversationHistory).filter(
+                ConversationHistory.conversation_id == conversation_id,
+                ConversationHistory.user_id == user_id
+            ).order_by(
+                desc(ConversationHistory.created_at)
+            ).limit(max_turns * 2).all()
+            
+            if not messages:
+                return ""
+            
+            # Reverse to get chronological order
+            messages.reverse()
+            
+            # Format history
+            formatted = "Previous conversation:\n"
+            for i in range(0, len(messages), 2):
+                if i + 1 < len(messages):
+                    question_msg = messages[i]
+                    answer_msg = messages[i + 1]
+                    
+                    formatted += f"\nQ: {question_msg.content}\n"
+                    # Truncate long answers
+                    answer_text = answer_msg.content[:200] + "..." if len(answer_msg.content) > 200 else answer_msg.content
+                    formatted += f"A: {answer_text}\n"
+            
+            return formatted
+            
+        except Exception as e:
+            logger.error(f"Error retrieving conversation history: {e}")
+            return ""
+    
+    def save_conversation_turn(
+        self,
+        conversation_id: str,
+        user_id: str,
+        question: str,
+        answer: str,
+        db: Session,
+        max_turns: int = 4
+    ):
+        """
+        Save conversation turn to DATABASE with FIFO deletion
+        
+        Args:
+            conversation_id: Conversation identifier
+            user_id: User identifier
+            question: User's question
+            answer: Assistant's answer
+            db: Database session
+            max_turns: Maximum Q&A pairs to keep (default: 4)
+        """
+        try:
+            # Count existing messages for this conversation
+            message_count = db.query(ConversationHistory).filter(
+                ConversationHistory.conversation_id == conversation_id,
+                ConversationHistory.user_id == user_id
+            ).count()
+            
+            # If we already have max_turns * 2 messages (Q&A pairs), delete oldest pair
+            if message_count >= (max_turns * 2):
+                # Delete oldest 2 messages (1 Q&A pair)
+                oldest_messages = db.query(ConversationHistory).filter(
+                    ConversationHistory.conversation_id == conversation_id,
+                    ConversationHistory.user_id == user_id
+                ).order_by(
+                    ConversationHistory.created_at.asc()
+                ).limit(2).all()
+                
+                for msg in oldest_messages:
+                    db.delete(msg)
+                
+                logger.debug(f"Deleted oldest Q&A pair from conversation {conversation_id}")
+            
+            # Save new question
+            question_msg = ConversationHistory(
+                conversation_id=conversation_id,
+                user_id=user_id,
+                role="user",
+                content=question,
+                created_at=datetime.utcnow()
+            )
+            db.add(question_msg)
+            
+            # Save new answer
+            answer_msg = ConversationHistory(
+                conversation_id=conversation_id,
+                user_id=user_id,
+                role="assistant",
+                content=answer,
+                created_at=datetime.utcnow()
+            )
+            db.add(answer_msg)
+            
+            db.commit()
+            
+            logger.debug(f"Saved conversation turn for user {user_id}, conversation {conversation_id}")
+            
+        except Exception as e:
+            logger.error(f"Error saving conversation: {e}")
+            db.rollback()
     
     def generate_answer(
         self,
         question: str,
         context: str,
+        user_id: str,
+        db: Session,
         conversation_id: Optional[str] = None,
         include_citations: bool = True,
         temperature: Optional[float] = None
     ) -> str:
         """
-        Generate answer with automatic image detection and inclusion
-        FIXED: Thread-safe conversation handling with automatic cleanup
+        Generate answer with DATABASE-BACKED conversation history
         
         Args:
+            question: User's question
+            context: Retrieved document context
+            user_id: User identifier (for conversation isolation)
+            db: Database session
+            conversation_id: Optional conversation ID for multi-turn
+            include_citations: Whether to verify citations
             temperature: Optional temperature override (0.0-1.0)
+        
+        Returns:
+            Generated answer string
         """
         try:
-            # Cleanup expired conversations before processing
-            self._cleanup_expired_conversations()
-            
             # Extract image references from context
             image_refs = self._extract_image_references(context)
             
-            # Get conversation history if available (thread-safe)
+            # Get conversation history from DATABASE if available
             history_text = ""
             if conversation_id:
-                with self._conversation_lock:
-                    if conversation_id in self.conversations:
-                        history_text = self.conversations[conversation_id].get_formatted_history()
+                history_text = self.get_conversation_history(
+                    conversation_id, 
+                    user_id, 
+                    db,
+                    max_turns=4  # Last 4 Q&A pairs
+                )
             
             # If images found, use vision-enabled generation
             if image_refs and self.bedrock_runtime:
@@ -177,12 +263,16 @@ class LLMService:
             if include_citations:
                 answer = self._verify_citations(answer, context)
             
-            # Update conversation history (thread-safe)
+            # Save to DATABASE
             if conversation_id:
-                with self._conversation_lock:
-                    if conversation_id not in self.conversations:
-                        self.conversations[conversation_id] = ConversationHistory()
-                    self.conversations[conversation_id].add_turn(question, answer, context)
+                self.save_conversation_turn(
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    question=question,
+                    answer=answer,
+                    db=db,
+                    max_turns=4
+                )
             
             return answer
             
@@ -218,106 +308,107 @@ class LLMService:
             page = page_match.group(1) if page_match else "unknown"
             
             # Extract description
-            desc_match = re.search(r'DESCRIPTION:\s*\n(.+?)(?:\n---|$)', surrounding_text, re.DOTALL)
-            description = desc_match.group(1).strip() if desc_match else ""
+            desc_match = re.search(r'DESCRIPTION:\s*([^\n]+)', surrounding_text)
+            description = desc_match.group(1) if desc_match else ""
             
-            # Resolve path (relative to uploads directory)
-            full_path = os.path.join(settings.upload_dir, image_path)
-            
-            if os.path.exists(full_path):
-                image_refs.append({
-                    'path': full_path,
-                    'relative_path': image_path,
-                    'page': page,
-                    'description': description
-                })
-                logger.info(f"Found image reference: {image_path} (page {page})")
-            else:
-                logger.warning(f"Image not found: {full_path}")
+            image_refs.append({
+                'path': image_path,
+                'page': page,
+                'description': description,
+                'surrounding_context': surrounding_text[:500]
+            })
         
         return image_refs
+    
+    def _load_image_as_base64(self, image_path: str) -> Optional[Tuple[str, str]]:
+        """
+        Load image file and convert to base64
+        
+        Returns:
+            Tuple of (base64_data, media_type) or None if failed
+        """
+        try:
+            # Handle relative paths
+            if not os.path.isabs(image_path):
+                image_path = os.path.join(settings.upload_dir, image_path)
+            
+            if not os.path.exists(image_path):
+                logger.warning(f"Image not found: {image_path}")
+                return None
+            
+            # Determine media type
+            ext = os.path.splitext(image_path)[1].lower()
+            media_type_map = {
+                '.jpg': 'image/jpeg',
+                '.jpeg': 'image/jpeg',
+                '.png': 'image/png',
+                '.gif': 'image/gif',
+                '.webp': 'image/webp'
+            }
+            media_type = media_type_map.get(ext, 'image/jpeg')
+            
+            # Read and encode
+            with open(image_path, 'rb') as f:
+                image_data = base64.b64encode(f.read()).decode('utf-8')
+            
+            return image_data, media_type
+            
+        except Exception as e:
+            logger.error(f"Error loading image {image_path}: {e}")
+            return None
     
     def _generate_with_vision(
         self,
         question: str,
         context: str,
-        image_refs: List[Dict[str, str]],
+        image_refs: List[Dict],
         history: str = "",
         temperature: Optional[float] = None
     ) -> str:
-        """
-        Generate answer using Bedrock with vision (direct API call)
-        Includes images in the request
-        FIXED: Added context compression to prevent overflow
-        """
+        """Generate answer with vision support using Bedrock API directly"""
         try:
             # Use provided temperature or default
-            temp = temperature if temperature is not None else settings.temperature
+            temp = temperature if temperature is not None else settings.vision_temperature
             
-            # FIXED: Compress context before building request to prevent overflow
-            compressed_context = self._compress_context(context, question, max_length=6000)
-            
-            # Build content array with text and images
+            # Build content parts (text + images)
             content_parts = []
             
-            # Add history if available
+            # Add text context
+            context_summary = self._compress_context(context, question, max_length=6000)
+            
+            text_content = ""
             if history:
-                content_parts.append({
-                    "type": "text",
-                    "text": f"{history}\n\n"
-                })
+                text_content += f"{history}\n\n"
             
-            # Add main context (remove image blocks to avoid duplication)
-            clean_context = re.sub(
-                r'---\n\*\*\[.*?\]\*\*.*?IMAGE_PATH:.*?---\n',
-                '',
-                compressed_context,  # Use compressed context
-                flags=re.DOTALL
-            )
-            
-            content_parts.append({
-                "type": "text",
-                "text": f"Context from documents:\n{clean_context}"
-            })
+            text_content += f"Context from documents:\n{context_summary}\n\n"
+            text_content += f"Question: {question}\n\n"
             
             # Add images
             for img_ref in image_refs[:5]:  # Limit to 5 images
-                try:
-                    with open(img_ref['path'], 'rb') as f:
-                        image_data = base64.standard_b64encode(f.read()).decode('utf-8')
-                    
-                    # Determine media type
-                    ext = os.path.splitext(img_ref['path'])[1].lower()
-                    media_types = {
-                        '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
-                        '.png': 'image/png', '.gif': 'image/gif', '.webp': 'image/webp'
-                    }
-                    media_type = media_types.get(ext, 'image/jpeg')
-                    
-                    # Add image with its description
-                    content_parts.append({
-                        "type": "text",
-                        "text": f"\n[Image from page {img_ref['page']}]\n{img_ref['description']}\n"
-                    })
-                    
+                image_data = self._load_image_as_base64(img_ref['path'])
+                if image_data:
+                    base64_data, media_type = image_data
                     content_parts.append({
                         "type": "image",
                         "source": {
                             "type": "base64",
                             "media_type": media_type,
-                            "data": image_data
+                            "data": base64_data
                         }
                     })
-                except Exception as e:
-                    logger.error(f"Error loading image {img_ref['path']}: {e}")
+                    
+                    # Add image context
+                    text_content += f"\n[Image from page {img_ref['page']}]\n"
+                    if img_ref['description']:
+                        text_content += f"Description: {img_ref['description']}\n"
             
-            # Add question
+            # Add text as final content part
             content_parts.append({
                 "type": "text",
-                "text": f"\nQuestion: {question}\n\nInstructions:\n" +
-                        "- Answer using the text context AND the images provided\n" +
-                        "- Reference specific images when relevant (e.g., 'as shown in the image from page 5')\n" +
-                        "- For tables/charts in images, describe the data you see\n" +
+                "text": text_content + 
+                        "Instructions:\n" +
+                        "- Answer using information from BOTH text context AND images\n" +
+                        "- Reference specific images when relevant (e.g., 'As shown in the image...')\n" +
                         "- Be specific about numbers, trends, and visual details\n" +
                         "- If answer not in context, say so clearly\n\nAnswer:"
             })
@@ -325,8 +416,8 @@ class LLMService:
             # Call Bedrock directly
             request_body = {
                 "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": settings.max_tokens,
-                "temperature": temp,  # Use provided or default temperature
+                "max_tokens": settings.vision_max_tokens,
+                "temperature": temp,
                 "messages": [{
                     "role": "user",
                     "content": content_parts
@@ -334,7 +425,7 @@ class LLMService:
             }
             
             response = self.bedrock_runtime.invoke_model(
-                modelId="us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+                modelId=settings.bedrock_vision_model_id,  # Use config!
                 body=json.dumps(request_body)
             )
             
@@ -347,7 +438,7 @@ class LLMService:
             
         except Exception as e:
             logger.error(f"Vision generation failed: {e}, falling back to text-only")
-            return self._generate_text_only(question, context, history)
+            return self._generate_text_only(question, context, history, temperature)
     
     def _generate_text_only(
         self,
@@ -516,12 +607,18 @@ Answer:"""
             logger.error(f"Error detecting hallucination: {str(e)}")
             return False, 1.0
     
-    def clear_conversation(self, conversation_id: str):
-        """Clear conversation history (thread-safe)"""
-        with self._conversation_lock:
-            if conversation_id in self.conversations:
-                self.conversations[conversation_id].clear()
-                logger.info(f"Cleared conversation {conversation_id}")
+    def clear_conversation(self, conversation_id: str, user_id: str, db: Session):
+        """Clear conversation history from DATABASE"""
+        try:
+            db.query(ConversationHistory).filter(
+                ConversationHistory.conversation_id == conversation_id,
+                ConversationHistory.user_id == user_id
+            ).delete()
+            db.commit()
+            logger.info(f"Cleared conversation {conversation_id} for user {user_id}")
+        except Exception as e:
+            logger.error(f"Error clearing conversation: {e}")
+            db.rollback()
     
     def update_model(self, new_model_id: str) -> bool:
         """Update model ID"""

@@ -1,5 +1,5 @@
 """
-Dependency Injection for Services
+Dependency Injection for Services - UPDATED WITH MANDATORY USER ID
 Provides proper FastAPI dependency injection for all services
 """
 
@@ -7,11 +7,11 @@ from typing import Generator, Optional
 from functools import lru_cache
 import logging
 
+from fastapi import Header, HTTPException
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
 from app.core.config import Settings, get_settings
-from app.core.exceptions import InvalidUserIDError
 
 logger = logging.getLogger(__name__)
 
@@ -30,9 +30,9 @@ def get_cached_settings() -> Settings:
 
 # ==================== User Validation ====================
 
-def get_user_id(x_user_id: Optional[str] = None) -> str:
+def get_user_id(x_user_id: Optional[str] = Header(None)) -> str:
     """
-    Extract and validate user ID from request header
+    Extract and validate MANDATORY user ID from request header
     
     Args:
         x_user_id: User ID from X-User-ID header
@@ -41,47 +41,50 @@ def get_user_id(x_user_id: Optional[str] = None) -> str:
         Validated user ID
     
     Raises:
-        InvalidUserIDError: If user ID is missing or invalid
+        HTTPException: If user ID is missing or invalid
     
     Usage in FastAPI:
         @router.get("/documents")
         def get_documents(user_id: str = Depends(get_user_id)):
             ...
     """
+    # MANDATORY: User ID must be provided
     if not x_user_id:
-        raise InvalidUserIDError(
-            "User ID is required. Please provide X-User-ID header."
+        raise HTTPException(
+            status_code=401,
+            detail="User ID is required. Please provide X-User-ID header."
         )
     
     # Validate user ID
     x_user_id = x_user_id.strip()
     
     if not x_user_id:
-        raise InvalidUserIDError("User ID cannot be empty")
+        raise HTTPException(
+            status_code=401,
+            detail="User ID cannot be empty"
+        )
     
     settings = get_cached_settings()
     if len(x_user_id) > settings.max_user_id_length:
-        raise InvalidUserIDError(
-            f"User ID too long (max {settings.max_user_id_length} characters)"
+        raise HTTPException(
+            status_code=400,
+            detail=f"User ID too long (max {settings.max_user_id_length} characters)"
         )
     
     # Basic sanitization - remove potentially dangerous characters
-    dangerous_chars = ['/', '\\', '..', '<', '>', '|', '*', '?', '"', ':']
+    dangerous_chars = ['/', '\\', '..', '<', '>', '|', '*', '?', '"', ':', ';', '\0']
     for char in dangerous_chars:
         if char in x_user_id:
-            raise InvalidUserIDError(
-                f"User ID contains invalid character: {char}"
+            raise HTTPException(
+                status_code=400,
+                detail=f"User ID contains invalid character: {char}"
             )
     
+    logger.debug(f"Authenticated user: {x_user_id}")
     return x_user_id
 
 
 # ==================== Service Dependencies ====================
-
-# These will be imported and used in service files
-# to avoid circular imports, actual service instances
-# are created lazily in each service module
-
 
 def get_vector_store_service():
     """
@@ -144,7 +147,10 @@ class ServiceDependencies:
     
     Usage in FastAPI:
         @router.post("/process")
-        def process(deps: ServiceDependencies = Depends()):
+        def process(
+            deps: ServiceDependencies = Depends(),
+            user_id: str = Depends(get_user_id)
+        ):
             vector_store = deps.vector_store
             llm = deps.llm
             ...
@@ -153,11 +159,9 @@ class ServiceDependencies:
     def __init__(
         self,
         db: Session = None,
-        user_id: str = None,
         settings: Settings = None
     ):
         self.db = db
-        self.user_id = user_id
         self.settings = settings or get_cached_settings()
         
         # Lazy load services only when needed
