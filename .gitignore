@@ -13,3 +13,4 @@ chroma_db/
 uploads/
 markdown_output/
 logs/
+rag_system.db
