@@ -8,3 +8,8 @@ __pycache__/
 *.swo
 .idea/
 .vscode/
+chroma_db/
+.DS_Store
+uploads/
+markdown_output/
+logs/
