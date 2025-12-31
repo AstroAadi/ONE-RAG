@@ -38,6 +38,7 @@ rank-bm25==0.2.2  # For hybrid keyword search
 aiofiles==24.1.0
 requests==2.32.3
 orjson==3.10.11
+imagehash==4.3.1
 
 # ==================== Optional Testing ====================
 pytest==8.3.4

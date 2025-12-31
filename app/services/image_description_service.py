@@ -216,29 +216,66 @@ class ImageDescriptionService:
         return descriptions
     
     def _build_description_prompt(
-        self,
-        context: Optional[str] = None,
-        page_number: Optional[int] = None
-    ) -> str:
+    self,
+    context: Optional[str] = None,
+    page_number: Optional[int] = None
+) -> str:
         """
-        Build prompt for image description
+        Build prompt for image description with chart detection
+        
+        ENHANCED: Two-stage approach for better chart descriptions
+        - Stage 1: Identify if image is a chart
+        - Stage 2: Extract structured data for charts, detailed description for others
         
         The prompt is optimized for generating detailed, searchable descriptions
         that will be embedded in the document and used for RAG retrieval.
         """
         prompt_parts = [
-            "Analyze this image and provide a detailed textual description.",
+            "Analyze this image carefully.",
             "",
-            "Your description should include:",
-            "- What type of visual element it is (diagram, chart, photo, illustration, screenshot, etc.)",
-            "- The main subject or content",
-            "- Key details, text, labels, or data visible in the image",
-            "- Colors, layout, or visual structure if relevant",
-            "- Any relationships, trends, or patterns shown",
+            "STEP 1: Identify the image type",
+            "Is this image a:",
+            "A) DATA VISUALIZATION (bar chart, line chart, pie chart, stacked chart, area chart, scatter plot, etc.)",
+            "B) DIAGRAM (flowchart, architecture diagram, mind map, etc.)",
+            "C) PHOTO or SCREENSHOT",
+            "D) ILLUSTRATION or DRAWING",
+            "E) TABLE or SPREADSHEET",
+            "F) Other",
             "",
-            "Be specific and factual. This description will be used for document search and retrieval,",
-            "so include relevant keywords and details that someone might search for.",
-            "Use markdown formatting where appropriate because this description will be embedded in markdown documents.",
+            "STEP 2: Provide description based on type",
+            "",
+            "If DATA VISUALIZATION (charts/graphs):",
+            "Format your response as:",
+            "**Chart Type**: [specific type, e.g., 'stacked bar chart', 'multi-line chart']",
+            "**X-axis**: [label and range, e.g., 'Years (2014-2024)']",
+            "**Y-axis**: [label and range with units, e.g., 'Number of models (0-120)']",
+            "**Legend/Categories**: [list all categories/segments shown]",
+            "**Key Data Points**: [notable values, peaks, significant changes]",
+            "**Trends**: [3-5 insights about patterns, growth, comparisons]",
+            "",
+            "Example for stacked bar chart:",
+            "**Chart Type**: Stacked bar chart",
+            "**X-axis**: Years (2014-2024)",
+            "**Y-axis**: Number of AI models (0-120)",
+            "**Legend/Categories**: API access, Hosted access, Open weights (restricted), Open weights (unrestricted), Unreleased, Unknown",
+            "**Key Data Points**: Peak of 105 models in 2021, 61 models in 2024, API access: 20 models in 2024",
+            "**Trends**: Overall growth from 2014-2021 with peak at 105 models, decline to 61 by 2024, API access category grew from near-zero to 32.8% share by 2024, diversification of access types over time",
+            "",
+            "If TABLE:",
+            "Describe the table structure, column headers, number of rows, and key data patterns.",
+            "",
+            "If DIAGRAM:",
+            "Describe the type of diagram, main components, relationships shown, and flow/hierarchy.",
+            "",
+            "If PHOTO/SCREENSHOT/ILLUSTRATION:",
+            "Describe the main subject, key visual elements, colors, composition, and any text visible.",
+            "",
+            "IMPORTANT:",
+            "- Be specific and factual",
+            "- Include all text visible in the image",
+            "- For charts: extract actual numbers when visible",
+            "- Use clear, searchable language",
+            "- This description will be used for document search and retrieval",
             ""
         ]
         
@@ -255,8 +292,8 @@ class ImageDescriptionService:
             ])
         
         prompt_parts.extend([
-            "Provide the description in markdown format, focusing on factual content.",
-            "Start your description directly without preamble."
+            "Start your description directly without preamble.",
+            "Use markdown formatting for structure."
         ])
         
         return "\n".join(prompt_parts)

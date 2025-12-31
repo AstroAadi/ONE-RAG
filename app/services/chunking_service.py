@@ -698,32 +698,45 @@ class SemanticChunkingService:
         
         return chunks
     
+    def _generate_chunk_id(
+    self, 
+    text: str, 
+    index: int,
+    file_id: Optional[str] = None
+) -> str:
+        """Generate unique chunk ID with file_id"""
+        if file_id:
+            hash_input = f"{file_id}_{index}_{text}".encode()
+        else:
+            hash_input = f"{index}_{text}".encode()
+        
+        content_hash = hashlib.sha256(hash_input).hexdigest()[:16]
+        
+        # Add timestamp for extra uniqueness
+        import time
+        timestamp = str(int(time.time() * 1000))[-6:]
+        
+        return f"chunk_{index}_{content_hash}_{timestamp}"
+
     def _create_chunk_dict(
         self,
         text: str,
         chunk_index: int,
         base_metadata: Optional[Dict[str, Any]]
     ) -> Dict[str, Any]:
-        """Create chunk dictionary with metadata"""
-        chunk_id = self._generate_chunk_id(text, chunk_index)
+        """Create chunk with file_id"""
+        file_id = base_metadata.get('file_id') if base_metadata else None
+        chunk_id = self._generate_chunk_id(text, chunk_index, file_id)  # Pass file_id
         
         chunk = {
             'chunk_id': chunk_id,
             'chunk_index': chunk_index,
             'text': text,
             'char_count': len(text),
-            'metadata': {}
+            'metadata': base_metadata or {}
         }
         
-        if base_metadata:
-            chunk['metadata'].update(base_metadata)
-        
         return chunk
-    
-    def _generate_chunk_id(self, text: str, index: int) -> str:
-        """Generate unique chunk ID"""
-        content_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
-        return f"chunk_{index}_{content_hash}"
     
     def _validate_all_chunks(self, chunks: List[Dict[str, Any]]) -> None:
         """Validate all chunks meet size requirements"""

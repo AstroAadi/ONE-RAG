@@ -227,6 +227,12 @@ class CaptionDetector:
         """
         Search for caption with all enhancements
         
+        ENHANCED:
+        - Filters footnotes
+        - Handles standalone figures
+        - Searches context for caption text
+        - Removes body text from descriptions
+        
         Args:
             lines: List of text lines
             start_idx: Starting line index
@@ -247,7 +253,12 @@ class CaptionDetector:
             if not line:
                 continue
             
-            # NEW: Skip chart titles
+            # Skip footnotes
+            if cls.is_footnote_reference(line):
+                logger.debug(f"Skipping footnote: {line[:50]}...")
+                continue
+            
+            # Skip chart titles
             if cls.is_chart_title(line):
                 logger.debug(f"Skipping chart title: {line[:50]}...")
                 continue
@@ -261,19 +272,19 @@ class CaptionDetector:
             if result:
                 caption_type, number, description = result
                 
-                # NEW: Check if description is actually body text
+                # Check if description is actually body text
                 if cls.is_body_text(description):
                     logger.info(
                         f"Filtering body text from caption '{caption_type.capitalize()} {number}': "
                         f"{description[:50]}..."
                     )
-                    description = ''  # Clear body text
+                    description = ''
                 
-                # Check if caption might be incomplete (for reconstruction)
+                # Check if caption seems incomplete (starts with digit)
                 is_suspicious = description and description[0].isdigit()
                 
                 if is_suspicious:
-                    # Try reconstruction
+                    # Try reconstruction from context
                     corrected_number = cls._find_complete_number_in_context(
                         lines, i, caption_type, number
                     )
@@ -293,16 +304,21 @@ class CaptionDetector:
                     'full_text': line
                 }
             
-            # NEW: Try standalone figure detection
+            # Try standalone figure detection
             standalone = cls.detect_standalone_figure(line)
             if standalone:
                 caption_type, number = standalone
                 logger.debug(f"Found standalone figure: {caption_type.capitalize()} {number}")
                 
+                # Try to find caption from context
+                context_caption = cls.find_caption_with_context_search(
+                    lines, start_idx, caption_type, number
+                )
+                
                 return {
                     'type': caption_type,
                     'number': number,
-                    'description': '',  # No caption text
+                    'description': context_caption or '',
                     'line_idx': i,
                     'full_text': line
                 }
@@ -318,6 +334,12 @@ class CaptionDetector:
     ) -> Optional[Dict]:
         """
         Search for caption before image with all enhancements
+        
+        ENHANCED:
+        - Filters footnotes
+        - Handles standalone figures
+        - Searches context for caption text
+        - Removes body text from descriptions
         
         Args:
             lines: List of text lines
@@ -340,12 +362,17 @@ class CaptionDetector:
             if not line:
                 continue
             
-            # NEW: Skip chart titles
+            # Skip footnotes
+            if cls.is_footnote_reference(line):
+                logger.debug(f"Skipping footnote: {line[:50]}...")
+                continue
+            
+            # Skip chart titles
             if cls.is_chart_title(line):
                 logger.debug(f"Skipping chart title: {line[:50]}...")
                 continue
             
-            # Stop at structural elements
+            # Stop at structural elements (headings)
             if line.startswith('#'):
                 break
             
@@ -354,7 +381,7 @@ class CaptionDetector:
             if result:
                 caption_type, number, description = result
                 
-                # NEW: Check if body text
+                # Check if body text
                 if cls.is_body_text(description):
                     logger.info(
                         f"Filtering body text from caption '{caption_type.capitalize()} {number}': "
@@ -362,7 +389,7 @@ class CaptionDetector:
                     )
                     description = ''
                 
-                # Check for reconstruction
+                # Check for reconstruction needs
                 is_suspicious = description and description[0].isdigit()
                 
                 if is_suspicious:
@@ -385,16 +412,21 @@ class CaptionDetector:
                     'full_text': line
                 }
             
-            # NEW: Try standalone detection
+            # Try standalone detection
             standalone = cls.detect_standalone_figure(line)
             if standalone:
                 caption_type, number = standalone
                 logger.debug(f"Found standalone figure: {caption_type.capitalize()} {number}")
                 
+                # Try to find caption from context
+                context_caption = cls.find_caption_with_context_search(
+                    lines, image_idx, caption_type, number
+                )
+                
                 return {
                     'type': caption_type,
                     'number': number,
-                    'description': '',
+                    'description': context_caption or '',
                     'line_idx': i,
                     'full_text': line
                 }
@@ -515,18 +547,135 @@ class CaptionDetector:
         return cls.format_as_heading(caption_type, number, description, level)
 
 
-# Backward compatibility helpers
-def detect_figure_caption(text: str) -> Optional[Tuple[str, str]]:
-    """Detect figure caption - returns (number, description)"""
-    result = CaptionDetector.detect_caption(text)
-    if result and result[0] == 'figure':
-        return (result[1], result[2])
-    return None
+    # Backward compatibility helpers
+    def detect_figure_caption(text: str) -> Optional[Tuple[str, str]]:
+        """Detect figure caption - returns (number, description)"""
+        result = CaptionDetector.detect_caption(text)
+        if result and result[0] == 'figure':
+            return (result[1], result[2])
+        return None
 
 
-def detect_table_caption(text: str) -> Optional[Tuple[str, str]]:
-    """Detect table caption - returns (number, description)"""
-    result = CaptionDetector.detect_caption(text)
-    if result and result[0] == 'table':
-        return (result[1], result[2])
-    return None
+    def detect_table_caption(text: str) -> Optional[Tuple[str, str]]:
+        """Detect table caption - returns (number, description)"""
+        result = CaptionDetector.detect_caption(text)
+        if result and result[0] == 'table':
+            return (result[1], result[2])
+        return None
+
+    @classmethod
+    def is_footnote_reference(cls, text: str) -> bool:
+        """
+        Detect if line is a footnote reference
+        
+        Footnotes typically:
+        - Start with 1-3 digits followed by space
+        - Followed by lowercase text (definition/explanation)
+        - Don't start with Figure/Table/Chart
+        
+        Examples:
+            "20 Hosted access refers to..." → True
+            "15 The analysis shows..." → True
+            "Figure 1.3.8 shows..." → False
+        
+        Args:
+            text: Line to check
+            
+        Returns:
+            True if likely footnote reference
+        """
+        text = text.strip()
+        
+        if not text:
+            return False
+        
+        # Pattern: starts with 1-3 digits, space, then lowercase word
+        footnote_pattern = r'^\d{1,3}\s+[a-z]'
+        
+        if re.match(footnote_pattern, text):
+            # Additional check: must not start with figure/table keywords
+            if not re.match(r'^\d+\s+(Figure|Table|Chart|Graph)', text, re.IGNORECASE):
+                return True
+        
+        return False
+
+    @classmethod
+    def find_caption_with_context_search(
+        cls,
+        lines: List[str],
+        image_idx: int,
+        figure_type: str,
+        figure_number: str
+    ) -> Optional[str]:
+        """
+        Search wider context for caption text when standalone figure found
+        
+        Strategy:
+        1. Look for "Figure X.Y.Z illustrates..." in surrounding lines
+        2. Extract the descriptive part after the verb
+        3. Use that as caption text
+        
+        This handles cases where Docling splits:
+            Line 1: "Figure 1.3.8"
+            Line 2: "Number of notable AI models by access type, 2014-24"
+        
+        Args:
+            lines: All document lines
+            image_idx: Index of image line
+            figure_type: 'figure', 'table', 'chart'
+            figure_number: Number like '1.3.8'
+            
+        Returns:
+            Caption description text or None
+        """
+        search_range = 20  # Search 20 lines before and after
+        start = max(0, image_idx - search_range)
+        end = min(len(lines), image_idx + search_range)
+        
+        # Build pattern to find "Figure 1.3.8 [verb] [description]"
+        # or just "Figure 1.3.8: [description]"
+        ref_pattern = rf'{figure_type.capitalize()}\s+{re.escape(figure_number)}'
+        
+        for i in range(start, end):
+            if i >= len(lines):
+                break
+            
+            line = lines[i]
+            
+            # Look for pattern with colon/dash separator
+            separator_match = re.search(
+                ref_pattern + r'\s*[:\-–—]\s*(.+)',
+                line,
+                re.IGNORECASE
+            )
+            
+            if separator_match:
+                caption = separator_match.group(1).strip()
+                logger.info(f"Found caption with separator: '{caption[:50]}...'")
+                return caption
+            
+            # Look for pattern with descriptive verb
+            verb_match = re.search(
+                ref_pattern + r'\s+(illustrates?|shows?|displays?|presents?|highlights?)\s+(.+)',
+                line,
+                re.IGNORECASE
+            )
+            
+            if verb_match:
+                caption = verb_match.group(2).strip()
+                # Clean up common prefixes
+                caption = re.sub(r'^(the\s+|that\s+|how\s+)', '', caption, flags=re.IGNORECASE)
+                logger.info(f"Found caption with verb: '{caption[:50]}...'")
+                return caption
+            
+            # Check next line after standalone figure number
+            if re.search(ref_pattern + r'\s*\.?\s*$', line, re.IGNORECASE):
+                # This line has just the figure number, check next line
+                if i + 1 < len(lines):
+                    next_line = lines[i + 1].strip()
+                    # If next line doesn't start with figure/table/heading, it might be caption
+                    if next_line and not re.match(r'^(#|Figure|Table|Chart|\d+\s+[a-z])', next_line):
+                        logger.info(f"Found caption on next line: '{next_line[:50]}...'")
+                        return next_line
+        
+        return None
