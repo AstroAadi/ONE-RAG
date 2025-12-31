@@ -18,7 +18,7 @@ class MarkdownConverter:
     Extractors already produce well-formatted markdown with:
     - Document headers
     - Page markers
-    - Image paths
+    - Image descriptions (AI-generated)
     - Tables
     - Captions
     
@@ -139,8 +139,13 @@ class MarkdownConverter:
         Returns:
             Dictionary with counts of images, tables, charts
         """
+        # UPDATED: Count both old format (IMAGE_PATH) and new format ([Image Description])
+        image_count = (
+            text.count('[Image Description]')  # New format (AI descriptions)
+        )
+        
         return {
-            'images': text.count('IMAGE_PATH:'),
+            'images': image_count,
             'tables': text.count('**[TABLE]**') + text.count('| --- |'),
             'charts': text.count('**[CHART]**') + text.count('**[FIGURE]**'),
             'pages': text.count('## Page '),

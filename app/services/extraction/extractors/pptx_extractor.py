@@ -1,6 +1,6 @@
 """
-PowerPoint (PPTX/PPT) Extractor with Complete Feature Parity
-Matches PDF/DOCX extractors with page tracking, images, and captions
+PowerPoint (PPTX/PPT) Extractor with AI Image Descriptions
+Images are described using vision LLM at ingestion time instead of storing paths
 """
 
 import os
@@ -8,36 +8,25 @@ from pathlib import Path
 from typing import Tuple, Dict, List
 import logging
 import re
+import base64
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
-import io
-from PIL import Image
 
 try:
     from ..base_extractor import BaseExtractor
     from ..processors.caption_detector import CaptionDetector
-    from ..processors.image_processor import ImageProcessor
 except ImportError:
-    # Standalone mode
     from base_extractor import BaseExtractor
     from caption_detector import CaptionDetector
-    from image_processor import ImageProcessor
 
 logger = logging.getLogger(__name__)
 
 
 class PptxExtractor(BaseExtractor):
     """
-    Enhanced PowerPoint extractor with full feature parity
+    Enhanced PowerPoint extractor with AI image descriptions
     
-    Features:
-    - Extracts text from all slides
-    - Extracts and saves images with slide numbers
-    - Extracts tables
-    - Extracts speaker notes
-    - Slide-based page tracking (slide = page)
-    - Caption detection for figures
-    - Shape text extraction (text boxes, etc.)
+    Key Change: Images are converted to AI descriptions at ingestion time
     """
     
     def _get_supported_formats(self) -> List[str]:
@@ -59,7 +48,7 @@ class PptxExtractor(BaseExtractor):
         return True, "Valid PowerPoint file"
     
     def extract(self, file_path: str) -> Tuple[str, bool, Dict]:
-        """Extract PowerPoint with full feature support"""
+        """Extract PowerPoint with AI image descriptions"""
         try:
             is_valid, msg = self.validate_file(file_path)
             if not is_valid:
@@ -67,8 +56,7 @@ class PptxExtractor(BaseExtractor):
             
             logger.info(f"Extracting PPTX: {file_path}")
             
-            # Extract with python-pptx
-            return self._extract_with_python_pptx(file_path)
+            return self._extract_with_descriptions(file_path)
             
         except Exception as e:
             logger.error(f"PPTX extraction error: {str(e)}")
@@ -76,15 +64,14 @@ class PptxExtractor(BaseExtractor):
             traceback.print_exc()
             return "", False, {'error': str(e)}
     
-    def _extract_with_python_pptx(self, file_path: str) -> Tuple[str, bool, Dict]:
-        """
-        Extract PowerPoint with comprehensive feature support
-        """
+    def _extract_with_descriptions(self, file_path: str) -> Tuple[str, bool, Dict]:
+        """Extract PowerPoint with AI image descriptions"""
         try:
+            from app.services.image_description_service import get_image_description_service
+            
             prs = Presentation(file_path)
             pptx_stem = Path(file_path).stem
             
-            # Create image directory
             image_output_dir = os.path.join(
                 os.path.dirname(file_path),
                 "extracted_images",
@@ -92,34 +79,28 @@ class PptxExtractor(BaseExtractor):
             )
             os.makedirs(image_output_dir, exist_ok=True)
             
-            logger.info(f"Image directory: {image_output_dir}")
             logger.info(f"Total slides: {len(prs.slides)}")
             
-            # Extract images from all slides
-            image_mapping = self._extract_all_images(
+            # NEW: Extract images with AI descriptions
+            image_data = self._extract_images_with_descriptions(
                 prs, image_output_dir, pptx_stem
             )
             
-            logger.info(f"Extracted {len(image_mapping)} images")
+            logger.info(f"Extracted {len(image_data)} images")
             
-            # Build markdown content with slide tracking
-            markdown_content = self._build_markdown_from_slides(
-                prs, image_mapping, pptx_stem
+            # Build markdown with descriptions
+            markdown_content = self._build_markdown_with_descriptions(
+                prs, image_data, pptx_stem
             )
             
-            # Apply caption detection
-            final_markdown = self._apply_caption_detection(
-                markdown_content, image_mapping, pptx_stem
-            )
-            
-            # Count statistics
-            stats = self._gather_statistics(prs, image_mapping)
+            stats = self._gather_statistics(prs, image_data)
             
             metadata = self.get_metadata(file_path)
             metadata.update({
-                'total_pages': len(prs.slides),  # Slides = Pages
+                'total_pages': len(prs.slides),
                 'total_slides': len(prs.slides),
-                'images_extracted': len(image_mapping),
+                'images_extracted': len(image_data),
+                'images_described': sum(1 for img in image_data.values() if img.get('description_success')),
                 'image_directory': str(image_output_dir),
                 'tables_found': stats['tables'],
                 'shapes_with_text': stats['text_shapes'],
@@ -127,9 +108,9 @@ class PptxExtractor(BaseExtractor):
                 'extraction_method': 'python-pptx'
             })
             
-            logger.info("✓ PPTX extraction complete")
+            logger.info("✓ PPTX extraction complete with AI descriptions")
             
-            return final_markdown, True, metadata
+            return markdown_content, True, metadata
             
         except Exception as e:
             logger.error(f"PPTX extraction failed: {str(e)}")
@@ -137,191 +118,185 @@ class PptxExtractor(BaseExtractor):
             traceback.print_exc()
             return "", False, {'error': str(e)}
     
-    def _extract_all_images(
+    def _extract_images_with_descriptions(
         self,
         prs: Presentation,
         output_dir: str,
         pptx_stem: str
     ) -> Dict[int, Dict]:
-        """
-        Extract all images from presentation with slide tracking
-        """
-        image_mapping = {}
+        """Extract images and generate AI descriptions"""
+        from app.services.image_description_service import get_image_description_service
+        
+        image_data = {}
         image_counter = 0
         
+        description_service = get_image_description_service()
+        doc_context = f"PowerPoint presentation: {pptx_stem}"
+        
         for slide_num, slide in enumerate(prs.slides, start=1):
-            # Extract images from this slide
-            slide_images = self._extract_images_from_slide(
-                slide, slide_num, output_dir, pptx_stem, image_counter
-            )
-            
-            # Add to mapping
-            for img_info in slide_images:
-                image_counter += 1
-                image_mapping[image_counter] = img_info
-        
-        return image_mapping
-    
-    def _extract_images_from_slide(
-        self,
-        slide,
-        slide_num: int,
-        output_dir: str,
-        pptx_stem: str,
-        start_counter: int
-    ) -> List[Dict]:
-        """
-        Extract images from a single slide
-        """
-        images = []
-        img_counter = start_counter
-        
-        for shape in slide.shapes:
-            # Check if shape is a picture
-            if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
-                img_counter += 1
-                
-                try:
-                    # Get image data
-                    image = shape.image
-                    image_bytes = image.blob
+            for shape in slide.shapes:
+                if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                    image_counter += 1
                     
-                    # Determine format
-                    ext = self._get_image_extension(image.content_type)
-                    
-                    # Generate filename with slide number
-                    filename = f"slide_{slide_num:02d}_image_{img_counter:03d}.{ext}"
-                    output_path = os.path.join(output_dir, filename)
-                    
-                    # Save image
-                    with open(output_path, 'wb') as f:
-                        f.write(image_bytes)
-                    
-                    images.append({
-                        'filename': filename,
-                        'slide_number': slide_num,
-                        'page_number': slide_num,  # For consistency
-                        'format': ext,
-                        'content_type': image.content_type,
-                        'size_bytes': len(image_bytes)
-                    })
-                    
-                    logger.info(f"  ✓ Saved: {filename} (slide {slide_num})")
-                    
-                except Exception as e:
-                    logger.warning(f"  ⚠ Could not extract image from slide {slide_num}: {e}")
-                    continue
-            
-            # Check for grouped shapes (images might be in groups)
-            elif hasattr(shape, 'shapes'):
-                # Recursively check grouped shapes
-                for sub_shape in shape.shapes:
-                    if sub_shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
-                        img_counter += 1
+                    try:
+                        # Get image data
+                        image = shape.image
+                        image_bytes = image.blob
                         
-                        try:
-                            image = sub_shape.image
-                            image_bytes = image.blob
-                            ext = self._get_image_extension(image.content_type)
+                        # Determine format
+                        ext = self._get_image_extension(image.content_type)
+                        
+                        filename = f"slide_{slide_num:02d}_image_{image_counter:03d}.{ext}"
+                        output_path = os.path.join(output_dir, filename)
+                        
+                        # Save image
+                        with open(output_path, 'wb') as f:
+                            f.write(image_bytes)
+                        
+                        logger.info(f"  ✓ Saved: {filename}")
+                        
+                        # Generate AI description
+                        if description_service.is_available():
+                            base64_image = base64.b64encode(image_bytes).decode('utf-8')
+                            success, description = description_service.describe_image_from_base64(
+                                base64_image,
+                                image.content_type,
+                                context=doc_context,
+                                page_number=slide_num,
+                                filename=filename
+                            )
                             
-                            filename = f"slide_{slide_num:02d}_image_{img_counter:03d}.{ext}"
-                            output_path = os.path.join(output_dir, filename)
-                            
-                            with open(output_path, 'wb') as f:
-                                f.write(image_bytes)
-                            
-                            images.append({
-                                'filename': filename,
-                                'slide_number': slide_num,
-                                'page_number': slide_num,
-                                'format': ext,
-                                'content_type': image.content_type,
-                                'size_bytes': len(image_bytes)
-                            })
-                            
-                            logger.info(f"  ✓ Saved: {filename} (slide {slide_num}, grouped)")
-                            
-                        except Exception as e:
-                            logger.warning(f"  ⚠ Could not extract grouped image: {e}")
+                            if success:
+                                logger.info(f"  ✓ Described: {filename}")
+                            else:
+                                logger.warning(f"  ⚠ Description failed: {filename}")
+                        else:
+                            success = False
+                            description = description_service.generate_fallback_description(
+                                filename, page_number=slide_num, image_type="slide image"
+                            )
+                        
+                        image_data[image_counter] = {
+                            'filename': filename,
+                            'slide_number': slide_num,
+                            'page_number': slide_num,
+                            'format': ext,
+                            'description': description,
+                            'description_success': success,
+                            'content_type': image.content_type,
+                            'size_bytes': len(image_bytes)
+                        }
+                        
+                    except Exception as e:
+                        logger.warning(f"  ⚠ Could not extract image from slide {slide_num}: {e}")
+                
+                # Check grouped shapes
+                elif hasattr(shape, 'shapes'):
+                    for sub_shape in shape.shapes:
+                        if sub_shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                            image_counter += 1
+                            try:
+                                image = sub_shape.image
+                                image_bytes = image.blob
+                                ext = self._get_image_extension(image.content_type)
+                                
+                                filename = f"slide_{slide_num:02d}_image_{image_counter:03d}.{ext}"
+                                output_path = os.path.join(output_dir, filename)
+                                
+                                with open(output_path, 'wb') as f:
+                                    f.write(image_bytes)
+                                
+                                logger.info(f"  ✓ Saved: {filename}")
+                                
+                                if description_service.is_available():
+                                    base64_image = base64.b64encode(image_bytes).decode('utf-8')
+                                    success, description = description_service.describe_image_from_base64(
+                                        base64_image,
+                                        image.content_type,
+                                        context=doc_context,
+                                        page_number=slide_num,
+                                        filename=filename
+                                    )
+                                    
+                                    if success:
+                                        logger.info(f"  ✓ Described: {filename}")
+                                else:
+                                    success = False
+                                    description = description_service.generate_fallback_description(
+                                        filename, page_number=slide_num
+                                    )
+                                
+                                image_data[image_counter] = {
+                                    'filename': filename,
+                                    'slide_number': slide_num,
+                                    'page_number': slide_num,
+                                    'format': ext,
+                                    'description': description,
+                                    'description_success': success,
+                                    'content_type': image.content_type,
+                                    'size_bytes': len(image_bytes)
+                                }
+                                
+                            except Exception as e:
+                                logger.warning(f"  ⚠ Could not extract grouped image: {e}")
         
-        return images
+        return image_data
     
-    def _get_image_extension(self, content_type: str) -> str:
-        """Get file extension from MIME type"""
-        mime_to_ext = {
-            'image/png': 'png',
-            'image/jpeg': 'jpg',
-            'image/jpg': 'jpg',
-            'image/gif': 'gif',
-            'image/bmp': 'bmp',
-            'image/tiff': 'tiff',
-            'image/x-emf': 'emf',
-            'image/x-wmf': 'wmf',
-        }
-        return mime_to_ext.get(content_type, 'png')
-    
-    def _build_markdown_from_slides(
+    def _build_markdown_with_descriptions(
         self,
         prs: Presentation,
-        image_mapping: Dict[int, Dict],
+        image_data: Dict[int, Dict],
         pptx_stem: str
     ) -> str:
         """
-        Build markdown content from presentation slides
-        Each slide = one page
+        Build markdown with captions AND AI descriptions
+        
+        Format:
+        ### Figure 1.3.4: Revenue Trends  <-- Caption from slide text
+        **[Image Description]**: A bar chart... <-- AI description
         """
-        markdown_parts = []
+        # First pass: Build content with image placeholders
+        temp_parts = []
+        temp_parts.append(f"# Presentation: {pptx_stem}")
+        temp_parts.append(f"**Total Slides**: {len(prs.slides)}\n")
         
-        # Add header
-        markdown_parts.append(f"# Presentation: {pptx_stem}\n")
-        markdown_parts.append(f"**Total Slides**: {len(prs.slides)}\n")
-        markdown_parts.append("---\n")
-        
-        # Track image counter
         image_counter = 0
         
-        # Process each slide
         for slide_num, slide in enumerate(prs.slides, start=1):
-            # Add slide marker (equivalent to page marker)
-            markdown_parts.append(f"\n## Slide {slide_num}\n")
+            temp_parts.append(f"## Slide {slide_num}")
             
-            # Extract title
+            # Slide title
             title = self._get_slide_title(slide)
             if title:
-                markdown_parts.append(f"### {title}\n")
+                temp_parts.append(f"### {title}\n")
             
-            # Extract text from all shapes
+            # Extract content
             slide_text = []
             slide_images = []
             slide_tables = []
             
             for shape in slide.shapes:
-                # Handle different shape types
                 if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
                     image_counter += 1
-                    if image_counter in image_mapping:
+                    if image_counter in image_data:
                         slide_images.append(image_counter)
                 
                 elif shape.shape_type == MSO_SHAPE_TYPE.TABLE:
-                    # Extract table
                     table_md = self._extract_table(shape)
                     if table_md:
                         slide_tables.append(table_md)
                 
                 elif hasattr(shape, "text") and shape.text.strip():
-                    # Skip title (already processed)
                     if shape == slide.shapes.title:
                         continue
-                    
                     text = shape.text.strip()
                     slide_text.append(text)
                 
                 elif hasattr(shape, 'shapes'):
-                    # Handle grouped shapes
                     for sub_shape in shape.shapes:
                         if sub_shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
                             image_counter += 1
-                            if image_counter in image_mapping:
+                            if image_counter in image_data:
                                 slide_images.append(image_counter)
                         elif hasattr(sub_shape, "text") and sub_shape.text.strip():
                             slide_text.append(sub_shape.text.strip())
@@ -329,36 +304,121 @@ class PptxExtractor(BaseExtractor):
             # Add text content
             if slide_text:
                 for text in slide_text:
-                    markdown_parts.append(f"{text}\n")
+                    temp_parts.append(f"{text}\n")
             
-            # Add images with placeholders
+            # Add image placeholders
             if slide_images:
                 for img_idx in slide_images:
-                    image_info = image_mapping[img_idx]
-                    filename = image_info['filename']
-                    slide_number = image_info['slide_number']
-                    rel_path = os.path.join("extracted_images", pptx_stem, filename)
-                    
-                    markdown_parts.append(f"\n[IMAGE_PLACEHOLDER_{img_idx}]")
-                    markdown_parts.append(f"IMAGE_PATH: {rel_path}")
-                    markdown_parts.append(f"PAGE: {slide_number}")  # PAGE tag for consistency
-                    markdown_parts.append(f"SLIDE: {slide_number}")  # Additional SLIDE tag
-                    markdown_parts.append("")
+                    temp_parts.append(f"[IMAGE_PLACEHOLDER_{img_idx}]")
             
             # Add tables
             if slide_tables:
                 for table_md in slide_tables:
-                    markdown_parts.append(f"\n{table_md}\n")
+                    temp_parts.append(f"\n{table_md}\n")
             
-            # Extract speaker notes
+            # Speaker notes
             if slide.has_notes_slide:
                 notes_text = slide.notes_slide.notes_text_frame.text.strip()
                 if notes_text:
-                    markdown_parts.append(f"\n**Speaker Notes**:\n{notes_text}\n")
+                    temp_parts.append(f"\n**Speaker Notes**: {notes_text}\n")
             
-            markdown_parts.append("")  # Blank line between slides
+            temp_parts.append("")
         
-        return "\n".join(markdown_parts)
+        # Second pass: Detect captions and associate with images
+        processed_caption_indices = set()
+        image_caption_map = {}
+        placeholder_pattern = r'\[IMAGE_PLACEHOLDER_(\d+)\]'
+        
+        for i, line in enumerate(temp_parts):
+            match = re.match(placeholder_pattern, line.strip())
+            if match:
+                img_idx = int(match.group(1))
+                
+                # Look ahead for caption (within next 8 lines for slides)
+                caption_info = None
+                for j in range(i + 1, min(i + 8, len(temp_parts))):
+                    check_line = temp_parts[j].strip()
+                    if not check_line:
+                        continue
+                    
+                    result = CaptionDetector.detect_caption(check_line)
+                    if result:
+                        caption_type, number, description = result
+                        if caption_type in ['figure', 'table', 'chart']:
+                            caption_info = {
+                                'type': caption_type,
+                                'number': number,
+                                'description': description,
+                                'line_idx': j,
+                                'full_text': check_line
+                            }
+                            processed_caption_indices.add(j)
+                            break
+                    
+                    # Stop at structural elements
+                    if check_line.startswith('#') or '[IMAGE_PLACEHOLDER_' in check_line:
+                        break
+                
+                # Look backward if not found ahead (captions can come before images in slides)
+                if not caption_info:
+                    for j in range(max(0, i - 8), i):
+                        check_line = temp_parts[j].strip()
+                        if not check_line:
+                            continue
+                        
+                        result = CaptionDetector.detect_caption(check_line)
+                        if result:
+                            caption_type, number, description = result
+                            if caption_type in ['figure', 'table', 'chart']:
+                                # Check if not already processed
+                                if j not in processed_caption_indices:
+                                    caption_info = {
+                                        'type': caption_type,
+                                        'number': number,
+                                        'description': description,
+                                        'line_idx': j,
+                                        'full_text': check_line
+                                    }
+                                    processed_caption_indices.add(j)
+                                    break
+                        
+                        # Stop at structural elements
+                        if check_line.startswith('#'):
+                            break
+                
+                if caption_info:
+                    image_caption_map[img_idx] = caption_info
+        
+        # Third pass: Build final output with captions and descriptions
+        final_parts = []
+        for i, line in enumerate(temp_parts):
+            # Skip processed captions
+            if i in processed_caption_indices:
+                continue
+            
+            # Check if this is an image placeholder
+            match = re.match(placeholder_pattern, line.strip())
+            if match:
+                img_idx = int(match.group(1))
+                if img_idx in image_data:
+                    image_info = image_data[img_idx]
+                    
+                    # Add caption as heading if found (e.g., "### Figure 1.3.4: Revenue Trends")
+                    if img_idx in image_caption_map:
+                        caption = image_caption_map[img_idx]
+                        heading = CaptionDetector.format_as_heading(
+                            caption['type'], caption['number'], caption['description']
+                        )
+                        final_parts.append(f"\n{heading}\n")
+                    
+                    # Add AI description
+                    final_parts.append(f"**[Image Description]**: {image_info['description']}")
+                    final_parts.append(f"*(Located on slide {image_info['slide_number']})*")
+                    final_parts.append("")
+            else:
+                final_parts.append(line)
+        
+        return "\n".join(final_parts)
     
     def _get_slide_title(self, slide) -> str:
         """Extract slide title"""
@@ -367,14 +427,11 @@ class PptxExtractor(BaseExtractor):
         return ""
     
     def _extract_table(self, shape) -> str:
-        """
-        Extract table from shape and convert to markdown
-        """
+        """Extract table as markdown"""
         try:
             table = shape.table
             rows = []
             
-            # Extract all cells
             for row in table.rows:
                 row_data = []
                 for cell in row.cells:
@@ -384,18 +441,11 @@ class PptxExtractor(BaseExtractor):
             if not rows:
                 return ""
             
-            # Build markdown table
             md_parts = []
-            
-            # Header row
             md_parts.append("| " + " | ".join(rows[0]) + " |")
-            
-            # Separator
             md_parts.append("| " + " | ".join(["---"] * len(rows[0])) + " |")
             
-            # Data rows
             for row in rows[1:]:
-                # Pad row if needed
                 while len(row) < len(rows[0]):
                     row.append("")
                 md_parts.append("| " + " | ".join(row) + " |")
@@ -406,7 +456,20 @@ class PptxExtractor(BaseExtractor):
             logger.warning(f"Could not extract table: {e}")
             return ""
     
-    def _gather_statistics(self, prs: Presentation, image_mapping: Dict) -> Dict:
+    def _get_image_extension(self, content_type: str) -> str:
+        """Get file extension from content type"""
+        extensions = {
+            'image/jpeg': 'jpg',
+            'image/png': 'png',
+            'image/gif': 'gif',
+            'image/bmp': 'bmp',
+            'image/tiff': 'tiff',
+            'image/webp': 'webp'
+        }
+        ext = extensions.get(content_type, 'png')
+        return ext
+    
+    def _gather_statistics(self, prs: Presentation, image_data: Dict) -> Dict:
         """Gather presentation statistics"""
         stats = {
             'tables': 0,
@@ -425,84 +488,3 @@ class PptxExtractor(BaseExtractor):
                     stats['text_shapes'] += 1
         
         return stats
-    
-    def _apply_caption_detection(
-        self,
-        markdown_content: str,
-        image_mapping: Dict[int, Dict],
-        pptx_stem: str
-    ) -> str:
-        """
-        Apply caption detection to associate figure labels with images
-        """
-        lines = markdown_content.split('\n')
-        result_lines = []
-        
-        placeholder_pattern = r'^(IMAGE_PATH:\s*(.+)|.*\[IMAGE_PLACEHOLDER_\d+\].*)$'
-        image_counter = [0]
-        processed_caption_indices = set()
-        image_caption_map = {}
-        
-        # First pass: Find captions
-        for i, line in enumerate(lines):
-            if re.match(placeholder_pattern, line):
-                image_counter[0] += 1
-                idx = image_counter[0]
-                
-                # Look ahead for caption
-                caption_info = CaptionDetector.find_caption_in_range(
-                    lines, i + 1, lookahead=10
-                )
-                
-                if caption_info:
-                    image_caption_map[idx] = caption_info
-                    processed_caption_indices.add(caption_info['line_idx'])
-                    logger.debug(f"Found caption for image {idx}: {caption_info['full_text']}")
-                
-                # Look backward for caption
-                if idx not in image_caption_map:
-                    caption_before = CaptionDetector.find_caption_before(
-                        lines, i, lookback=10
-                    )
-                    if caption_before:
-                        image_caption_map[idx] = caption_before
-                        processed_caption_indices.add(caption_before['line_idx'])
-                        logger.debug(f"Found caption before image {idx}: {caption_before['full_text']}")
-        
-        # Second pass: Build output with captions
-        image_counter[0] = 0
-        
-        for i, line in enumerate(lines):
-            # Skip processed captions
-            if i in processed_caption_indices:
-                continue
-            
-            # Keep headings
-            if line.startswith('#'):
-                result_lines.append(line)
-                continue
-            
-            # Handle image placeholders
-            if re.match(placeholder_pattern, line):
-                image_counter[0] += 1
-                idx = image_counter[0]
-                
-                # Add caption as heading if found
-                if idx in image_caption_map:
-                    caption = image_caption_map[idx]
-                    heading = CaptionDetector.format_caption_as_heading(
-                        caption['type'], caption['number'], caption['description']
-                    )
-                    result_lines.append(f"\n{heading}\n")
-                
-                # Add image path
-                if 'IMAGE_PATH:' in line:
-                    result_lines.append(line)
-                elif '[IMAGE_PLACEHOLDER_' in line:
-                    pass  # Skip placeholder, IMAGE_PATH comes next
-                
-                result_lines.append("")
-            else:
-                result_lines.append(line)
-        
-        return '\n'.join(result_lines)

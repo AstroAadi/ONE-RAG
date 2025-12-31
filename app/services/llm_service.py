@@ -1,8 +1,7 @@
 """
-Enhanced LLM Service with Vision Support and DATABASE-BACKED CONVERSATION HISTORY
-- Stores conversation history in database (last 4 turns per user)
-- FIFO deletion when exceeding limit
-- Proper user isolation
+LLM Service - Text-Only Version (No Vision)
+All image understanding happens at ingestion time via ImageDescriptionService
+This service handles only text-based RAG queries
 """
 
 from langchain_aws import ChatBedrock
@@ -13,12 +12,8 @@ from app.db.models import ConversationHistory
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
 import logging
-from typing import List, Dict, Optional, Tuple
+from typing import Optional, Tuple
 import re
-import json
-import base64
-import os
-import boto3
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
@@ -26,12 +21,12 @@ logger = logging.getLogger(__name__)
 
 class LLMService:
     """
-    LLM service with DATABASE-BACKED conversation history
+    Text-only LLM service with database-backed conversation history
     
-    Key changes:
-    - Stores conversation in database, not in-memory
-    - FIFO deletion: keeps only last 4 Q&A pairs per conversation
-    - User-isolated conversations
+    Key Changes:
+    - Removed all vision-related code
+    - No image path detection or processing
+    - Pure text-based RAG
     """
     
     def __init__(self):
@@ -46,24 +41,7 @@ class LLMService:
         self.model_id = settings.bedrock_model_id
         self._llm = None
         
-        # Initialize Bedrock runtime for vision
-        try:
-            if settings.aws_profile_name:
-                session = boto3.Session(
-                    profile_name=settings.aws_profile_name,
-                    region_name=settings.aws_region
-                )
-                self.bedrock_runtime = session.client('bedrock-runtime')
-            else:
-                self.bedrock_runtime = boto3.client(
-                    'bedrock-runtime',
-                    region_name=settings.aws_region
-                )
-        except Exception as e:
-            logger.warning(f"Could not initialize Bedrock runtime: {e}")
-            self.bedrock_runtime = None
-        
-        logger.info(f"Enhanced LLM Service initialized with model: {self.model_id}")
+        logger.info(f"LLM Service initialized (text-only) with model: {self.model_id}")
     
     def get_llm(self) -> ChatBedrock:
         """Get or create LangChain ChatBedrock instance"""
@@ -80,14 +58,14 @@ class LLMService:
         return self._llm
     
     def get_conversation_history(
-        self, 
-        conversation_id: str, 
+        self,
+        conversation_id: str,
         user_id: str,
         db: Session,
         max_turns: int = 4
     ) -> str:
         """
-        Get conversation history from DATABASE (last N turns)
+        Get conversation history from database (last N turns)
         
         Args:
             conversation_id: Conversation identifier
@@ -141,7 +119,7 @@ class LLMService:
         max_turns: int = 4
     ):
         """
-        Save conversation turn to DATABASE with FIFO deletion
+        Save conversation turn to database with FIFO deletion
         
         Args:
             conversation_id: Conversation identifier
@@ -152,15 +130,14 @@ class LLMService:
             max_turns: Maximum Q&A pairs to keep (default: 4)
         """
         try:
-            # Count existing messages for this conversation
+            # Count existing messages
             message_count = db.query(ConversationHistory).filter(
                 ConversationHistory.conversation_id == conversation_id,
                 ConversationHistory.user_id == user_id
             ).count()
             
-            # If we already have max_turns * 2 messages (Q&A pairs), delete oldest pair
+            # If at limit, delete oldest pair
             if message_count >= (max_turns * 2):
-                # Delete oldest 2 messages (1 Q&A pair)
                 oldest_messages = db.query(ConversationHistory).filter(
                     ConversationHistory.conversation_id == conversation_id,
                     ConversationHistory.user_id == user_id
@@ -195,7 +172,7 @@ class LLMService:
             
             db.commit()
             
-            logger.debug(f"Saved conversation turn for user {user_id}, conversation {conversation_id}")
+            logger.debug(f"Saved conversation turn for user {user_id}")
             
         except Exception as e:
             logger.error(f"Error saving conversation: {e}")
@@ -212,233 +189,50 @@ class LLMService:
         temperature: Optional[float] = None
     ) -> str:
         """
-        Generate answer with DATABASE-BACKED conversation history
+        Generate answer using text-only LLM (NO VISION)
         
         Args:
             question: User's question
-            context: Retrieved document context
-            user_id: User identifier (for conversation isolation)
+            context: Retrieved document context (text only)
+            user_id: User identifier
             db: Database session
-            conversation_id: Optional conversation ID for multi-turn
+            conversation_id: Optional conversation ID
             include_citations: Whether to verify citations
-            temperature: Optional temperature override (0.0-1.0)
+            temperature: Optional temperature override
         
         Returns:
-            Generated answer string
+            Generated answer
         """
         try:
-            # Extract image references from context
-            image_refs = self._extract_image_references(context)
-            
-            # Get conversation history from DATABASE if available
-            history_text = ""
+            # Get conversation history if conversation_id provided
+            history = ""
             if conversation_id:
-                history_text = self.get_conversation_history(
-                    conversation_id, 
-                    user_id, 
-                    db,
-                    max_turns=4  # Last 4 Q&A pairs
+                history = self.get_conversation_history(
+                    conversation_id, user_id, db
                 )
             
-            # If images found, use vision-enabled generation
-            if image_refs and self.bedrock_runtime:
-                logger.info(f"Found {len(image_refs)} image(s) in context, using vision-enabled generation")
-                answer = self._generate_with_vision(
-                    question=question,
-                    context=context,
-                    image_refs=image_refs,
-                    history=history_text,
-                    temperature=temperature
-                )
-            else:
-                # Standard text-only generation
-                answer = self._generate_text_only(
-                    question=question,
-                    context=context,
-                    history=history_text,
-                    temperature=temperature
-                )
+            # Generate answer (text-only)
+            answer = self._generate_text_only(
+                question, context, history, temperature
+            )
             
-            # Verify citations
+            # Verify citations if requested
             if include_citations:
                 answer = self._verify_citations(answer, context)
             
-            # Save to DATABASE
+            # Save to conversation history if conversation_id provided
             if conversation_id:
                 self.save_conversation_turn(
-                    conversation_id=conversation_id,
-                    user_id=user_id,
-                    question=question,
-                    answer=answer,
-                    db=db,
-                    max_turns=4
+                    conversation_id, user_id, question, answer, db
                 )
             
             return answer
             
         except Exception as e:
-            logger.error(f"Error generating answer: {str(e)}")
-            raise
-    
-    def _extract_image_references(self, context: str) -> List[Dict[str, str]]:
-        """
-        Extract image references from context
-        
-        Format in markdown:
-        IMAGE_PATH: path/to/image.png
-        PAGE: 5
-        DESCRIPTION: ...
-        """
-        image_refs = []
-        
-        # Find all image path references
-        pattern = r'IMAGE_PATH:\s*([^\n]+)'
-        matches = re.finditer(pattern, context)
-        
-        for match in matches:
-            image_path = match.group(1).strip()
-            
-            # Get surrounding context (description, page, etc.)
-            start_pos = max(0, match.start() - 500)
-            end_pos = min(len(context), match.end() + 1000)
-            surrounding_text = context[start_pos:end_pos]
-            
-            # Extract page number
-            page_match = re.search(r'PAGE:\s*(\d+)', surrounding_text)
-            page = page_match.group(1) if page_match else "unknown"
-            
-            # Extract description
-            desc_match = re.search(r'DESCRIPTION:\s*([^\n]+)', surrounding_text)
-            description = desc_match.group(1) if desc_match else ""
-            
-            image_refs.append({
-                'path': image_path,
-                'page': page,
-                'description': description,
-                'surrounding_context': surrounding_text[:500]
-            })
-        
-        return image_refs
-    
-    def _load_image_as_base64(self, image_path: str) -> Optional[Tuple[str, str]]:
-        """
-        Load image file and convert to base64
-        
-        Returns:
-            Tuple of (base64_data, media_type) or None if failed
-        """
-        try:
-            # Handle relative paths
-            if not os.path.isabs(image_path):
-                image_path = os.path.join(settings.upload_dir, image_path)
-            
-            if not os.path.exists(image_path):
-                logger.warning(f"Image not found: {image_path}")
-                return None
-            
-            # Determine media type
-            ext = os.path.splitext(image_path)[1].lower()
-            media_type_map = {
-                '.jpg': 'image/jpeg',
-                '.jpeg': 'image/jpeg',
-                '.png': 'image/png',
-                '.gif': 'image/gif',
-                '.webp': 'image/webp'
-            }
-            media_type = media_type_map.get(ext, 'image/jpeg')
-            
-            # Read and encode
-            with open(image_path, 'rb') as f:
-                image_data = base64.b64encode(f.read()).decode('utf-8')
-            
-            return image_data, media_type
-            
-        except Exception as e:
-            logger.error(f"Error loading image {image_path}: {e}")
-            return None
-    
-    def _generate_with_vision(
-        self,
-        question: str,
-        context: str,
-        image_refs: List[Dict],
-        history: str = "",
-        temperature: Optional[float] = None
-    ) -> str:
-        """Generate answer with vision support using Bedrock API directly"""
-        try:
-            # Use provided temperature or default
-            temp = temperature if temperature is not None else settings.vision_temperature
-            
-            # Build content parts (text + images)
-            content_parts = []
-            
-            # Add text context
-            context_summary = self._compress_context(context, question, max_length=6000)
-            
-            text_content = ""
-            if history:
-                text_content += f"{history}\n\n"
-            
-            text_content += f"Context from documents:\n{context_summary}\n\n"
-            text_content += f"Question: {question}\n\n"
-            
-            # Add images
-            for img_ref in image_refs[:5]:  # Limit to 5 images
-                image_data = self._load_image_as_base64(img_ref['path'])
-                if image_data:
-                    base64_data, media_type = image_data
-                    content_parts.append({
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": media_type,
-                            "data": base64_data
-                        }
-                    })
-                    
-                    # Add image context
-                    text_content += f"\n[Image from page {img_ref['page']}]\n"
-                    if img_ref['description']:
-                        text_content += f"Description: {img_ref['description']}\n"
-            
-            # Add text as final content part
-            content_parts.append({
-                "type": "text",
-                "text": text_content + 
-                        "Instructions:\n" +
-                        "- Answer using information from BOTH text context AND images\n" +
-                        "- Reference specific images when relevant (e.g., 'As shown in the image...')\n" +
-                        "- Be specific about numbers, trends, and visual details\n" +
-                        "- If answer not in context, say so clearly\n\nAnswer:"
-            })
-            
-            # Call Bedrock directly
-            request_body = {
-                "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": settings.vision_max_tokens,
-                "temperature": temp,
-                "messages": [{
-                    "role": "user",
-                    "content": content_parts
-                }]
-            }
-            
-            response = self.bedrock_runtime.invoke_model(
-                modelId=settings.bedrock_vision_model_id,  # Use config!
-                body=json.dumps(request_body)
-            )
-            
-            response_body = json.loads(response['body'].read())
-            
-            if 'content' in response_body and response_body['content']:
-                return response_body['content'][0]['text']
-            else:
-                raise Exception("No content in vision response")
-            
-        except Exception as e:
-            logger.error(f"Vision generation failed: {e}, falling back to text-only")
-            return self._generate_text_only(question, context, history, temperature)
+            logger.error(f"Answer generation error: {e}")
+            import traceback
+            traceback.print_exc()
+            return f"I apologize, but I encountered an error: {str(e)}"
     
     def _generate_text_only(
         self,
@@ -447,7 +241,11 @@ class LLMService:
         history: str = "",
         temperature: Optional[float] = None
     ) -> str:
-        """Standard text-only generation using LangChain"""
+        """
+        Standard text-only generation
+        
+        This is now the ONLY generation method - no vision support
+        """
         try:
             # Use provided temperature or default
             temp = temperature if temperature is not None else settings.temperature
@@ -481,7 +279,7 @@ Instructions:
 - If answer not found, say "I don't have enough information to answer this question"
 - Be concise and accurate
 - Reference sources when relevant (e.g., [Source 1])
-- For visual content (tables, charts), use the descriptions provided
+- The context may include image descriptions marked as "[Image Description]" - use these descriptions as factual information
 - Use proper markdown formatting (bullet points, **bold**, headings)
 
 Answer:"""
@@ -509,7 +307,7 @@ Answer:"""
         self,
         context: str,
         question: str,
-        max_length: int = 8000 
+        max_length: int = 8000
     ) -> str:
         """Compress context by removing less relevant parts"""
         if len(context) <= max_length:
@@ -608,7 +406,7 @@ Answer:"""
             return False, 1.0
     
     def clear_conversation(self, conversation_id: str, user_id: str, db: Session):
-        """Clear conversation history from DATABASE"""
+        """Clear conversation history from database"""
         try:
             db.query(ConversationHistory).filter(
                 ConversationHistory.conversation_id == conversation_id,
