@@ -1,38 +1,45 @@
 """
-PDF Extractor - COMPLETE FIX
-All issues resolved:
-1. ✅ Image deduplication using perceptual hashing
-2. ✅ Proper page numbers from Docling (no estimation)
-3. ✅ Page 1 marker added at start
-4. ✅ Vision classification to skip headers/footers
-5. ✅ Proper image-to-page mapping
-6. ✅ No duplicate figures
+Enhanced PDF Extractor - PROPER SOLUTION
+Uses Docling's internal page structure to extract content page-by-page
 """
 
 import os
 from pathlib import Path
-from typing import Tuple, Dict, List, Set
+from typing import Tuple, Dict, List, Optional
 import base64
 import re
 import logging
-import io
-from PIL import Image
-import imagehash
 
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.datamodel.base_models import InputFormat
 
 from ..base_extractor import BaseExtractor
-from ..processors.caption_detector import CaptionDetector
 
 logger = logging.getLogger(__name__)
 
 
 class PDFExtractor(BaseExtractor):
     """
-    Production PDF Extractor with complete fixes
+    PDF Extractor with proper page-by-page extraction
+    
+    SOLUTION: Use Docling's page objects to get content per page
     """
+    
+    def __init__(self, config: Optional[Dict] = None):
+        super().__init__(config)
+        
+        from app.services.header_footer_detector import get_header_footer_detector
+        from app.services.image_cache_manager import get_image_cache
+        from app.services.image_description_service import get_image_description_service
+        from app.services.extraction.processors.caption_detector import CaptionDetector
+        
+        self.header_footer_detector = get_header_footer_detector()
+        self.image_cache = get_image_cache()
+        self.image_service = get_image_description_service()
+        self.caption_detector = CaptionDetector
+        
+        logger.info("PDF Extractor initialized with page-aware extraction")
     
     def _get_supported_formats(self) -> List[str]:
         return ['pdf']
@@ -43,169 +50,212 @@ class PDFExtractor(BaseExtractor):
         
         if not path.exists():
             return False, "File does not exist"
-        
         if path.suffix.lower() != '.pdf':
             return False, "Not a PDF file"
-        
         if path.stat().st_size == 0:
             return False, "PDF file is empty"
         
         return True, "Valid PDF"
     
     def extract(self, file_path: str) -> Tuple[str, bool, Dict]:
-        """Extract PDF with all fixes"""
+        """Extract PDF with proper page structure"""
         try:
             is_valid, msg = self.validate_file(file_path)
             if not is_valid:
                 return "", False, {'error': msg}
             
             pdf_stem = Path(file_path).stem
-            image_output_dir = os.path.join(
-                os.path.dirname(file_path),
-                "extracted_images",
-                pdf_stem
-            )
-            os.makedirs(image_output_dir, exist_ok=True)
+            image_output_dir = self._create_image_directory(file_path, pdf_stem)
             
-            logger.info(f"Extracting: {file_path}")
+            logger.info(f"📄 Extracting: {file_path}")
             
-            # Configure Docling
-            pipeline_options = PdfPipelineOptions()
-            pipeline_options.do_ocr = self.get_config('do_ocr', True)
-            pipeline_options.do_table_structure = self.get_config('do_table_structure', True)
-            pipeline_options.images_scale = self.get_config('images_scale', 2.0)
-            pipeline_options.generate_picture_images = True
+            # Detect header/footer zones
+            zones = self.header_footer_detector.detect(file_path, sample_pages=5)
+            if zones:
+                logger.info(f"🎯 {zones}")
             
-            # Optional features
-            try:
-                pipeline_options.generate_page_images = False
-                pipeline_options.artifacts_path = None
-            except AttributeError:
-                pass
+            # Extract with Docling
+            result, total_pages = self._extract_with_docling(file_path)
             
-            converter = DocumentConverter(
-                format_options={
-                    InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
-                }
-            )
+            logger.info(f"📑 Document has {total_pages} pages")
             
-            # Convert
-            logger.info("Starting Docling conversion...")
-            result = converter.convert(file_path)
-            total_pages = len(result.document.pages)
-            logger.info(f"Docling extracted {total_pages} pages")
+            # Build content index: map each content item to its page
+            content_to_page_map = self._build_content_page_map(result.document)
             
-            # STEP 1: Get page mapping from Docling (EXACT pages, no estimation)
-            page_mapping = self._get_page_mapping_from_docling(result.document)
-            
-            # STEP 2: Extract images with base64
-            markdown_with_base64 = result.document.export_to_markdown(image_mode="embedded")
-            
-            # STEP 3: Process images (deduplicate, classify, describe)
-            image_data = self._extract_and_describe_images(
-                markdown_with_base64,
+            # Process images with page information
+            image_data = self._process_images_with_pages(
+                result.document,
                 image_output_dir,
                 pdf_stem,
-                result.document,
                 file_path,
+                zones,
+                content_to_page_map
+            )
+            
+            # Build markdown page-by-page using Docling's structure
+            final_markdown = self._build_markdown_from_pages(
+                result.document,
                 total_pages,
-                page_mapping
-            )
-            
-            # STEP 4: Generate markdown with placeholders
-            markdown_content = result.document.export_to_markdown(
-                image_mode="placeholder",
-                image_placeholder="[IMAGE:{image_name}]"
-            )
-            
-            # STEP 5: Build final markdown
-            final_markdown = self._build_markdown_with_descriptions(
-                markdown_content,
                 image_data,
                 pdf_stem,
-                total_pages
+                zones,
+                content_to_page_map
             )
             
-            metadata = self.get_metadata(file_path)
-            metadata.update({
+            # Metadata
+            cache_stats = self.image_cache.get_stats()
+            metadata = {
+                'extractor': 'PDFExtractor_PageAware',
                 'total_pages': total_pages,
                 'images_extracted': len(image_data),
-                'images_described': sum(1 for img in image_data.values() if img.get('description_success')),
+                'images_described': sum(1 for img in image_data.values() if img.get('success')),
+                'images_cached': cache_stats['hits'],
                 'images_skipped_duplicates': getattr(self, '_duplicates_skipped', 0),
                 'images_skipped_headers': getattr(self, '_headers_skipped', 0),
+                'header_footer_detected': zones is not None,
+                'cache_hit_rate': cache_stats['hit_rate_percent'],
                 'image_directory': str(image_output_dir)
-            })
+            }
             
             logger.info(
-                f"✓ Complete: {total_pages} pages, {len(image_data)} images "
-                f"(skipped {metadata['images_skipped_duplicates']} dupes, "
-                f"{metadata['images_skipped_headers']} headers)"
+                f"✅ Complete: {total_pages} pages, {len(image_data)} images "
+                f"({metadata['images_cached']} cached)"
             )
             
             return final_markdown, True, metadata
             
         except Exception as e:
-            logger.error(f"PDF extraction error: {str(e)}")
+            logger.error(f"❌ PDF extraction error: {str(e)}")
             import traceback
             traceback.print_exc()
             return "", False, {'error': str(e)}
     
-    def _get_page_mapping_from_docling(self, document) -> Dict[int, int]:
-        """
-        Get EXACT page numbers from Docling structure
-        NO ESTIMATION - use actual Docling data
-        
-        Returns:
-            Dict mapping extract_index -> page_number
-        """
-        page_mapping = {}
+    def _create_image_directory(self, file_path: str, pdf_stem: str) -> str:
+        """Create directory for extracted images"""
+        image_dir = os.path.join(
+            os.path.dirname(file_path),
+            "extracted_images",
+            pdf_stem
+        )
+        os.makedirs(image_dir, exist_ok=True)
+        return image_dir
+    
+    def _extract_with_docling(self, file_path: str) -> Tuple[any, int]:
+        """Extract content using Docling"""
+        pipeline_options = PdfPipelineOptions()
+        pipeline_options.do_ocr = self.config.get('do_ocr', True)
+        pipeline_options.do_table_structure = self.config.get('do_table_structure', True)
+        pipeline_options.images_scale = self.config.get('images_scale', 2.0)
+        pipeline_options.generate_picture_images = True
         
         try:
+            pipeline_options.generate_page_images = False
+            pipeline_options.artifacts_path = None
+        except AttributeError:
+            pass
+        
+        converter = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+            }
+        )
+        
+        logger.info("🔄 Starting Docling conversion...")
+        result = converter.convert(file_path)
+        total_pages = len(result.document.pages)
+        logger.info(f"✅ Docling extracted {total_pages} pages")
+        
+        return result, total_pages
+    
+    def _build_content_page_map(self, document) -> Dict:
+        """
+        Build a map of content items to their source pages
+        
+        This is the KEY to proper page-by-page extraction
+        
+        Returns:
+            {
+                'texts': {text_index: page_number},
+                'pictures': {picture_index: page_number},
+                'tables': {table_index: page_number}
+            }
+        """
+        content_map = {
+            'texts': {},
+            'pictures': {},
+            'tables': {}
+        }
+        
+        try:
+            # Map pictures to pages
             if hasattr(document, 'pictures') and document.pictures:
-                for idx, picture in enumerate(document.pictures, start=1):
-                    if hasattr(picture, 'prov'):
+                for idx, picture in enumerate(document.pictures):
+                    if hasattr(picture, 'prov') and picture.prov:
                         for prov in picture.prov:
                             if hasattr(prov, 'page_no'):
                                 # Docling uses 0-indexed pages
-                                page_mapping[idx] = prov.page_no + 1
-                                logger.debug(f"Image {idx} -> Page {prov.page_no + 1} (from Docling)")
+                                content_map['pictures'][idx] = prov.page_no + 1
                                 break
+            
+            # Map tables to pages
+            if hasattr(document, 'tables') and document.tables:
+                for idx, table in enumerate(document.tables):
+                    if hasattr(table, 'prov') and table.prov:
+                        for prov in table.prov:
+                            if hasattr(prov, 'page_no'):
+                                content_map['tables'][idx] = prov.page_no + 1
+                                break
+            
+            # Map text items to pages (if available)
+            if hasattr(document, 'texts') and document.texts:
+                for idx, text in enumerate(document.texts):
+                    if hasattr(text, 'prov') and text.prov:
+                        for prov in text.prov:
+                            if hasattr(prov, 'page_no'):
+                                content_map['texts'][idx] = prov.page_no + 1
+                                break
+            
+            logger.debug(
+                f"Mapped content: {len(content_map['pictures'])} images, "
+                f"{len(content_map['tables'])} tables, "
+                f"{len(content_map['texts'])} text items"
+            )
+            
         except Exception as e:
-            logger.warning(f"Could not extract page mapping: {e}")
+            logger.warning(f"Error building content map: {e}")
         
-        return page_mapping
+        return content_map
     
-    def _extract_and_describe_images(
+    def _process_images_with_pages(
         self,
-        markdown_with_base64: str,
+        document,
         image_output_dir: str,
         pdf_stem: str,
-        document,
         pdf_path: str,
-        total_pages: int,
-        page_mapping: Dict[int, int]
+        zones,
+        content_map: Dict
     ) -> Dict[int, Dict]:
-        """
-        Extract and process images with:
-        1. Perceptual hash deduplication
-        2. Vision classification (skip headers)
-        3. AI descriptions
-        """
-        from app.services.image_description_service import get_image_description_service
+        """Process images with accurate page numbers from content map"""
+        try:
+            markdown_with_base64 = document.export_to_markdown(image_mode="embedded")
+        except Exception as e:
+            logger.warning(f"Failed to export with embedded images: {e}")
+            return {}
         
         pattern = r'!\[([^\]]*)\]\(data:image/([^;]+);base64,([^)]+)\)'
         matches = re.findall(pattern, markdown_with_base64)
         
-        description_service = get_image_description_service()
-        doc_context = f"PDF document: {pdf_stem}"
+        if not matches:
+            return {}
         
-        # Track seen hashes
-        seen_hashes: Set[str] = set()
+        # Track statistics
         self._duplicates_skipped = 0
         self._headers_skipped = 0
+        seen_hashes = set()
         
+        # Process images
         image_data = {}
-        output_idx = 1  # Index for kept images
+        doc_context = f"PDF document: {pdf_stem}"
         
         for extract_idx, match in enumerate(matches, start=1):
             try:
@@ -213,338 +263,160 @@ class PDFExtractor(BaseExtractor):
                 base64_image = match[2]
                 image_bytes = base64.b64decode(base64_image)
                 
-                # STEP 1: Check for duplicate
-                if self._is_duplicate_image(image_bytes, seen_hashes):
-                    logger.info(f"  ⏭ Duplicate: image {extract_idx}")
+                # Get page number from content map (0-indexed in enumerate, so extract_idx-1)
+                page_number = content_map['pictures'].get(extract_idx - 1, 1)
+                
+                # Check duplicate
+                img_hash = self.image_cache.compute_hash(image_bytes)
+                if img_hash in seen_hashes:
                     self._duplicates_skipped += 1
                     continue
+                seen_hashes.add(img_hash)
                 
-                # STEP 2: Get page number (NO ESTIMATION)
-                page_number = page_mapping.get(extract_idx)
-                if page_number is None:
-                    logger.warning(f"  ⚠ No page mapping for image {extract_idx}, defaulting to page 1")
-                    page_number = 1
-                
-                # Clamp to valid range
-                if page_number > total_pages:
-                    logger.warning(f"  ⚠ Page {page_number} > {total_pages}, clamping")
-                    page_number = total_pages
-                
-                # STEP 3: Classify image type
-                image_class = self._classify_image_type(
-                    base64_image,
-                    f"image/{image_format}",
-                    description_service
-                )
-                
-                if image_class in ['HEADER', 'FOOTER', 'DECORATION']:
-                    logger.info(f"  ⏭ {image_class}: image {extract_idx}")
+                # Check header/footer
+                if zones and self.header_footer_detector.is_image_in_zone(
+                    pdf_path, page_number, image_bytes, zones
+                ):
                     self._headers_skipped += 1
                     continue
                 
-                # STEP 4: Save image
+                # Get description (with caching)
+                cached_desc = self.image_cache.get(image_bytes)
+                
+                if cached_desc:
+                    description = cached_desc
+                    from_cache = True
+                    success = True
+                else:
+                    success, description = self.image_service.describe_image_from_base64(
+                        base64_image,
+                        self._get_media_type(image_format),
+                        context=doc_context,
+                        page_number=page_number
+                    )
+                    from_cache = False
+                    
+                    if success:
+                        self.image_cache.put(image_bytes, description)
+                
+                # Save image
                 ext = image_format.lower()
                 if ext == 'jpeg':
                     ext = 'jpg'
                 
-                image_filename = f"page_{page_number:02d}_image_{output_idx:03d}.{ext}"
-                image_path = os.path.join(image_output_dir, image_filename)
+                filename = f"page_{page_number:03d}_image_{extract_idx:03d}.{ext}"
+                image_path = os.path.join(image_output_dir, filename)
                 
                 with open(image_path, 'wb') as f:
                     f.write(image_bytes)
                 
-                logger.info(f"  ✓ Saved: {image_filename} (page {page_number})")
-                
-                # STEP 5: Generate description
-                if description_service.is_available():
-                    success, description = description_service.describe_image_from_base64(
-                        base64_image,
-                        f"image/{image_format}",
-                        context=doc_context,
-                        page_number=page_number,
-                        filename=image_filename
-                    )
-                    
-                    if success:
-                        logger.info(f"  ✓ Described: {image_filename}")
-                else:
-                    success = False
-                    description = description_service.generate_fallback_description(
-                        image_filename,
-                        page_number=page_number,
-                        image_type=image_class.lower()
-                    )
-                
-                # Store with output index
-                image_data[output_idx] = {
-                    'filename': image_filename,
+                image_data[extract_idx] = {
+                    'extract_idx': extract_idx,
+                    'filename': filename,
                     'page_number': page_number,
-                    'format': ext,
+                    'format': image_format,
                     'description': description,
-                    'description_success': success,
-                    'original_index': extract_idx
+                    'success': success,
+                    'from_cache': from_cache
                 }
                 
-                output_idx += 1
+                cache_str = "💾" if from_cache else "✓"
+                logger.info(f"  {cache_str} {filename} (page {page_number})")
                 
             except Exception as e:
                 logger.warning(f"  ⚠ Error processing image {extract_idx}: {e}")
                 continue
         
-        logger.info(
-            f"Processed: {len(image_data)} kept, "
-            f"{self._duplicates_skipped} duplicates, "
-            f"{self._headers_skipped} headers"
-        )
-        
         return image_data
     
-    def _is_duplicate_image(self, image_bytes: bytes, seen_hashes: Set[str]) -> bool:
-        """Check if image is duplicate using perceptual hash"""
-        try:
-            img = Image.open(io.BytesIO(image_bytes))
-            img_hash = str(imagehash.phash(img, hash_size=8))
-            
-            if img_hash in seen_hashes:
-                return True
-            
-            seen_hashes.add(img_hash)
-            return False
-            
-        except Exception as e:
-            logger.debug(f"Hash error: {e}")
-            return False
-    
-    def _classify_image_type(
-        self,
-        base64_image: str,
-        media_type: str,
-        description_service
-    ) -> str:
+    def _build_markdown_from_pages(
+    self,
+    document,  # This is the DoclingDocument
+    total_pages: int,
+    image_data: Dict[int, Dict],
+    pdf_stem: str,
+    zones,
+    content_map: Dict
+) -> str:
         """
-        Classify image using vision LLM
-        Returns: FIGURE, TABLE, HEADER, FOOTER, or DECORATION
-        """
-        if not description_service.is_available():
-            return 'FIGURE'
+        Build markdown by processing each page separately
         
-        try:
-            prompt = """Classify this image into ONE category:
-
-A) FIGURE - Chart, graph, diagram, photo with data/research content
-B) TABLE - Data table or spreadsheet
-C) HEADER - Logo, title banner, page header, report branding
-D) FOOTER - Copyright, page number, footer text
-E) DECORATION - Decorative element with no information
-
-Respond ONLY with the letter (A, B, C, D, or E). No explanation."""
-            
-            content_parts = [
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": media_type,
-                        "data": base64_image
-                    }
-                },
-                {
-                    "type": "text",
-                    "text": prompt
-                }
-            ]
-            
-            request_body = {
-                "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": 10,
-                "temperature": 0.0,
-                "messages": [{
-                    "role": "user",
-                    "content": content_parts
-                }]
-            }
-            
-            import boto3
-            import json
-            from app.core.config import settings
-            
-            if settings.aws_profile_name:
-                session = boto3.Session(
-                    profile_name=settings.aws_profile_name,
-                    region_name=settings.aws_region
-                )
-                bedrock = session.client('bedrock-runtime')
-            else:
-                bedrock = boto3.client(
-                    'bedrock-runtime',
-                    region_name=settings.aws_region
-                )
-            
-            response = bedrock.invoke_model(
-                modelId=settings.bedrock_vision_model_id,
-                body=json.dumps(request_body)
-            )
-            
-            response_body = json.loads(response['body'].read())
-            classification = response_body['content'][0]['text'].strip().upper()
-            
-            mapping = {
-                'A': 'FIGURE',
-                'B': 'TABLE',
-                'C': 'HEADER',
-                'D': 'FOOTER',
-                'E': 'DECORATION'
-            }
-            
-            result = mapping.get(classification, 'FIGURE')
-            logger.debug(f"Classified as: {result}")
-            return result
-            
-        except Exception as e:
-            logger.debug(f"Classification failed: {e}, defaulting to FIGURE")
-            return 'FIGURE'
-    
-    def _build_markdown_with_descriptions(
-        self,
-        markdown_content: str,
-        image_data: Dict[int, Dict],
-        pdf_stem: str,
-        total_pages: int
-    ) -> str:
+        FIXED: Iterate over dict keys; use document.export_to_markdown with page_no filter
         """
-        Build final markdown with proper page tracking
-        
-        FIXES:
-        1. Adds "## Page 1" at document start
-        2. Tracks current page properly
-        3. Only adds page marker when page changes
-        4. Captions with images
-        5. No duplicate page markers
-        """
-        lines = markdown_content.split('\n')
         result_lines = []
         
         # Header
         result_lines.append(f"# Document: {pdf_stem}")
-        result_lines.append(f"**Total Pages**: {total_pages}\n")
+        result_lines.append(f"**Total Pages**: {total_pages}")
+        if zones:
+            result_lines.append("**Processing**: Header/footer filtered")
+        result_lines.append("")
         
-        # FIX: Add Page 1 marker at start
-        result_lines.append("## Page 1\n")
-        current_page = 1
+        # Get sorted page numbers (dict keys are ints like 1, 2, ...)
+        page_numbers = sorted(document.pages.keys())
         
-        placeholder_pattern = r'\[IMAGE:\{[^\}]+\}\]'
-        
-        # PASS 1: Find captions
-        image_caption_map = {}
-        lines_to_skip = set()
-        image_counter = 1
-        
-        for i, line in enumerate(lines):
-            if re.search(placeholder_pattern, line):
-                idx = image_counter
+        # Process each page individually
+        for page_number in page_numbers:
+            # Add page marker
+            result_lines.append(f"## Page {page_number}\n")
+            
+            try:
+                # Export this specific page to markdown using the document-level method
+                page_markdown = document.export_to_markdown(
+                    image_mode="placeholder",
+                    image_placeholder="[IMAGE_PLACEHOLDER_{image_name}]",
+                    page_no=page_number,  # Filter to this page only
+                    # Add other params as needed, e.g., delim="\n\n", indent=4
+                )
                 
-                if idx not in image_data:
-                    image_counter += 1
+                if not page_markdown.strip():
+                    result_lines.append("*(No content on this page)*\n")
+                    result_lines.append("")  # Blank line after page
                     continue
                 
-                caption_info = self._find_caption_near_image(lines, i, idx)
+                # Process page content and insert image descriptions
+                page_lines = page_markdown.split('\n')
                 
-                if caption_info:
-                    image_caption_map[idx] = caption_info
-                    lines_to_skip.add(caption_info['line_idx'])
-                    
-                    # Skip chart titles
-                    for j in range(max(0, caption_info['line_idx'] - 5), caption_info['line_idx']):
-                        if self._is_chart_title(lines[j]):
-                            lines_to_skip.add(j)
+                for line in page_lines:
+                    # Check for image placeholders (your existing logic)
+                    if '[IMAGE_PLACEHOLDER_' in line:
+                        # Find matching images for this page
+                        for img_idx, img_info in image_data.items():
+                            if img_info['page_number'] == page_number:
+                                result_lines.append(f"**[Image Description]**: {img_info['description']}")
+                                cache_str = "cached" if img_info.get('from_cache') else "described"
+                                result_lines.append(f"*(Page {page_number}, {cache_str})*")
+                                result_lines.append("")
+                                break  # Assuming one placeholder per image; adjust if multiple
+                    else:
+                        # Regular content
+                        result_lines.append(line)
                 
-                # Skip body text with figure refs
-                for j in range(max(0, i - 10), min(i + 5, len(lines))):
-                    if self._is_body_text_with_figure_ref(lines[j], caption_info):
-                        lines_to_skip.add(j)
+                result_lines.append("")  # Blank line after page content
                 
-                image_counter += 1
-        
-        # PASS 2: Build markdown
-        image_counter = 1
-        
-        for i, line in enumerate(lines):
-            # Skip marked lines
-            if i in lines_to_skip:
-                continue
-            
-            # Skip chart title headings
-            if line.startswith('#') and self._is_chart_title(line.lstrip('#').strip()):
-                continue
-            
-            # Keep regular headings
-            if line.startswith('#') and not self._is_chart_title(line.lstrip('#').strip()):
-                result_lines.append(line)
-                continue
-            
-            # Handle images
-            if re.search(placeholder_pattern, line):
-                idx = image_counter
-                
-                if idx in image_data:
-                    img_info = image_data[idx]
-                    page_number = img_info['page_number']
-                    description = img_info['description']
-                    
-                    # FIX: Only add page marker when page changes
-                    if page_number != current_page:
-                        result_lines.append(f"\n## Page {page_number}\n")
-                        current_page = page_number
-                    
-                    # Add caption
-                    if idx in image_caption_map:
-                        caption = image_caption_map[idx]
-                        heading = CaptionDetector.format_as_heading(
-                            caption['type'], caption['number'], caption['description']
-                        )
-                        result_lines.append(f"{heading}\n")
-                    
-                    # Add description
-                    result_lines.append(f"**[Image Description]**: {description}")
-                    result_lines.append(f"*(Located on page {page_number})*")
-                    result_lines.append("")
-                    
-                    image_counter += 1
-                else:
-                    # Skipped image (duplicate/header)
-                    image_counter += 1
-            else:
-                # Regular content
-                result_lines.append(line)
+            except Exception as e:
+                logger.warning(f"Error processing page {page_number}: {e}")
+                result_lines.append(f"*(Error extracting content from page {page_number})*")
+                result_lines.append("")
         
         return '\n'.join(result_lines)
     
-    def _find_caption_near_image(self, lines: List[str], image_idx: int, image_counter: int) -> Dict:
-        """Find caption near image"""
-        caption = CaptionDetector.find_caption_before(lines, image_idx, lookback=8)
-        if caption:
-            return caption
-        caption = CaptionDetector.find_caption_in_range(lines, image_idx + 1, lookahead=6)
-        return caption
+    def _get_media_type(self, extension: str) -> str:
+        """Map extension to MIME type"""
+        return {
+            'jpg': 'image/jpeg',
+            'jpeg': 'image/jpeg',
+            'png': 'image/png',
+            'gif': 'image/gif',
+            'webp': 'image/webp',
+            'bmp': 'image/bmp'
+        }.get(extension.lower(), 'image/jpeg')
     
-    def _is_chart_title(self, text: str) -> bool:
-        """Check if line is chart title"""
-        return CaptionDetector.is_chart_title(text)
-    
-    def _is_body_text_with_figure_ref(self, line: str, caption_info: Dict) -> bool:
-        """Check if line is body text referencing figure"""
-        if not caption_info or not line.strip():
-            return False
-        
-        figure_ref = f"{caption_info['type'].capitalize()} {caption_info['number']}"
-        
-        if figure_ref in line:
-            body_indicators = [
-                'illustrate', 'show', 'display', 'highlight',
-                'visualize', 'present', 'demonstrate'
-            ]
-            
-            if any(indicator in line.lower() for indicator in body_indicators):
-                return True
-        
-        return False
+    def get_metadata(self, file_path: str) -> Dict:
+        """Get file metadata"""
+        path = Path(file_path)
+        return {
+            'filename': path.name,
+            'size_bytes': path.stat().st_size,
+            'extension': path.suffix.lower()
+        }

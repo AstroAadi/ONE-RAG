@@ -1,6 +1,6 @@
 """
-Image Description Service
-Uses vision-capable LLM to generate textual descriptions of images at ingestion time
+Image Description Service - Unified Version
+Supports both individual and batch image description
 """
 
 import os
@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 import boto3
 import json
+import re
 
 from app.core.config import settings
 
@@ -20,9 +21,10 @@ class ImageDescriptionService:
     """
     Service to generate textual descriptions of images using vision LLM
     
-    This service is called at document ingestion time to convert images
-    into textual descriptions, eliminating the need for vision capabilities
-    at query time.
+    Features:
+    - Individual image description
+    - Batch image description (multiple images in one API call)
+    - Automatic fallback to individual calls if batch fails
     """
     
     def __init__(self):
@@ -56,6 +58,8 @@ class ImageDescriptionService:
         """Check if vision service is available"""
         return self.bedrock_runtime is not None
     
+    # ========== INDIVIDUAL IMAGE DESCRIPTION ==========
+    
     def describe_image_from_path(
         self,
         image_path: str,
@@ -67,7 +71,7 @@ class ImageDescriptionService:
         
         Args:
             image_path: Path to the image file
-            context: Optional context about the document (e.g., document title, section)
+            context: Optional context about the document
             page_number: Optional page number where image appears
             
         Returns:
@@ -164,7 +168,7 @@ class ImageDescriptionService:
             
             if 'content' in response_body and response_body['content']:
                 description = response_body['content'][0]['text'].strip()
-                logger.debug(f"Generated description for image: {description[:100]}...")
+                logger.debug(f"Generated description: {description[:100]}...")
                 return True, description
             else:
                 logger.warning("No content in vision response")
@@ -181,55 +185,191 @@ class ImageDescriptionService:
             
             return False, fallback
     
-    def describe_multiple_images(
+    # ========== BATCH IMAGE DESCRIPTION ==========
+    
+    def describe_images_batch(
         self,
-        image_paths: List[str],
+        images: List[Dict[str, str]],
         context: Optional[str] = None,
-        page_numbers: Optional[Dict[str, int]] = None
-    ) -> Dict[str, str]:
+        page_number: Optional[int] = None,
+        max_batch_size: int = 5
+    ) -> List[Dict[str, any]]:
         """
-        Generate descriptions for multiple images
+        Describe multiple images in a single API call
         
         Args:
-            image_paths: List of image file paths
+            images: List of dicts with 'base64' and 'media_type' keys
             context: Optional document context
-            page_numbers: Optional dict mapping image paths to page numbers
+            page_number: Optional page number
+            max_batch_size: Maximum images per batch (default: 5)
             
         Returns:
-            Dictionary mapping image paths to descriptions
+            List of result dictionaries with 'success', 'description', 'error'
         """
-        descriptions = {}
-        page_numbers = page_numbers or {}
+        if not self.is_available():
+            logger.warning("Vision service not available")
+            return [{
+                'success': False,
+                'description': '[Vision service unavailable]',
+                'error': 'Service not initialized'
+            } for _ in images]
         
-        for image_path in image_paths:
-            page_num = page_numbers.get(image_path)
-            success, description = self.describe_image_from_path(
-                image_path,
-                context=context,
-                page_number=page_num
-            )
-            descriptions[image_path] = description
+        if not images:
+            return []
+        
+        # Split into batches if needed
+        if len(images) > max_batch_size:
+            logger.debug(f"Splitting {len(images)} images into batches of {max_batch_size}")
+            results = []
             
-            if not success:
-                logger.warning(f"Failed to describe image: {image_path}")
+            for i in range(0, len(images), max_batch_size):
+                batch = images[i:i + max_batch_size]
+                batch_results = self._process_batch(batch, context, page_number)
+                results.extend(batch_results)
+            
+            return results
+        else:
+            return self._process_batch(images, context, page_number)
+    
+    def _process_batch(
+        self,
+        images: List[Dict[str, str]],
+        context: Optional[str],
+        page_number: Optional[int]
+    ) -> List[Dict[str, any]]:
+        """
+        Process a single batch of images
         
-        return descriptions
+        Args:
+            images: List of image dictionaries
+            context: Document context
+            page_number: Page number
+            
+        Returns:
+            List of result dictionaries
+        """
+        try:
+            # Build prompt for batch
+            prompt = self._build_batch_prompt(len(images), context, page_number)
+            
+            # Build content with multiple images
+            content_parts = []
+            
+            for img_data in images:
+                content_parts.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": img_data['media_type'],
+                        "data": img_data['base64']
+                    }
+                })
+            
+            # Add prompt
+            content_parts.append({
+                "type": "text",
+                "text": prompt
+            })
+            
+            # Prepare request
+            request_body = {
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": self.max_tokens * len(images),  # Scale tokens
+                "temperature": self.temperature,
+                "messages": [{
+                    "role": "user",
+                    "content": content_parts
+                }]
+            }
+            
+            # Call Bedrock
+            logger.debug(f"Making batch API call for {len(images)} images")
+            
+            response = self.bedrock_runtime.invoke_model(
+                modelId=self.vision_model_id,
+                body=json.dumps(request_body)
+            )
+            
+            response_body = json.loads(response['body'].read())
+            
+            if 'content' in response_body and response_body['content']:
+                full_response = response_body['content'][0]['text'].strip()
+                
+                # Parse individual descriptions
+                descriptions = self._parse_batch_response(full_response, len(images))
+                
+                if len(descriptions) == len(images):
+                    logger.info(f"✓ Batch processed {len(images)} images in one API call")
+                    
+                    return [{
+                        'success': True,
+                        'description': desc,
+                        'error': None
+                    } for desc in descriptions]
+                else:
+                    logger.warning(
+                        f"Batch response mismatch: got {len(descriptions)} descriptions "
+                        f"for {len(images)} images"
+                    )
+                    raise ValueError("Response count mismatch")
+            else:
+                raise ValueError("No content in response")
+                
+        except Exception as e:
+            logger.warning(f"Batch processing failed: {e}, falling back to individual calls")
+            return self._fallback_individual(images, context, page_number)
+    
+    def _fallback_individual(
+        self,
+        images: List[Dict[str, str]],
+        context: Optional[str],
+        page_number: Optional[int]
+    ) -> List[Dict[str, any]]:
+        """
+        Fallback to individual API calls
+        
+        Args:
+            images: List of image dictionaries
+            context: Document context
+            page_number: Page number
+            
+        Returns:
+            List of result dictionaries
+        """
+        results = []
+        
+        for img_data in images:
+            try:
+                success, description = self.describe_image_from_base64(
+                    img_data['base64'],
+                    img_data['media_type'],
+                    context=context,
+                    page_number=page_number
+                )
+                
+                results.append({
+                    'success': success,
+                    'description': description,
+                    'error': None if success else 'Description failed'
+                })
+                
+            except Exception as e:
+                results.append({
+                    'success': False,
+                    'description': f'[Error: {str(e)}]',
+                    'error': str(e)
+                })
+        
+        return results
+    
+    # ========== HELPER METHODS ==========
     
     def _build_description_prompt(
-    self,
-    context: Optional[str] = None,
-    page_number: Optional[int] = None
-) -> str:
-        """
-        Build prompt for image description with chart detection
-        
-        ENHANCED: Two-stage approach for better chart descriptions
-        - Stage 1: Identify if image is a chart
-        - Stage 2: Extract structured data for charts, detailed description for others
-        
-        The prompt is optimized for generating detailed, searchable descriptions
-        that will be embedded in the document and used for RAG retrieval.
-        """
+        self,
+        context: Optional[str] = None,
+        page_number: Optional[int] = None
+    ) -> str:
+        """Build prompt for single image description"""
         prompt_parts = [
             "Analyze this image carefully.",
             "",
@@ -246,36 +386,27 @@ class ImageDescriptionService:
             "",
             "If DATA VISUALIZATION (charts/graphs):",
             "Format your response as:",
-            "**Chart Type**: [specific type, e.g., 'stacked bar chart', 'multi-line chart']",
-            "**X-axis**: [label and range, e.g., 'Years (2014-2024)']",
-            "**Y-axis**: [label and range with units, e.g., 'Number of models (0-120)']",
-            "**Legend/Categories**: [list all categories/segments shown]",
-            "**Key Data Points**: [notable values, peaks, significant changes]",
-            "**Trends**: [3-5 insights about patterns, growth, comparisons]",
-            "",
-            "Example for stacked bar chart:",
-            "**Chart Type**: Stacked bar chart",
-            "**X-axis**: Years (2014-2024)",
-            "**Y-axis**: Number of AI models (0-120)",
-            "**Legend/Categories**: API access, Hosted access, Open weights (restricted), Open weights (unrestricted), Unreleased, Unknown",
-            "**Key Data Points**: Peak of 105 models in 2021, 61 models in 2024, API access: 20 models in 2024",
-            "**Trends**: Overall growth from 2014-2021 with peak at 105 models, decline to 61 by 2024, API access category grew from near-zero to 32.8% share by 2024, diversification of access types over time",
+            "**Chart Type**: [specific type]",
+            "**X-axis**: [label and range]",
+            "**Y-axis**: [label and range with units]",
+            "**Legend/Categories**: [list all categories]",
+            "**Key Data Points**: [notable values]",
+            "**Trends**: [3-5 insights]",
             "",
             "If TABLE:",
-            "Describe the table structure, column headers, number of rows, and key data patterns.",
+            "Describe structure, column headers, rows, and key data.",
             "",
             "If DIAGRAM:",
-            "Describe the type of diagram, main components, relationships shown, and flow/hierarchy.",
+            "Describe type, components, relationships, and flow.",
             "",
             "If PHOTO/SCREENSHOT/ILLUSTRATION:",
-            "Describe the main subject, key visual elements, colors, composition, and any text visible.",
+            "Describe main subject, key elements, colors, and any visible text.",
             "",
             "IMPORTANT:",
             "- Be specific and factual",
             "- Include all text visible in the image",
             "- For charts: extract actual numbers when visible",
             "- Use clear, searchable language",
-            "- This description will be used for document search and retrieval",
             ""
         ]
         
@@ -298,6 +429,105 @@ class ImageDescriptionService:
         
         return "\n".join(prompt_parts)
     
+    def _build_batch_prompt(
+        self,
+        num_images: int,
+        context: Optional[str],
+        page_number: Optional[int]
+    ) -> str:
+        """Build prompt for batch image description"""
+        prompt_parts = [
+            f"You are analyzing {num_images} images",
+        ]
+        
+        if context:
+            prompt_parts.append(f"from: {context}")
+        
+        if page_number:
+            prompt_parts.append(f"(page {page_number})")
+        
+        prompt_parts.append("\n\nFor each image (in order), provide a detailed description following this structure:\n")
+        
+        prompt_parts.append("""
+IMAGE 1:
+**Type**: [chart/graph/diagram/photo/table/illustration]
+**Content**: [Detailed description of what the image shows]
+**Text**: [Any text visible in the image]
+**Key Points**: [Important data points or visual elements]
+
+IMAGE 2:
+[Same structure...]
+
+... and so on for all images.
+
+IMPORTANT:
+- Identify image type first (chart, table, diagram, photo, etc.)
+- For charts/graphs: extract axis labels, data points, trends, legend items
+- For tables: describe structure and key data
+- For diagrams: explain relationships and flow
+- Include ALL visible text
+- Be specific and factual
+- Each description should be 2-4 sentences
+
+Start with IMAGE 1:""")
+        
+        return " ".join(prompt_parts)
+    
+    def _parse_batch_response(
+        self,
+        response_text: str,
+        expected_count: int
+    ) -> List[str]:
+        """Parse batch response into individual descriptions"""
+        descriptions = []
+        
+        # Strategy 1: Parse by "IMAGE N:" markers
+        pattern = r'IMAGE\s+(\d+):\s*(.+?)(?=IMAGE\s+\d+:|$)'
+        matches = re.findall(pattern, response_text, re.DOTALL | re.IGNORECASE)
+        
+        if matches:
+            matches_sorted = sorted(matches, key=lambda x: int(x[0]))
+            descriptions = [match[1].strip() for match in matches_sorted]
+        
+        # Strategy 2: Split by double newlines
+        if len(descriptions) != expected_count:
+            descriptions = [
+                d.strip() for d in response_text.split('\n\n')
+                if d.strip() and not d.strip().startswith('IMAGE')
+            ]
+        
+        # Strategy 3: Split by single newlines with filtering
+        if len(descriptions) != expected_count:
+            lines = response_text.split('\n')
+            descriptions = []
+            current_desc = []
+            
+            for line in lines:
+                line = line.strip()
+                
+                if re.match(r'^IMAGE\s+\d+:', line, re.IGNORECASE):
+                    if current_desc:
+                        descriptions.append(' '.join(current_desc))
+                        current_desc = []
+                    line = re.sub(r'^IMAGE\s+\d+:\s*', '', line, flags=re.IGNORECASE)
+                
+                if line:
+                    current_desc.append(line)
+            
+            if current_desc:
+                descriptions.append(' '.join(current_desc))
+        
+        # Trim to expected count
+        descriptions = descriptions[:expected_count]
+        
+        # Pad if too few
+        while len(descriptions) < expected_count:
+            descriptions.append("[Description unavailable]")
+        
+        logger.debug(f"Parsed {len(descriptions)} descriptions from batch response")
+        
+        return descriptions
+    
     def _get_media_type(self, extension: str) -> str:
         """Map file extension to MIME type"""
         media_types = {
@@ -318,17 +548,7 @@ class ImageDescriptionService:
         page_number: Optional[int] = None,
         image_type: Optional[str] = None
     ) -> str:
-        """
-        Generate a fallback description when vision API is unavailable
-        
-        Args:
-            filename: Image filename
-            page_number: Optional page number
-            image_type: Optional detected image type (figure, chart, etc.)
-            
-        Returns:
-            Fallback description string
-        """
+        """Generate fallback description when vision API is unavailable"""
         parts = []
         
         if image_type:
