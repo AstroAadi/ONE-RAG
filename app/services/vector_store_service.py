@@ -18,7 +18,7 @@ from app.core.exceptions import (
     VectorStoreException, 
     EmbeddingError, 
     SearchError,
-    NoDocumentsFoundError  # ADDED THIS IMPORT
+    NoDocumentsFoundError
 )
 from app.core.monitoring import get_logger
 
@@ -403,12 +403,14 @@ class VectorStoreService:
             True if deleted, False if not found
         """
         try:
-            # Build where filter
-            where_filter = {'file_id': file_id}
-            if user_id:
-                where_filter['user_id'] = user_id
+            # ✅ FIXED - Use $and operator for multiple conditions
+            where_filter = {
+                "$and": [
+                    {"file_id": file_id},
+                    {"user_id": user_id}
+                ]
+            }
             
-            # Get matching documents
             results = self.collection.get(where=where_filter)
             
             if not results or not results['ids']:

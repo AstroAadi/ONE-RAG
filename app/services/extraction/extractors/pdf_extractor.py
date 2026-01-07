@@ -58,7 +58,7 @@ class PDFExtractor(BaseExtractor):
         return True, "Valid PDF"
     
     def extract(self, file_path: str) -> Tuple[str, bool, Dict]:
-        """Extract PDF with proper page structure"""
+        """Extract PDF with proper page structure and debugging"""
         try:
             is_valid, msg = self.validate_file(file_path)
             if not is_valid:
@@ -82,6 +82,11 @@ class PDFExtractor(BaseExtractor):
             # Build content index: map each content item to its page
             content_to_page_map = self._build_content_page_map(result.document)
             
+            # DIAGNOSTIC: Log the content map
+            logger.info(f"Content map built: {len(content_to_page_map['pictures'])} pictures mapped")
+            for pic_idx, page_num in sorted(list(content_to_page_map['pictures'].items())[:10]):
+                logger.debug(f"  Picture[{pic_idx}] -> Page {page_num}")
+            
             # Process images with page information
             image_data = self._process_images_with_pages(
                 result.document,
@@ -91,6 +96,18 @@ class PDFExtractor(BaseExtractor):
                 zones,
                 content_to_page_map
             )
+            
+            # DIAGNOSTIC: Log image distribution
+            images_by_page = {}
+            for img_idx, img_info in image_data.items():
+                page = img_info['page_number']
+                if page not in images_by_page:
+                    images_by_page[page] = []
+                images_by_page[page].append(img_idx)
+            
+            logger.info("Image distribution by page:")
+            for page_num in sorted(images_by_page.keys()):
+                logger.info(f"  Page {page_num}: {len(images_by_page[page_num])} images")
             
             # Build markdown page-by-page using Docling's structure
             final_markdown = self._build_markdown_from_pages(
@@ -114,7 +131,8 @@ class PDFExtractor(BaseExtractor):
                 'images_skipped_headers': getattr(self, '_headers_skipped', 0),
                 'header_footer_detected': zones is not None,
                 'cache_hit_rate': cache_stats['hit_rate_percent'],
-                'image_directory': str(image_output_dir)
+                'image_directory': str(image_output_dir),
+                'images_by_page': {str(k): len(v) for k, v in images_by_page.items()}
             }
             
             logger.info(
@@ -194,7 +212,7 @@ class PDFExtractor(BaseExtractor):
                         for prov in picture.prov:
                             if hasattr(prov, 'page_no'):
                                 # Docling uses 0-indexed pages
-                                content_map['pictures'][idx] = prov.page_no + 1
+                                content_map['pictures'][idx] = prov.page_no
                                 break
             
             # Map tables to pages
@@ -203,7 +221,7 @@ class PDFExtractor(BaseExtractor):
                     if hasattr(table, 'prov') and table.prov:
                         for prov in table.prov:
                             if hasattr(prov, 'page_no'):
-                                content_map['tables'][idx] = prov.page_no + 1
+                                content_map['tables'][idx] = prov.page_no
                                 break
             
             # Map text items to pages (if available)
@@ -212,7 +230,7 @@ class PDFExtractor(BaseExtractor):
                     if hasattr(text, 'prov') and text.prov:
                         for prov in text.prov:
                             if hasattr(prov, 'page_no'):
-                                content_map['texts'][idx] = prov.page_no + 1
+                                content_map['texts'][idx] = prov.page_no
                                 break
             
             logger.debug(
@@ -235,7 +253,11 @@ class PDFExtractor(BaseExtractor):
         zones,
         content_map: Dict
     ) -> Dict[int, Dict]:
-        """Process images with accurate page numbers from content map"""
+        """
+        Process images with accurate page numbers from content map
+        
+        FIXED: Properly track extract_idx vs picture_idx mapping
+        """
         try:
             markdown_with_base64 = document.export_to_markdown(image_mode="embedded")
         except Exception as e:
@@ -248,6 +270,9 @@ class PDFExtractor(BaseExtractor):
         if not matches:
             return {}
         
+        logger.info(f"Found {len(matches)} images in markdown")
+        logger.debug(f"Content map has {len(content_map['pictures'])} pictures")
+        
         # Track statistics
         self._duplicates_skipped = 0
         self._headers_skipped = 0
@@ -257,18 +282,24 @@ class PDFExtractor(BaseExtractor):
         image_data = {}
         doc_context = f"PDF document: {pdf_stem}"
         
+        # IMPORTANT: extract_idx starts at 1, but picture indices in content_map start at 0
         for extract_idx, match in enumerate(matches, start=1):
             try:
                 image_format = match[1]
                 base64_image = match[2]
                 image_bytes = base64.b64decode(base64_image)
                 
-                # Get page number from content map (0-indexed in enumerate, so extract_idx-1)
-                page_number = content_map['pictures'].get(extract_idx - 1, 1)
+                # Get page number from content map
+                # extract_idx is 1-based, content_map uses 0-based indices
+                picture_idx = extract_idx - 1
+                page_number = content_map['pictures'].get(picture_idx, 1)
+                
+                logger.debug(f"Image {extract_idx} (picture_idx={picture_idx}) -> page {page_number}")
                 
                 # Check duplicate
                 img_hash = self.image_cache.compute_hash(image_bytes)
                 if img_hash in seen_hashes:
+                    logger.debug(f"  ⏭ Skipping duplicate image {extract_idx}")
                     self._duplicates_skipped += 1
                     continue
                 seen_hashes.add(img_hash)
@@ -277,6 +308,7 @@ class PDFExtractor(BaseExtractor):
                 if zones and self.header_footer_detector.is_image_in_zone(
                     pdf_path, page_number, image_bytes, zones
                 ):
+                    logger.debug(f"  ⏭ Skipping header/footer image {extract_idx} on page {page_number}")
                     self._headers_skipped += 1
                     continue
                 
@@ -310,8 +342,10 @@ class PDFExtractor(BaseExtractor):
                 with open(image_path, 'wb') as f:
                     f.write(image_bytes)
                 
+                # Store with extract_idx as key (this is what appears in placeholders)
                 image_data[extract_idx] = {
                     'extract_idx': extract_idx,
+                    'picture_idx': picture_idx,
                     'filename': filename,
                     'page_number': page_number,
                     'format': image_format,
@@ -321,27 +355,31 @@ class PDFExtractor(BaseExtractor):
                 }
                 
                 cache_str = "💾" if from_cache else "✓"
-                logger.info(f"  {cache_str} {filename} (page {page_number})")
+                logger.info(f"  {cache_str} Image {extract_idx} -> {filename} (page {page_number})")
                 
             except Exception as e:
                 logger.warning(f"  ⚠ Error processing image {extract_idx}: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
+        
+        logger.info(f"Processed {len(image_data)} images (skipped {self._duplicates_skipped} dupes, {self._headers_skipped} headers)")
         
         return image_data
     
     def _build_markdown_from_pages(
-    self,
-    document,  # This is the DoclingDocument
-    total_pages: int,
-    image_data: Dict[int, Dict],
-    pdf_stem: str,
-    zones,
-    content_map: Dict
-) -> str:
+        self,
+        document,
+        total_pages: int,
+        image_data: Dict[int, Dict],
+        pdf_stem: str,
+        zones,
+        content_map: Dict
+    ) -> str:
         """
         Build markdown by processing each page separately
         
-        FIXED: Iterate over dict keys; use document.export_to_markdown with page_no filter
+        FIXED: Properly match image placeholders to descriptions
         """
         result_lines = []
         
@@ -352,42 +390,60 @@ class PDFExtractor(BaseExtractor):
             result_lines.append("**Processing**: Header/footer filtered")
         result_lines.append("")
         
-        # Get sorted page numbers (dict keys are ints like 1, 2, ...)
-        page_numbers = sorted(document.pages.keys())
+        # Build a mapping of page_number -> list of images on that page (in order)
+        images_by_page = {}
+        for img_idx, img_info in sorted(image_data.items()):
+            page_num = img_info['page_number']
+            if page_num not in images_by_page:
+                images_by_page[page_num] = []
+            images_by_page[page_num].append(img_info)
+        
+        logger.debug(f"Images distribution: {[(p, len(imgs)) for p, imgs in images_by_page.items()]}")
         
         # Process each page individually
-        for page_number in page_numbers:
+        for page_number in sorted(document.pages.keys()):
+            
             # Add page marker
             result_lines.append(f"## Page {page_number}\n")
             
             try:
-                # Export this specific page to markdown using the document-level method
+                # Export this specific page to markdown
                 page_markdown = document.export_to_markdown(
+                    page_no=page_number,
                     image_mode="placeholder",
-                    image_placeholder="[IMAGE_PLACEHOLDER_{image_name}]",
-                    page_no=page_number,  # Filter to this page only
-                    # Add other params as needed, e.g., delim="\n\n", indent=4
+                    image_placeholder="[IMAGE_PLACEHOLDER_{image_name}]"
                 )
                 
                 if not page_markdown.strip():
                     result_lines.append("*(No content on this page)*\n")
-                    result_lines.append("")  # Blank line after page
                     continue
+                
+                # Get images for this page
+                page_images = images_by_page.get(page_number, [])
+                image_counter_on_page = 0
                 
                 # Process page content and insert image descriptions
                 page_lines = page_markdown.split('\n')
                 
                 for line in page_lines:
-                    # Check for image placeholders (your existing logic)
+                    # Check for image placeholders
                     if '[IMAGE_PLACEHOLDER_' in line:
-                        # Find matching images for this page
-                        for img_idx, img_info in image_data.items():
-                            if img_info['page_number'] == page_number:
-                                result_lines.append(f"**[Image Description]**: {img_info['description']}")
-                                cache_str = "cached" if img_info.get('from_cache') else "described"
-                                result_lines.append(f"*(Page {page_number}, {cache_str})*")
-                                result_lines.append("")
-                                break  # Assuming one placeholder per image; adjust if multiple
+                        # Match placeholder to the next image on this page
+                        if image_counter_on_page < len(page_images):
+                            img_info = page_images[image_counter_on_page]
+                            
+                            # Add image description
+                            result_lines.append(f"**[Image Description]**: {img_info['description']}")
+                            cache_str = "cached" if img_info.get('from_cache') else "described"
+                            result_lines.append(f"*(Page {page_number}, {cache_str})*")
+                            result_lines.append("")
+                            
+                            image_counter_on_page += 1
+                        else:
+                            # Placeholder exists but image was filtered out (duplicate/header)
+                            logger.debug(f"Placeholder on page {page_number} but no image data (likely filtered)")
+                            result_lines.append("*(Image filtered - duplicate or header/footer)*")
+                            result_lines.append("")
                     else:
                         # Regular content
                         result_lines.append(line)
@@ -396,8 +452,7 @@ class PDFExtractor(BaseExtractor):
                 
             except Exception as e:
                 logger.warning(f"Error processing page {page_number}: {e}")
-                result_lines.append(f"*(Error extracting content from page {page_number})*")
-                result_lines.append("")
+                result_lines.append(f"*(Error extracting content from page {page_number})*\n")
         
         return '\n'.join(result_lines)
     

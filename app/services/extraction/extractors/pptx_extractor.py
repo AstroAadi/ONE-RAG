@@ -1,11 +1,11 @@
 """
-PowerPoint (PPTX/PPT) Extractor with AI Image Descriptions
-Images are described using vision LLM at ingestion time instead of storing paths
+Enhanced PowerPoint (PPTX/PPT) Extractor - UPDATED
+Matches PDF extractor pattern with image caching, duplicate detection, and consistent flow
 """
 
 import os
 from pathlib import Path
-from typing import Tuple, Dict, List
+from typing import Tuple, Dict, List, Optional
 import logging
 import re
 import base64
@@ -14,20 +14,37 @@ from pptx.enum.shapes import MSO_SHAPE_TYPE
 
 try:
     from ..base_extractor import BaseExtractor
-    from ..processors.caption_detector import CaptionDetector
 except ImportError:
     from base_extractor import BaseExtractor
-    from caption_detector import CaptionDetector
 
 logger = logging.getLogger(__name__)
 
 
 class PptxExtractor(BaseExtractor):
     """
-    Enhanced PowerPoint extractor with AI image descriptions
+    Enhanced PowerPoint extractor matching PDF extractor pattern
     
-    Key Change: Images are converted to AI descriptions at ingestion time
+    Features:
+    - Image caching (avoid redundant API calls)
+    - Duplicate detection (skip same image multiple times)
+    - Proper page/slide numbering
+    - Consistent markdown structure
+    - Smart table and text extraction
     """
+    
+    def __init__(self, config: Optional[Dict] = None):
+        super().__init__(config)
+        
+        from app.services.image_cache_manager import get_image_cache
+        from app.services.image_description_service import get_image_description_service
+        
+        self.image_cache = get_image_cache()
+        self.image_service = get_image_description_service()
+        
+        # Tracking counters
+        self._duplicates_skipped = 0
+        
+        logger.info("PPTX Extractor initialized with caching and duplicate detection")
     
     def _get_supported_formats(self) -> List[str]:
         return ['pptx', 'ppt']
@@ -38,387 +55,360 @@ class PptxExtractor(BaseExtractor):
         
         if not path.exists():
             return False, "File does not exist"
-        
         if path.suffix.lower() not in ['.pptx', '.ppt']:
             return False, "Not a PowerPoint file"
-        
         if path.stat().st_size == 0:
             return False, "File is empty"
         
         return True, "Valid PowerPoint file"
     
     def extract(self, file_path: str) -> Tuple[str, bool, Dict]:
-        """Extract PowerPoint with AI image descriptions"""
+        """Extract PowerPoint with proper flow matching PDF extractor"""
         try:
             is_valid, msg = self.validate_file(file_path)
             if not is_valid:
                 return "", False, {'error': msg}
             
-            logger.info(f"Extracting PPTX: {file_path}")
-            
-            return self._extract_with_descriptions(file_path)
-            
-        except Exception as e:
-            logger.error(f"PPTX extraction error: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return "", False, {'error': str(e)}
-    
-    def _extract_with_descriptions(self, file_path: str) -> Tuple[str, bool, Dict]:
-        """Extract PowerPoint with AI image descriptions"""
-        try:
-            from app.services.image_description_service import get_image_description_service
-            
-            prs = Presentation(file_path)
             pptx_stem = Path(file_path).stem
+            image_output_dir = self._create_image_directory(file_path, pptx_stem)
             
-            image_output_dir = os.path.join(
-                os.path.dirname(file_path),
-                "extracted_images",
+            logger.info(f"📊 Extracting: {file_path}")
+            
+            # Load presentation
+            prs = Presentation(file_path)
+            total_slides = len(prs.slides)
+            
+            logger.info(f"📑 Presentation has {total_slides} slides")
+            
+            # Reset counters
+            self._duplicates_skipped = 0
+            
+            # Process images with caching and duplicate detection
+            image_data = self._process_images_with_caching(
+                prs,
+                image_output_dir,
                 pptx_stem
             )
-            os.makedirs(image_output_dir, exist_ok=True)
             
-            logger.info(f"Total slides: {len(prs.slides)}")
-            
-            # NEW: Extract images with AI descriptions
-            image_data = self._extract_images_with_descriptions(
-                prs, image_output_dir, pptx_stem
+            # Build markdown slide-by-slide
+            final_markdown = self._build_markdown_from_slides(
+                prs,
+                total_slides,
+                image_data,
+                pptx_stem
             )
             
-            logger.info(f"Extracted {len(image_data)} images")
-            
-            # Build markdown with descriptions
-            markdown_content = self._build_markdown_with_descriptions(
-                prs, image_data, pptx_stem
-            )
-            
+            # Gather statistics
+            cache_stats = self.image_cache.get_stats()
             stats = self._gather_statistics(prs, image_data)
             
             metadata = self.get_metadata(file_path)
             metadata.update({
-                'total_pages': len(prs.slides),
-                'total_slides': len(prs.slides),
+                'extractor': 'PptxExtractor_Enhanced',
+                'total_pages': total_slides,
+                'total_slides': total_slides,
                 'images_extracted': len(image_data),
-                'images_described': sum(1 for img in image_data.values() if img.get('description_success')),
+                'images_described': sum(1 for img in image_data.values() if img.get('success')),
+                'images_cached': cache_stats['hits'],
+                'images_skipped_duplicates': self._duplicates_skipped,
+                'cache_hit_rate': cache_stats['hit_rate_percent'],
                 'image_directory': str(image_output_dir),
                 'tables_found': stats['tables'],
                 'shapes_with_text': stats['text_shapes'],
-                'slides_with_notes': stats['notes_slides'],
-                'extraction_method': 'python-pptx'
+                'slides_with_notes': stats['notes_slides']
             })
             
-            logger.info("✓ PPTX extraction complete with AI descriptions")
+            logger.info(
+                f"✅ Complete: {total_slides} slides, {len(image_data)} images "
+                f"({metadata['images_cached']} cached, {self._duplicates_skipped} dupes skipped)"
+            )
             
-            return markdown_content, True, metadata
+            return final_markdown, True, metadata
             
         except Exception as e:
-            logger.error(f"PPTX extraction failed: {str(e)}")
+            logger.error(f"❌ PPTX extraction error: {str(e)}")
             import traceback
             traceback.print_exc()
             return "", False, {'error': str(e)}
     
-    def _extract_images_with_descriptions(
+    def _create_image_directory(self, file_path: str, pptx_stem: str) -> str:
+        """Create directory for extracted images"""
+        image_dir = os.path.join(
+            os.path.dirname(file_path),
+            "extracted_images",
+            pptx_stem
+        )
+        os.makedirs(image_dir, exist_ok=True)
+        return image_dir
+    
+    def _process_images_with_caching(
         self,
         prs: Presentation,
-        output_dir: str,
+        image_output_dir: str,
         pptx_stem: str
     ) -> Dict[int, Dict]:
-        """Extract images and generate AI descriptions"""
-        from app.services.image_description_service import get_image_description_service
+        """
+        Process images with caching and duplicate detection
         
+        Key features matching PDF extractor:
+        - Perceptual hashing for duplicate detection
+        - Image cache to avoid redundant API calls
+        - Slide number tracking
+        """
         image_data = {}
+        seen_hashes = set()
         image_counter = 0
         
-        description_service = get_image_description_service()
         doc_context = f"PowerPoint presentation: {pptx_stem}"
         
         for slide_num, slide in enumerate(prs.slides, start=1):
-            for shape in slide.shapes:
-                if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
-                    image_counter += 1
-                    
-                    try:
-                        # Get image data
-                        image = shape.image
-                        image_bytes = image.blob
-                        
-                        # Determine format
-                        ext = self._get_image_extension(image.content_type)
-                        
-                        filename = f"slide_{slide_num:02d}_image_{image_counter:03d}.{ext}"
-                        output_path = os.path.join(output_dir, filename)
-                        
-                        # Save image
-                        with open(output_path, 'wb') as f:
-                            f.write(image_bytes)
-                        
-                        logger.info(f"  ✓ Saved: {filename}")
-                        
-                        # Generate AI description
-                        if description_service.is_available():
-                            base64_image = base64.b64encode(image_bytes).decode('utf-8')
-                            success, description = description_service.describe_image_from_base64(
-                                base64_image,
-                                image.content_type,
-                                context=doc_context,
-                                page_number=slide_num,
-                                filename=filename
-                            )
-                            
-                            if success:
-                                logger.info(f"  ✓ Described: {filename}")
-                            else:
-                                logger.warning(f"  ⚠ Description failed: {filename}")
-                        else:
-                            success = False
-                            description = description_service.generate_fallback_description(
-                                filename, page_number=slide_num, image_type="slide image"
-                            )
-                        
-                        image_data[image_counter] = {
-                            'filename': filename,
-                            'slide_number': slide_num,
-                            'page_number': slide_num,
-                            'format': ext,
-                            'description': description,
-                            'description_success': success,
-                            'content_type': image.content_type,
-                            'size_bytes': len(image_bytes)
-                        }
-                        
-                    except Exception as e:
-                        logger.warning(f"  ⚠ Could not extract image from slide {slide_num}: {e}")
-                
-                # Check grouped shapes
-                elif hasattr(shape, 'shapes'):
-                    for sub_shape in shape.shapes:
-                        if sub_shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
-                            image_counter += 1
-                            try:
-                                image = sub_shape.image
-                                image_bytes = image.blob
-                                ext = self._get_image_extension(image.content_type)
-                                
-                                filename = f"slide_{slide_num:02d}_image_{image_counter:03d}.{ext}"
-                                output_path = os.path.join(output_dir, filename)
-                                
-                                with open(output_path, 'wb') as f:
-                                    f.write(image_bytes)
-                                
-                                logger.info(f"  ✓ Saved: {filename}")
-                                
-                                if description_service.is_available():
-                                    base64_image = base64.b64encode(image_bytes).decode('utf-8')
-                                    success, description = description_service.describe_image_from_base64(
-                                        base64_image,
-                                        image.content_type,
-                                        context=doc_context,
-                                        page_number=slide_num,
-                                        filename=filename
-                                    )
-                                    
-                                    if success:
-                                        logger.info(f"  ✓ Described: {filename}")
-                                else:
-                                    success = False
-                                    description = description_service.generate_fallback_description(
-                                        filename, page_number=slide_num
-                                    )
-                                
-                                image_data[image_counter] = {
-                                    'filename': filename,
-                                    'slide_number': slide_num,
-                                    'page_number': slide_num,
-                                    'format': ext,
-                                    'description': description,
-                                    'description_success': success,
-                                    'content_type': image.content_type,
-                                    'size_bytes': len(image_bytes)
-                                }
-                                
-                            except Exception as e:
-                                logger.warning(f"  ⚠ Could not extract grouped image: {e}")
+            # Extract images from slide shapes
+            slide_images = self._extract_images_from_shapes(
+                slide.shapes, slide_num, image_counter, seen_hashes,
+                image_output_dir, doc_context, image_data
+            )
+            image_counter += slide_images
+        
+        logger.info(
+            f"Processed {len(image_data)} images "
+            f"(skipped {self._duplicates_skipped} duplicates)"
+        )
         
         return image_data
     
-    def _build_markdown_with_descriptions(
+    def _extract_images_from_shapes(
+        self,
+        shapes,
+        slide_num: int,
+        start_counter: int,
+        seen_hashes: set,
+        image_output_dir: str,
+        doc_context: str,
+        image_data: Dict
+    ) -> int:
+        """Extract images from shapes recursively"""
+        images_found = 0
+        
+        for shape in shapes:
+            # Picture shape
+            if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                images_found += 1
+                image_idx = start_counter + images_found
+                
+                try:
+                    # Get image data
+                    image = shape.image
+                    image_bytes = image.blob
+                    
+                    # Check for duplicates using perceptual hash
+                    img_hash = self.image_cache.compute_hash(image_bytes)
+                    if img_hash in seen_hashes:
+                        logger.debug(f"  ⏭ Skipping duplicate image on slide {slide_num}")
+                        self._duplicates_skipped += 1
+                        continue
+                    seen_hashes.add(img_hash)
+                    
+                    # Get cached description or generate new one
+                    cached_desc = self.image_cache.get(image_bytes)
+                    
+                    if cached_desc:
+                        description = cached_desc
+                        from_cache = True
+                        success = True
+                    else:
+                        # Generate AI description
+                        if self.image_service.is_available():
+                            base64_image = base64.b64encode(image_bytes).decode('utf-8')
+                            success, description = self.image_service.describe_image_from_base64(
+                                base64_image,
+                                image.content_type,
+                                context=doc_context,
+                                page_number=slide_num
+                            )
+                            from_cache = False
+                            
+                            if success:
+                                self.image_cache.put(image_bytes, description)
+                        else:
+                            success = False
+                            description = self.image_service.generate_fallback_description(
+                                f"slide_{slide_num}_image",
+                                page_number=slide_num,
+                                image_type="slide image"
+                            )
+                            from_cache = False
+                    
+                    # Determine format
+                    ext = self._get_image_extension(image.content_type)
+                    
+                    # Save image with consistent naming
+                    filename = f"slide_{slide_num:03d}_image_{image_idx:03d}.{ext}"
+                    output_path = os.path.join(image_output_dir, filename)
+                    
+                    with open(output_path, 'wb') as f:
+                        f.write(image_bytes)
+                    
+                    # Store image data
+                    image_data[image_idx] = {
+                        'extract_idx': image_idx,
+                        'filename': filename,
+                        'slide_number': slide_num,
+                        'page_number': slide_num,
+                        'format': ext,
+                        'description': description,
+                        'success': success,
+                        'from_cache': from_cache,
+                        'content_type': image.content_type,
+                        'size_bytes': len(image_bytes)
+                    }
+                    
+                    cache_str = "💾" if from_cache else "✓"
+                    logger.info(f"  {cache_str} Image {image_idx} -> {filename} (slide {slide_num})")
+                    
+                except Exception as e:
+                    logger.warning(f"  ⚠ Error processing image on slide {slide_num}: {e}")
+                    continue
+            
+            # Grouped shapes - recurse
+            elif hasattr(shape, 'shapes'):
+                nested_images = self._extract_images_from_shapes(
+                    shape.shapes, slide_num, start_counter + images_found,
+                    seen_hashes, image_output_dir, doc_context, image_data
+                )
+                images_found += nested_images
+        
+        return images_found
+    
+    def _build_markdown_from_slides(
         self,
         prs: Presentation,
+        total_slides: int,
         image_data: Dict[int, Dict],
         pptx_stem: str
     ) -> str:
         """
-        Build markdown with captions AND AI descriptions
+        Build markdown by processing each slide separately
         
-        Format:
-        ### Figure 1.3.4: Revenue Trends  <-- Caption from slide text
-        **[Image Description]**: A bar chart... <-- AI description
+        Matches PDF extractor structure with proper page markers
         """
-        # First pass: Build content with image placeholders
-        temp_parts = []
-        temp_parts.append(f"# Presentation: {pptx_stem}")
-        temp_parts.append(f"**Total Slides**: {len(prs.slides)}\n")
+        result_lines = []
         
-        image_counter = 0
+        # Header
+        result_lines.append(f"# Document: {pptx_stem}")
+        result_lines.append(f"**Total Pages**: {total_slides}")
+        result_lines.append(f"**Format**: PowerPoint")
+        result_lines.append("")
         
+        # Build mapping: slide_number -> list of images on that slide
+        images_by_slide = {}
+        for img_idx, img_info in sorted(image_data.items()):
+            slide_num = img_info['slide_number']
+            if slide_num not in images_by_slide:
+                images_by_slide[slide_num] = []
+            images_by_slide[slide_num].append(img_info)
+        
+        # Process each slide
         for slide_num, slide in enumerate(prs.slides, start=1):
-            temp_parts.append(f"## Slide {slide_num}")
+            # Add slide/page marker
+            result_lines.append(f"## Page {slide_num}\n")
             
             # Slide title
             title = self._get_slide_title(slide)
             if title:
-                temp_parts.append(f"### {title}\n")
+                result_lines.append(f"### {title}\n")
             
-            # Extract content
-            slide_text = []
-            slide_images = []
-            slide_tables = []
+            # Get images for this slide
+            slide_images = images_by_slide.get(slide_num, [])
+            image_counter_on_slide = 0
             
-            for shape in slide.shapes:
-                if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
-                    image_counter += 1
-                    if image_counter in image_data:
-                        slide_images.append(image_counter)
-                
-                elif shape.shape_type == MSO_SHAPE_TYPE.TABLE:
-                    table_md = self._extract_table(shape)
-                    if table_md:
-                        slide_tables.append(table_md)
-                
-                elif hasattr(shape, "text") and shape.text.strip():
-                    if shape == slide.shapes.title:
-                        continue
-                    text = shape.text.strip()
-                    slide_text.append(text)
-                
-                elif hasattr(shape, 'shapes'):
-                    for sub_shape in shape.shapes:
-                        if sub_shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
-                            image_counter += 1
-                            if image_counter in image_data:
-                                slide_images.append(image_counter)
-                        elif hasattr(sub_shape, "text") and sub_shape.text.strip():
-                            slide_text.append(sub_shape.text.strip())
+            # Extract content from shapes
+            slide_content = self._extract_slide_content(
+                slide, slide_images, image_counter_on_slide
+            )
             
-            # Add text content
-            if slide_text:
-                for text in slide_text:
-                    temp_parts.append(f"{text}\n")
-            
-            # Add image placeholders
-            if slide_images:
-                for img_idx in slide_images:
-                    temp_parts.append(f"[IMAGE_PLACEHOLDER_{img_idx}]")
-            
-            # Add tables
-            if slide_tables:
-                for table_md in slide_tables:
-                    temp_parts.append(f"\n{table_md}\n")
-            
-            # Speaker notes
-            if slide.has_notes_slide:
-                notes_text = slide.notes_slide.notes_text_frame.text.strip()
-                if notes_text:
-                    temp_parts.append(f"\n**Speaker Notes**: {notes_text}\n")
-            
-            temp_parts.append("")
+            result_lines.extend(slide_content)
+            result_lines.append("")  # Blank line after slide
         
-        # Second pass: Detect captions and associate with images
-        processed_caption_indices = set()
-        image_caption_map = {}
-        placeholder_pattern = r'\[IMAGE_PLACEHOLDER_(\d+)\]'
+        return '\n'.join(result_lines)
+    
+    def _extract_slide_content(
+        self,
+        slide,
+        slide_images: List[Dict],
+        image_counter: int
+    ) -> List[str]:
+        """Extract content from a single slide"""
+        content_lines = []
+        image_idx = 0
         
-        for i, line in enumerate(temp_parts):
-            match = re.match(placeholder_pattern, line.strip())
-            if match:
-                img_idx = int(match.group(1))
-                
-                # Look ahead for caption (within next 8 lines for slides)
-                caption_info = None
-                for j in range(i + 1, min(i + 8, len(temp_parts))):
-                    check_line = temp_parts[j].strip()
-                    if not check_line:
-                        continue
-                    
-                    result = CaptionDetector.detect_caption(check_line)
-                    if result:
-                        caption_type, number, description = result
-                        if caption_type in ['figure', 'table', 'chart']:
-                            caption_info = {
-                                'type': caption_type,
-                                'number': number,
-                                'description': description,
-                                'line_idx': j,
-                                'full_text': check_line
-                            }
-                            processed_caption_indices.add(j)
-                            break
-                    
-                    # Stop at structural elements
-                    if check_line.startswith('#') or '[IMAGE_PLACEHOLDER_' in check_line:
-                        break
-                
-                # Look backward if not found ahead (captions can come before images in slides)
-                if not caption_info:
-                    for j in range(max(0, i - 8), i):
-                        check_line = temp_parts[j].strip()
-                        if not check_line:
-                            continue
-                        
-                        result = CaptionDetector.detect_caption(check_line)
-                        if result:
-                            caption_type, number, description = result
-                            if caption_type in ['figure', 'table', 'chart']:
-                                # Check if not already processed
-                                if j not in processed_caption_indices:
-                                    caption_info = {
-                                        'type': caption_type,
-                                        'number': number,
-                                        'description': description,
-                                        'line_idx': j,
-                                        'full_text': check_line
-                                    }
-                                    processed_caption_indices.add(j)
-                                    break
-                        
-                        # Stop at structural elements
-                        if check_line.startswith('#'):
-                            break
-                
-                if caption_info:
-                    image_caption_map[img_idx] = caption_info
-        
-        # Third pass: Build final output with captions and descriptions
-        final_parts = []
-        for i, line in enumerate(temp_parts):
-            # Skip processed captions
-            if i in processed_caption_indices:
-                continue
+        # Process shapes in order
+        for shape in slide.shapes:
+            # Text shapes
+            if hasattr(shape, 'text') and shape.text.strip():
+                if shape != slide.shapes.title:  # Skip title (already added)
+                    content_lines.append(shape.text.strip())
+                    content_lines.append("")
             
-            # Check if this is an image placeholder
-            match = re.match(placeholder_pattern, line.strip())
-            if match:
-                img_idx = int(match.group(1))
-                if img_idx in image_data:
-                    image_info = image_data[img_idx]
+            # Picture shapes - add description
+            elif shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                if image_idx < len(slide_images):
+                    img_info = slide_images[image_idx]
                     
-                    # Add caption as heading if found (e.g., "### Figure 1.3.4: Revenue Trends")
-                    if img_idx in image_caption_map:
-                        caption = image_caption_map[img_idx]
-                        heading = CaptionDetector.format_as_heading(
-                            caption['type'], caption['number'], caption['description']
-                        )
-                        final_parts.append(f"\n{heading}\n")
+                    content_lines.append(f"**[Image Description]**: {img_info['description']}")
+                    cache_str = "cached" if img_info.get('from_cache') else "described"
+                    content_lines.append(f"*(Slide {img_info['slide_number']}, {cache_str})*")
+                    content_lines.append("")
                     
-                    # Add AI description
-                    final_parts.append(f"**[Image Description]**: {image_info['description']}")
-                    final_parts.append(f"*(Located on slide {image_info['slide_number']})*")
-                    final_parts.append("")
-            else:
-                final_parts.append(line)
+                    image_idx += 1
+            
+            # Tables
+            elif shape.shape_type == MSO_SHAPE_TYPE.TABLE:
+                table_md = self._extract_table(shape)
+                if table_md:
+                    content_lines.append(table_md)
+                    content_lines.append("")
+            
+            # Grouped shapes
+            elif hasattr(shape, 'shapes'):
+                grouped_content = self._extract_grouped_content(
+                    shape.shapes, slide_images, image_idx
+                )
+                content_lines.extend(grouped_content['lines'])
+                image_idx = grouped_content['image_idx']
         
-        return "\n".join(final_parts)
+        # Speaker notes
+        if slide.has_notes_slide:
+            notes_text = slide.notes_slide.notes_text_frame.text.strip()
+            if notes_text:
+                content_lines.append(f"**Speaker Notes**: {notes_text}")
+                content_lines.append("")
+        
+        return content_lines
+    
+    def _extract_grouped_content(
+        self,
+        shapes,
+        slide_images: List[Dict],
+        start_image_idx: int
+    ) -> Dict:
+        """Extract content from grouped shapes"""
+        lines = []
+        image_idx = start_image_idx
+        
+        for shape in shapes:
+            if hasattr(shape, 'text') and shape.text.strip():
+                lines.append(shape.text.strip())
+                lines.append("")
+            
+            elif shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                if image_idx < len(slide_images):
+                    img_info = slide_images[image_idx]
+                    lines.append(f"**[Image Description]**: {img_info['description']}")
+                    lines.append(f"*(Slide {img_info['slide_number']})*")
+                    lines.append("")
+                    image_idx += 1
+        
+        return {'lines': lines, 'image_idx': image_idx}
     
     def _get_slide_title(self, slide) -> str:
         """Extract slide title"""
@@ -466,8 +456,7 @@ class PptxExtractor(BaseExtractor):
             'image/tiff': 'tiff',
             'image/webp': 'webp'
         }
-        ext = extensions.get(content_type, 'png')
-        return ext
+        return extensions.get(content_type, 'png')
     
     def _gather_statistics(self, prs: Presentation, image_data: Dict) -> Dict:
         """Gather presentation statistics"""

@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     
     # Model Parameters (consolidated)
     temperature: float = Field(
-        default=0.5,
+        default=0.6,
         ge=0.0,
         le=1.0,
         description="LLM temperature"
@@ -65,7 +65,7 @@ class Settings(BaseSettings):
         description="Max tokens for vision model"
     )
     vision_temperature: float = Field(
-        default=0.3,
+        default=0.6,
         ge=0.0,
         le=1.0,
         description="Temperature for vision model (lower for factual descriptions)"

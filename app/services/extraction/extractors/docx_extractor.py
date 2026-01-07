@@ -1,11 +1,12 @@
 """
-Enhanced DOCX/DOC Extractor with AI Image Descriptions
-Images are described using vision LLM at ingestion time instead of storing paths
+Enhanced DOCX/DOC Extractor - UPDATED
+Matches PDF extractor pattern with image caching, duplicate detection, and consistent flow
+Uses Docling when available, falls back to python-docx
 """
 
 import os
 from pathlib import Path
-from typing import Tuple, Dict, List
+from typing import Tuple, Dict, List, Optional
 import logging
 import re
 import base64
@@ -13,22 +14,38 @@ from docx import Document
 
 try:
     from ..base_extractor import BaseExtractor
-    from ..processors.caption_detector import CaptionDetector
-    from ..processors.image_processor import ImageProcessor
 except ImportError:
     from base_extractor import BaseExtractor
-    from caption_detector import CaptionDetector
-    from image_processor import ImageProcessor
 
 logger = logging.getLogger(__name__)
 
 
 class DocxExtractor(BaseExtractor):
     """
-    Enhanced extractor for Word documents with AI image descriptions
+    Enhanced Word document extractor matching PDF extractor pattern
     
-    Key Change: Images are converted to AI descriptions at ingestion time
+    Features:
+    - Image caching (avoid redundant API calls)
+    - Duplicate detection (skip same image multiple times)
+    - Proper page numbering
+    - Consistent markdown structure
+    - Smart table and text extraction
+    - Docling support with fallback to python-docx
     """
+    
+    def __init__(self, config: Optional[Dict] = None):
+        super().__init__(config)
+        
+        from app.services.image_cache_manager import get_image_cache
+        from app.services.image_description_service import get_image_description_service
+        
+        self.image_cache = get_image_cache()
+        self.image_service = get_image_description_service()
+        
+        # Tracking counters
+        self._duplicates_skipped = 0
+        
+        logger.info("DOCX Extractor initialized with caching and duplicate detection")
     
     def _get_supported_formats(self) -> List[str]:
         return ['docx', 'doc']
@@ -39,95 +56,100 @@ class DocxExtractor(BaseExtractor):
         
         if not path.exists():
             return False, "File does not exist"
-        
         if path.suffix.lower() not in ['.docx', '.doc']:
             return False, "Not a Word document"
-        
         if path.stat().st_size == 0:
             return False, "File is empty"
         
         return True, "Valid Word document"
     
     def extract(self, file_path: str) -> Tuple[str, bool, Dict]:
-        """Extract DOCX with AI image descriptions"""
+        """Extract DOCX with proper flow matching PDF extractor"""
         try:
             is_valid, msg = self.validate_file(file_path)
             if not is_valid:
                 return "", False, {'error': msg}
             
-            logger.info(f"Extracting DOCX: {file_path}")
+            logger.info(f"📄 Extracting: {file_path}")
             
-            # Try Docling first
+            # Try Docling first (better structure preservation)
             docling_result = self._try_docling_extraction(file_path)
             if docling_result[1]:  # success
-                logger.info("✓ Docling extraction successful")
+                logger.info("✅ Docling extraction successful")
                 return docling_result
             
             # Fallback to python-docx
-            logger.info("Using python-docx with AI descriptions")
-            return self._extract_with_descriptions(file_path)
+            logger.info("Using python-docx with caching")
+            return self._extract_with_python_docx(file_path)
             
         except Exception as e:
-            logger.error(f"DOCX extraction error: {str(e)}")
+            logger.error(f"❌ DOCX extraction error: {str(e)}")
             import traceback
             traceback.print_exc()
             return "", False, {'error': str(e)}
     
     def _try_docling_extraction(self, file_path: str) -> Tuple[str, bool, Dict]:
-        """Try Docling extraction with AI image descriptions"""
+        """Try Docling extraction with full PDF-like features"""
         try:
             from docling.document_converter import DocumentConverter
-            from app.services.image_description_service import get_image_description_service
+            from docling.datamodel.pipeline_options import PdfPipelineOptions
             
             doc_stem = Path(file_path).stem
-            image_output_dir = os.path.join(
-                os.path.dirname(file_path),
-                "extracted_images",
-                doc_stem
-            )
-            os.makedirs(image_output_dir, exist_ok=True)
+            image_output_dir = self._create_image_directory(file_path, doc_stem)
+            
+            logger.info("🔄 Starting Docling conversion...")
             
             # Convert with Docling
             converter = DocumentConverter()
             result = converter.convert(file_path)
             
             total_pages = len(result.document.pages) if hasattr(result.document, 'pages') else 1
+            logger.info(f"📑 Document has {total_pages} pages")
             
-            # Export with embedded images
-            markdown_with_base64 = result.document.export_to_markdown(image_mode="embedded")
+            # Reset counters
+            self._duplicates_skipped = 0
             
-            # NEW: Extract and describe images
-            image_data = self._extract_and_describe_images_docling(
-                markdown_with_base64,
-                image_output_dir,
+            # Build content-to-page map (similar to PDF)
+            content_map = self._build_content_page_map_docling(result.document)
+            
+            # Process images with caching and duplicate detection
+            image_data = self._process_images_with_caching_docling(
                 result.document,
-                doc_stem
+                image_output_dir,
+                doc_stem,
+                file_path,
+                content_map
             )
             
-            # Export with placeholders
-            markdown_content = result.document.export_to_markdown(
-                image_mode="placeholder",
-                image_placeholder="[IMAGE:{image_name}]"
-            )
-            
-            # NEW: Build markdown with descriptions
-            final_markdown = self._build_markdown_with_descriptions(
-                markdown_content,
+            # Build markdown page-by-page
+            final_markdown = self._build_markdown_from_pages_docling(
+                result.document,
+                total_pages,
                 image_data,
                 doc_stem,
-                total_pages
+                content_map
             )
+            
+            # Gather statistics
+            cache_stats = self.image_cache.get_stats()
             
             metadata = self.get_metadata(file_path)
             metadata.update({
+                'extractor': 'DocxExtractor_Docling_Enhanced',
                 'total_pages': total_pages,
                 'images_extracted': len(image_data),
-                'images_described': sum(1 for img in image_data.values() if img.get('description_success')),
+                'images_described': sum(1 for img in image_data.values() if img.get('success')),
+                'images_cached': cache_stats['hits'],
+                'images_skipped_duplicates': self._duplicates_skipped,
+                'cache_hit_rate': cache_stats['hit_rate_percent'],
                 'image_directory': str(image_output_dir),
                 'extraction_method': 'docling'
             })
             
-            logger.info(f"✓ Docling: {total_pages} pages, {len(image_data)} images described")
+            logger.info(
+                f"✅ Complete: {total_pages} pages, {len(image_data)} images "
+                f"({metadata['images_cached']} cached, {self._duplicates_skipped} dupes skipped)"
+            )
             
             return final_markdown, True, metadata
             
@@ -136,394 +158,429 @@ class DocxExtractor(BaseExtractor):
             return "", False, {'error': 'Docling not installed'}
         except Exception as e:
             logger.warning(f"Docling extraction failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return "", False, {'error': str(e)}
     
-    def _extract_and_describe_images_docling(
-        self,
-        markdown_with_base64: str,
-        image_output_dir: str,
-        document,
-        doc_stem: str
-    ) -> Dict[int, Dict]:
-        """Extract images from Docling and generate AI descriptions"""
-        from app.services.image_description_service import get_image_description_service
+    def _build_content_page_map_docling(self, document) -> Dict:
+        """Build map of content items to their source pages (Docling)"""
+        content_map = {
+            'texts': {},
+            'pictures': {},
+            'tables': {}
+        }
         
-        pattern = r'!\[([^\]]*)\]\(data:image/([^;]+);base64,([^)]+)\)'
-        matches = re.findall(pattern, markdown_with_base64)
-        image_data = {}
-        
-        # Get page hints
-        page_hints = {}
         try:
-            if hasattr(document, 'pictures') and document.pictures:
-                for idx, picture in enumerate(document.pictures, start=1):
+            if hasattr(document, 'texts'):
+                for idx, text in enumerate(document.texts):
+                    if hasattr(text, 'prov'):
+                        for prov in text.prov:
+                            if hasattr(prov, 'page_no'):
+                                content_map['texts'][idx] = prov.page_no + 1
+                                break
+            
+            if hasattr(document, 'pictures'):
+                for idx, picture in enumerate(document.pictures):
                     if hasattr(picture, 'prov'):
                         for prov in picture.prov:
                             if hasattr(prov, 'page_no'):
-                                page_hints[idx] = prov.page_no + 1
+                                content_map['pictures'][idx] = prov.page_no + 1
                                 break
+            
+            if hasattr(document, 'tables'):
+                for idx, table in enumerate(document.tables):
+                    if hasattr(table, 'prov'):
+                        for prov in table.prov:
+                            if hasattr(prov, 'page_no'):
+                                content_map['tables'][idx] = prov.page_no + 1
+                                break
+        
         except Exception as e:
-            logger.debug(f"Could not extract page hints: {e}")
+            logger.debug(f"Error building content map: {e}")
         
-        total_pages = len(document.pages) if hasattr(document, 'pages') else 1
-        description_service = get_image_description_service()
+        logger.debug(f"Content map: {len(content_map['pictures'])} pictures mapped")
+        return content_map
+    
+    def _process_images_with_caching_docling(
+        self,
+        document,
+        image_output_dir: str,
+        doc_stem: str,
+        file_path: str,
+        content_map: Dict
+    ) -> Dict[int, Dict]:
+        """Process images with caching and duplicate detection (Docling path)"""
+        image_data = {}
+        seen_hashes = set()
+        
+        # Export with embedded images to extract them
+        markdown_with_base64 = document.export_to_markdown(image_mode="embedded")
+        
+        pattern = r'!\[([^\]]*)\]\(data:image/([^;]+);base64,([^)]+)\)'
+        matches = re.findall(pattern, markdown_with_base64)
+        
         doc_context = f"Word document: {doc_stem}"
+        total_pages = len(document.pages) if hasattr(document, 'pages') else 1
         
-        for idx, match in enumerate(matches, start=1):
+        for extract_idx, match in enumerate(matches, start=1):
             try:
                 image_format = match[1]
                 base64_image = match[2]
                 image_bytes = base64.b64decode(base64_image)
                 
+                # Get page number from content map
+                picture_idx = extract_idx - 1
+                page_number = content_map['pictures'].get(picture_idx, 1)
+                
+                logger.debug(f"Image {extract_idx} (picture_idx={picture_idx}) -> page {page_number}")
+                
+                # Check for duplicates
+                img_hash = self.image_cache.compute_hash(image_bytes)
+                if img_hash in seen_hashes:
+                    logger.debug(f"  ⏭ Skipping duplicate image {extract_idx}")
+                    self._duplicates_skipped += 1
+                    continue
+                seen_hashes.add(img_hash)
+                
+                # Get cached description or generate new one
+                cached_desc = self.image_cache.get(image_bytes)
+                
+                if cached_desc:
+                    description = cached_desc
+                    from_cache = True
+                    success = True
+                else:
+                    # Generate AI description
+                    success, description = self.image_service.describe_image_from_base64(
+                        base64_image,
+                        self._get_media_type(image_format),
+                        context=doc_context,
+                        page_number=page_number
+                    )
+                    from_cache = False
+                    
+                    if success:
+                        self.image_cache.put(image_bytes, description)
+                
+                # Save image
                 ext = image_format.lower()
                 if ext == 'jpeg':
                     ext = 'jpg'
                 
-                page_number = page_hints.get(idx)
-                if page_number is None:
-                    page_number = int((idx / len(matches)) * total_pages) + 1 if len(matches) > 0 else 1
-                    page_number = max(1, min(page_number, total_pages))
+                filename = f"page_{page_number:03d}_image_{extract_idx:03d}.{ext}"
+                image_path = os.path.join(image_output_dir, filename)
                 
-                filename = f"page_{page_number:02d}_image_{idx:03d}.{ext}"
-                output_path = os.path.join(image_output_dir, filename)
-                
-                # Save image
-                with open(output_path, 'wb') as f:
+                with open(image_path, 'wb') as f:
                     f.write(image_bytes)
                 
-                logger.info(f"  ✓ Saved: {filename}")
-                
-                # Generate AI description
-                if description_service.is_available():
-                    media_type = f"image/{image_format}"
-                    success, description = description_service.describe_image_from_base64(
-                        base64_image,
-                        media_type,
-                        context=doc_context,
-                        page_number=page_number,
-                        filename=filename
-                    )
-                    
-                    if success:
-                        logger.info(f"  ✓ Described: {filename}")
-                    else:
-                        logger.warning(f"  ⚠ Description failed: {filename}")
-                else:
-                    success = False
-                    description = description_service.generate_fallback_description(
-                        filename, page_number=page_number, image_type="figure"
-                    )
-                
-                image_data[idx] = {
+                # Store image data
+                image_data[extract_idx] = {
+                    'extract_idx': extract_idx,
+                    'picture_idx': picture_idx,
                     'filename': filename,
                     'page_number': page_number,
-                    'format': ext,
+                    'format': image_format,
                     'description': description,
-                    'description_success': success
+                    'success': success,
+                    'from_cache': from_cache
                 }
                 
+                cache_str = "💾" if from_cache else "✓"
+                logger.info(f"  {cache_str} Image {extract_idx} -> {filename} (page {page_number})")
+                
             except Exception as e:
-                logger.warning(f"  ⚠ Could not process image {idx}: {e}")
+                logger.warning(f"  ⚠ Error processing image {extract_idx}: {e}")
+                continue
+        
+        logger.info(
+            f"Processed {len(image_data)} images "
+            f"(skipped {self._duplicates_skipped} duplicates)"
+        )
         
         return image_data
     
-    def _extract_with_descriptions(self, file_path: str) -> Tuple[str, bool, Dict]:
-        """Extract with python-docx and AI image descriptions"""
-        try:
-            from app.services.image_description_service import get_image_description_service
+    def _build_markdown_from_pages_docling(
+        self,
+        document,
+        total_pages: int,
+        image_data: Dict[int, Dict],
+        doc_stem: str,
+        content_map: Dict
+    ) -> str:
+        """Build markdown by processing each page separately (Docling path)"""
+        result_lines = []
+        
+        # Header
+        result_lines.append(f"# Document: {doc_stem}")
+        result_lines.append(f"**Total Pages**: {total_pages}")
+        result_lines.append(f"**Format**: Word Document")
+        result_lines.append("")
+        
+        # Build mapping: page_number -> list of images on that page
+        images_by_page = {}
+        for img_idx, img_info in sorted(image_data.items()):
+            page_num = img_info['page_number']
+            if page_num not in images_by_page:
+                images_by_page[page_num] = []
+            images_by_page[page_num].append(img_info)
+        
+        logger.debug(f"Images distribution: {[(p, len(imgs)) for p, imgs in images_by_page.items()]}")
+        
+        # Process each page individually
+        for page_number in sorted(document.pages.keys()):
+            # Add page marker
+            result_lines.append(f"## Page {page_number}\n")
             
+            try:
+                # Export this specific page to markdown
+                page_markdown = document.export_to_markdown(
+                    page_no=page_number,
+                    image_mode="placeholder",
+                    image_placeholder="[IMAGE_PLACEHOLDER_{image_name}]"
+                )
+                
+                if not page_markdown.strip():
+                    result_lines.append("*(No content on this page)*\n")
+                    continue
+                
+                # Get images for this page
+                page_images = images_by_page.get(page_number, [])
+                image_counter_on_page = 0
+                
+                # Process page content and insert image descriptions
+                page_lines = page_markdown.split('\n')
+                
+                for line in page_lines:
+                    # Check for image placeholders
+                    if '[IMAGE_PLACEHOLDER_' in line:
+                        # Match placeholder to the next image on this page
+                        if image_counter_on_page < len(page_images):
+                            img_info = page_images[image_counter_on_page]
+                            
+                            # Add image description
+                            result_lines.append(f"**[Image Description]**: {img_info['description']}")
+                            cache_str = "cached" if img_info.get('from_cache') else "described"
+                            result_lines.append(f"*(Page {page_number}, {cache_str})*")
+                            result_lines.append("")
+                            
+                            image_counter_on_page += 1
+                        else:
+                            # Placeholder exists but image was filtered out (duplicate)
+                            logger.debug(f"Placeholder on page {page_number} but no image data (likely filtered)")
+                            result_lines.append("*(Image filtered - duplicate)*")
+                            result_lines.append("")
+                    else:
+                        # Regular content
+                        result_lines.append(line)
+                
+                result_lines.append("")  # Blank line after page content
+                
+            except Exception as e:
+                logger.warning(f"Error processing page {page_number}: {e}")
+                result_lines.append(f"*(Error extracting content from page {page_number})*\n")
+        
+        return '\n'.join(result_lines)
+    
+    def _extract_with_python_docx(self, file_path: str) -> Tuple[str, bool, Dict]:
+        """Fallback extraction using python-docx with caching"""
+        try:
             doc = Document(file_path)
             doc_stem = Path(file_path).stem
+            image_output_dir = self._create_image_directory(file_path, doc_stem)
             
-            image_output_dir = os.path.join(
-                os.path.dirname(file_path),
-                "extracted_images",
+            # Reset counters
+            self._duplicates_skipped = 0
+            
+            # Process images with caching
+            image_data = self._process_images_python_docx(
+                doc,
+                image_output_dir,
                 doc_stem
             )
-            os.makedirs(image_output_dir, exist_ok=True)
             
-            # Estimate pages
-            page_breaks = self._find_page_breaks(doc)
-            total_pages = self._estimate_total_pages(doc, page_breaks)
-            
-            logger.info(f"Estimated pages: {total_pages}")
-            
-            # Extract images with descriptions
-            image_data = self._extract_images_with_descriptions(
-                doc, image_output_dir, doc_stem, page_breaks, total_pages
+            # Build markdown
+            final_markdown = self._build_markdown_python_docx(
+                doc,
+                image_data,
+                doc_stem
             )
             
-            logger.info(f"Extracted {len(image_data)} images")
-            
-            # Build markdown with descriptions
-            markdown_content = self._build_content_with_descriptions(
-                doc, image_data, doc_stem, total_pages, page_breaks
-            )
+            cache_stats = self.image_cache.get_stats()
             
             metadata = self.get_metadata(file_path)
             metadata.update({
-                'total_pages': total_pages,
+                'extractor': 'DocxExtractor_PythonDocx_Enhanced',
+                'total_pages': len(doc.paragraphs) // 20 + 1,  # Rough estimate
                 'images_extracted': len(image_data),
-                'images_described': sum(1 for img in image_data.values() if img.get('description_success')),
+                'images_described': sum(1 for img in image_data.values() if img.get('success')),
+                'images_cached': cache_stats['hits'],
+                'images_skipped_duplicates': self._duplicates_skipped,
+                'cache_hit_rate': cache_stats['hit_rate_percent'],
                 'image_directory': str(image_output_dir),
-                'tables_found': len(doc.tables),
                 'extraction_method': 'python-docx'
             })
             
-            logger.info("✓ Extraction complete with AI descriptions")
+            logger.info(f"✅ Complete with python-docx: {len(image_data)} images")
             
-            return markdown_content, True, metadata
+            return final_markdown, True, metadata
             
         except Exception as e:
-            logger.error(f"Extraction failed: {str(e)}")
+            logger.error(f"python-docx extraction failed: {str(e)}")
             import traceback
             traceback.print_exc()
             return "", False, {'error': str(e)}
     
-    def _find_page_breaks(self, doc: Document) -> List[int]:
-        """Find page break positions"""
-        page_breaks = [0]
-        for i, para in enumerate(doc.paragraphs):
-            if '\\f' in para._element.xml or 'w:br w:type="page"' in para._element.xml:
-                page_breaks.append(i)
-        return page_breaks
-    
-    def _estimate_total_pages(self, doc: Document, page_breaks: List[int]) -> int:
-        """Estimate total pages"""
-        if len(page_breaks) > 1:
-            return len(page_breaks)
-        total_chars = sum(len(p.text) for p in doc.paragraphs)
-        estimated_pages = max(1, (total_chars // 2000) + 1)
-        return estimated_pages
-    
-    def _extract_images_with_descriptions(
+    def _process_images_python_docx(
         self,
         doc: Document,
-        output_dir: str,
-        doc_stem: str,
-        page_breaks: List[int],
-        total_pages: int
+        image_output_dir: str,
+        doc_stem: str
     ) -> Dict[int, Dict]:
-        """Extract images and generate AI descriptions"""
-        from app.services.image_description_service import get_image_description_service
-        
+        """Process images with caching (python-docx path)"""
         image_data = {}
+        seen_hashes = set()
         image_counter = 0
         
-        description_service = get_image_description_service()
         doc_context = f"Word document: {doc_stem}"
         
-        for para_idx, para in enumerate(doc.paragraphs):
-            # Estimate page
-            page_number = self._estimate_paragraph_page(para_idx, page_breaks, total_pages)
-            
-            # Check for images in paragraph
-            if para._element.xpath('.//pic:pic'):
-                for pic in para._element.xpath('.//pic:pic'):
-                    image_counter += 1
+        # Extract from inline shapes
+        for rel in doc.part.rels.values():
+            if "image" in rel.target_ref:
+                image_counter += 1
+                
+                try:
+                    image_bytes = rel.target_part.blob
                     
-                    try:
-                        # Extract image
-                        blip = pic.xpath('.//a:blip', namespaces={'a': 'http://schemas.openxmlformats.org/drawingml/2006/main'})[0]
-                        rId = blip.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed')
-                        image_part = doc.part.related_parts[rId]
-                        image_bytes = image_part.blob
-                        
-                        # Determine format
-                        content_type = image_part.content_type
-                        ext = content_type.split('/')[-1]
-                        if ext == 'jpeg':
-                            ext = 'jpg'
-                        
-                        filename = f"page_{page_number:02d}_image_{image_counter:03d}.{ext}"
-                        output_path = os.path.join(output_dir, filename)
-                        
-                        # Save image
-                        with open(output_path, 'wb') as f:
-                            f.write(image_bytes)
-                        
-                        logger.info(f"  ✓ Saved: {filename}")
-                        
+                    # Check for duplicates
+                    img_hash = self.image_cache.compute_hash(image_bytes)
+                    if img_hash in seen_hashes:
+                        logger.debug(f"  ⏭ Skipping duplicate image {image_counter}")
+                        self._duplicates_skipped += 1
+                        continue
+                    seen_hashes.add(img_hash)
+                    
+                    # Get cached description or generate new one
+                    cached_desc = self.image_cache.get(image_bytes)
+                    
+                    if cached_desc:
+                        description = cached_desc
+                        from_cache = True
+                        success = True
+                    else:
                         # Generate AI description
-                        if description_service.is_available():
-                            base64_image = base64.b64encode(image_bytes).decode('utf-8')
-                            success, description = description_service.describe_image_from_base64(
-                                base64_image,
-                                content_type,
-                                context=doc_context,
-                                page_number=page_number,
-                                filename=filename
-                            )
-                            
-                            if success:
-                                logger.info(f"  ✓ Described: {filename}")
-                        else:
-                            success = False
-                            description = description_service.generate_fallback_description(
-                                filename, page_number=page_number
-                            )
+                        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+                        content_type = rel.target_part.content_type
                         
-                        image_data[image_counter] = {
-                            'filename': filename,
-                            'page_number': page_number,
-                            'paragraph_index': para_idx,
-                            'format': ext,
-                            'description': description,
-                            'description_success': success
-                        }
+                        success, description = self.image_service.describe_image_from_base64(
+                            base64_image,
+                            content_type,
+                            context=doc_context,
+                            page_number=None  # No page info in python-docx
+                        )
+                        from_cache = False
                         
-                    except Exception as e:
-                        logger.warning(f"Could not extract image {image_counter}: {e}")
+                        if success:
+                            self.image_cache.put(image_bytes, description)
+                    
+                    # Determine format
+                    ext = self._get_extension_from_content_type(rel.target_part.content_type)
+                    
+                    # Save image
+                    filename = f"image_{image_counter:03d}.{ext}"
+                    output_path = os.path.join(image_output_dir, filename)
+                    
+                    with open(output_path, 'wb') as f:
+                        f.write(image_bytes)
+                    
+                    image_data[image_counter] = {
+                        'extract_idx': image_counter,
+                        'filename': filename,
+                        'page_number': None,
+                        'format': ext,
+                        'description': description,
+                        'success': success,
+                        'from_cache': from_cache
+                    }
+                    
+                    cache_str = "💾" if from_cache else "✓"
+                    logger.info(f"  {cache_str} Image {image_counter} -> {filename}")
+                    
+                except Exception as e:
+                    logger.warning(f"  ⚠ Error processing image {image_counter}: {e}")
+                    continue
+        
+        logger.info(
+            f"Processed {len(image_data)} images "
+            f"(skipped {self._duplicates_skipped} duplicates)"
+        )
         
         return image_data
     
-    def _estimate_paragraph_page(self, para_idx: int, page_breaks: List[int], total_pages: int) -> int:
-        """Estimate which page a paragraph is on"""
-        for i, break_idx in enumerate(page_breaks):
-            if para_idx < break_idx:
-                return max(1, i)
-        return total_pages
-    
-    def _build_content_with_descriptions(
+    def _build_markdown_python_docx(
         self,
         doc: Document,
         image_data: Dict[int, Dict],
-        doc_stem: str,
-        total_pages: int,
-        page_breaks: List[int]
+        doc_stem: str
     ) -> str:
-        """
-        Build markdown with AI descriptions instead of image paths (python-docx path)
+        """Build markdown from python-docx extraction"""
+        result_lines = []
         
-        Includes caption detection to associate figure labels with images
-        """
-        lines = []
-        lines.append(f"# Document: {doc_stem}")
-        lines.append(f"**Total Pages**: {total_pages}\n")
+        # Header
+        result_lines.append(f"# Document: {doc_stem}")
+        result_lines.append(f"**Format**: Word Document")
+        result_lines.append("")
         
-        current_page = 1
-        lines.append(f"## Page {current_page}\n")
+        image_counter = 1
         
-        image_counter = 0
-        
-        # First pass: Build content with image placeholders
-        temp_lines = []
-        for para_idx, para in enumerate(doc.paragraphs):
-            # Check for page break
-            page_number = self._estimate_paragraph_page(para_idx, page_breaks, total_pages)
-            if page_number != current_page:
-                current_page = page_number
-                temp_lines.append(f"\n## Page {current_page}\n")
+        # Process paragraphs
+        for para in doc.paragraphs:
+            text = para.text.strip()
             
-            # Check if paragraph has images
-            has_images = bool(para._element.xpath('.//pic:pic'))
+            if text:
+                # Check if it's a heading
+                if para.style.name.startswith('Heading'):
+                    level = para.style.name.replace('Heading ', '')
+                    try:
+                        level_num = int(level)
+                        result_lines.append(f"{'#' * level_num} {text}\n")
+                    except:
+                        result_lines.append(f"{text}\n")
+                else:
+                    result_lines.append(f"{text}\n")
             
-            if has_images:
-                # Add paragraph text if any
-                if para.text.strip():
-                    temp_lines.append(para.text.strip())
-                    temp_lines.append("")
+            # Check for images in paragraph
+            if hasattr(para, '_element') and hasattr(para._element, 'xpath'):
+                # Check for images
+                images_in_para = para._element.xpath('.//pic:pic', namespaces={
+                    'pic': 'http://schemas.openxmlformats.org/drawingml/2006/picture'
+                })
                 
-                # Add image placeholders
-                for pic in para._element.xpath('.//pic:pic'):
+                if images_in_para and image_counter in image_data:
+                    img_info = image_data[image_counter]
+                    result_lines.append(f"**[Image Description]**: {img_info['description']}")
+                    cache_str = "cached" if img_info.get('from_cache') else "described"
+                    result_lines.append(f"*({cache_str})*")
+                    result_lines.append("")
                     image_counter += 1
-                    if image_counter in image_data:
-                        temp_lines.append(f"[IMAGE_PLACEHOLDER_{image_counter}]")
-            else:
-                # Regular paragraph
-                if para.text.strip():
-                    temp_lines.append(para.text.strip())
-                    temp_lines.append("")
         
-        # Add tables
+        # Process tables
         for table in doc.tables:
-            temp_lines.append(self._extract_table(table))
-            temp_lines.append("")
+            table_md = self._extract_table(table)
+            if table_md:
+                result_lines.append(table_md)
+                result_lines.append("")
         
-        # Second pass: Detect captions and associate with images
-        processed_caption_indices = set()
-        image_caption_map = {}
-        placeholder_pattern = r'\[IMAGE_PLACEHOLDER_(\d+)\]'
-        
-        for i, line in enumerate(temp_lines):
-            match = re.match(placeholder_pattern, line)
-            if match:
-                img_idx = int(match.group(1))
-                
-                # Look ahead for caption
-                caption_info = None
-                for j in range(i + 1, min(i + 5, len(temp_lines))):
-                    check_line = temp_lines[j].strip()
-                    if not check_line:
-                        continue
-                    
-                    result = CaptionDetector.detect_caption(check_line)
-                    if result:
-                        caption_type, number, description = result
-                        if caption_type in ['figure', 'table', 'chart']:
-                            caption_info = {
-                                'type': caption_type,
-                                'number': number,
-                                'description': description,
-                                'line_idx': j
-                            }
-                            processed_caption_indices.add(j)
-                            break
-                
-                # Look backward if not found ahead
-                if not caption_info:
-                    for j in range(max(0, i - 5), i):
-                        check_line = temp_lines[j].strip()
-                        if not check_line:
-                            continue
-                        
-                        result = CaptionDetector.detect_caption(check_line)
-                        if result:
-                            caption_type, number, description = result
-                            if caption_type in ['figure', 'table', 'chart']:
-                                if j not in processed_caption_indices:
-                                    caption_info = {
-                                        'type': caption_type,
-                                        'number': number,
-                                        'description': description,
-                                        'line_idx': j
-                                    }
-                                    processed_caption_indices.add(j)
-                                    break
-                
-                if caption_info:
-                    image_caption_map[img_idx] = caption_info
-        
-        # Third pass: Build final output with captions and descriptions
-        final_lines = []
-        for i, line in enumerate(temp_lines):
-            # Skip processed captions
-            if i in processed_caption_indices:
-                continue
-            
-            # Check if this is an image placeholder
-            match = re.match(placeholder_pattern, line)
-            if match:
-                img_idx = int(match.group(1))
-                if img_idx in image_data:
-                    img_info = image_data[img_idx]
-                    
-                    # Add caption as heading if found (e.g., "### Figure 1.3.4: Revenue Trends")
-                    if img_idx in image_caption_map:
-                        caption = image_caption_map[img_idx]
-                        heading = CaptionDetector.format_as_heading(
-                            caption['type'], caption['number'], caption['description']
-                        )
-                        final_lines.append(f"{heading}\n")
-                    
-                    # Add AI description
-                    final_lines.append(f"**[Image Description]**: {img_info['description']}")
-                    final_lines.append(f"*(Located on page {img_info['page_number']})*")
-                    final_lines.append("")
-            else:
-                final_lines.append(line)
-        
-        return '\n'.join(final_lines)
+        return '\n'.join(result_lines)
+    
+    def _create_image_directory(self, file_path: str, doc_stem: str) -> str:
+        """Create directory for extracted images"""
+        image_dir = os.path.join(
+            os.path.dirname(file_path),
+            "extracted_images",
+            doc_stem
+        )
+        os.makedirs(image_dir, exist_ok=True)
+        return image_dir
     
     def _extract_table(self, table) -> str:
         """Extract table as markdown"""
@@ -549,93 +606,25 @@ class DocxExtractor(BaseExtractor):
         except:
             return ""
     
-    def _build_markdown_with_descriptions(
-        self,
-        markdown_content: str,
-        image_data: Dict[int, Dict],
-        doc_stem: str,
-        total_pages: int
-    ) -> str:
-        """
-        Build markdown with captions AND AI descriptions (Docling path)
-        
-        Format:
-        ### Figure 1.3.4: Revenue Trends  <-- Caption from document
-        **[Image Description]**: A bar chart... <-- AI description
-        """
-        lines = markdown_content.split('\n')
-        result_lines = []
-        
-        result_lines.append(f"# Document: {doc_stem}")
-        result_lines.append(f"**Total Pages**: {total_pages}\n")
-        
-        placeholder_pattern = r'\[IMAGE:\{[^\}]+\}\]'
-        image_counter = [1]
-        processed_caption_indices = set()
-        image_caption_map = {}
-        
-        # First pass: find captions
-        for i, line in enumerate(lines):
-            if re.search(placeholder_pattern, line):
-                idx = image_counter[0]
-                
-                # Look ahead for caption
-                caption_info = CaptionDetector.find_caption_in_range(lines, i + 1, lookahead=5)
-                
-                if caption_info:
-                    image_caption_map[idx] = caption_info
-                    processed_caption_indices.add(caption_info['line_idx'])
-                
-                # Look backward if not found ahead
-                if idx not in image_caption_map:
-                    caption_before = CaptionDetector.find_caption_before(lines, i, lookback=5)
-                    if caption_before:
-                        # Check if not already processed
-                        if caption_before['line_idx'] not in processed_caption_indices:
-                            image_caption_map[idx] = caption_before
-                            processed_caption_indices.add(caption_before['line_idx'])
-                
-                image_counter[0] += 1
-        
-        # Second pass: build output with captions AND descriptions
-        image_counter[0] = 1
-        
-        for i, line in enumerate(lines):
-            if i in processed_caption_indices:
-                continue
-            
-            if line.startswith('#'):
-                result_lines.append(line)
-                continue
-            
-            if re.search(placeholder_pattern, line):
-                idx = image_counter[0]
-                
-                if idx in image_data:
-                    img_info = image_data[idx]
-                    page_number = img_info['page_number']
-                    
-                    if not result_lines or not result_lines[-1].startswith(f"## Page {page_number}"):
-                        result_lines.append(f"\n## Page {page_number}\n")
-                    
-                    # Add caption as heading if found (e.g., "### Figure 1.3.4: Revenue Trends")
-                    if idx in image_caption_map:
-                        caption = image_caption_map[idx]
-                        heading = CaptionDetector.format_caption_as_heading(
-                            caption['type'], caption['number'], caption['description']
-                        )
-                        result_lines.append(f"{heading}\n")
-                    
-                    # Add AI description
-                    result_lines.append(f"**[Image Description]**: {img_info['description']}")
-                    result_lines.append(f"*(Located on page {page_number})*")
-                    result_lines.append("")
-                    
-                    image_counter[0] += 1
-                else:
-                    result_lines.append(line)
-                    image_counter[0] += 1
-            else:
-                result_lines.append(line)
-        
-        return '\n'.join(result_lines)
+    def _get_media_type(self, extension: str) -> str:
+        """Map extension to MIME type"""
+        return {
+            'jpg': 'image/jpeg',
+            'jpeg': 'image/jpeg',
+            'png': 'image/png',
+            'gif': 'image/gif',
+            'webp': 'image/webp',
+            'bmp': 'image/bmp'
+        }.get(extension.lower(), 'image/jpeg')
+    
+    def _get_extension_from_content_type(self, content_type: str) -> str:
+        """Get file extension from content type"""
+        extensions = {
+            'image/jpeg': 'jpg',
+            'image/png': 'png',
+            'image/gif': 'gif',
+            'image/bmp': 'bmp',
+            'image/tiff': 'tiff',
+            'image/webp': 'webp'
+        }
+        return extensions.get(content_type, 'png')

@@ -371,107 +371,195 @@ class ImageDescriptionService:
     ) -> str:
         """Build prompt for single image description"""
         prompt_parts = [
-            "Analyze this image carefully.",
-            "",
-            "STEP 1: Identify the image type",
-            "Is this image a:",
-            "A) DATA VISUALIZATION (bar chart, line chart, pie chart, stacked chart, area chart, scatter plot, etc.)",
-            "B) DIAGRAM (flowchart, architecture diagram, mind map, etc.)",
-            "C) PHOTO or SCREENSHOT",
-            "D) ILLUSTRATION or DRAWING",
-            "E) TABLE or SPREADSHEET",
-            "F) Other",
-            "",
-            "STEP 2: Provide description based on type",
-            "",
-            "If DATA VISUALIZATION (charts/graphs):",
-            "Format your response as:",
-            "**Chart Type**: [specific type]",
-            "**X-axis**: [label and range]",
-            "**Y-axis**: [label and range with units]",
-            "**Legend/Categories**: [list all categories]",
-            "**Key Data Points**: [notable values]",
-            "**Trends**: [3-5 insights]",
-            "",
-            "If TABLE:",
-            "Describe structure, column headers, rows, and key data.",
-            "",
-            "If DIAGRAM:",
-            "Describe type, components, relationships, and flow.",
-            "",
-            "If PHOTO/SCREENSHOT/ILLUSTRATION:",
-            "Describe main subject, key elements, colors, and any visible text.",
-            "",
-            "IMPORTANT:",
-            "- Be specific and factual",
-            "- Include all text visible in the image",
-            "- For charts: extract actual numbers when visible",
-            "- Use clear, searchable language",
+            "Analyze this image and provide a detailed description.",
             ""
         ]
         
         if context:
-            prompt_parts.extend([
-                f"Document context: {context}",
-                ""
-            ])
-        
+            prompt_parts.append(f"Context: {context}")
         if page_number:
-            prompt_parts.extend([
-                f"This image appears on page {page_number}.",
-                ""
-            ])
+            prompt_parts.append(f"Page: {page_number}")
+        if context or page_number:
+            prompt_parts.append("")
         
         prompt_parts.extend([
-            "Start your description directly without preamble.",
-            "Use markdown formatting for structure."
+            "Analyze this image with extreme precision and provide a comprehensive description.",
+            "",
+            "## CAPTION/LABEL RULES (CRITICAL - FOLLOW EXACTLY)",
+            "",
+            "**STEP 1: CAPTION DETECTION (Read very carefully)**",
+            "",
+            "Examine the image thoroughly for ANY text that looks like:",
+            "- 'Figure X.Y.Z' or 'Fig. X.Y.Z' or 'Figure X.Y.Z:'",
+            "- 'Table X.Y.Z' or 'Tbl. X.Y.Z'",
+            "- ANY numbered label with dots/decimals (e.g., '1.3.1', '2.5.3', 'Fig 1.4.2')",
+            "",
+            "**CRITICAL CAPTION READING RULES:**",
+            "- Read caption numbers EXACTLY as written, including ALL decimal points",
+            "- '1.3.1' is NOT '1.31' - these are different numbers",
+            "- 'Figure 1.3.1' has THREE parts: 1, 3, and 1 (not two parts: 1 and 31)",
+            "- Preserve ALL dots, spaces, and formatting from the original",
+            "- If unsure, look multiple times at the exact spacing and punctuation",
+            "",
+            "**STEP 2: APPLY CAPTION RULES**",
+            "",
+            "**Single Visual Element (one chart/diagram/table):**",
+            "- IF caption exists:",
+            "  ✅ Copy it EXACTLY as shown (character-by-character)",
+            "  ✅ Format: **Figure [exact number]**: Description...",
+            "  ✅ Double-check you copied ALL decimal points",
+            "- IF no caption exists:",
+            "  ❌ Do NOT invent any caption",
+            "  ✅ Start directly with description",
+            "",
+            "**Multiple Visual Elements (2+ charts/diagrams/tables in same image):**",
+            "- IF at least one element has a caption:",
+            "  ✅ Use existing captions EXACTLY as shown (preserve all dots)",
+            "  ✅ Generate captions ONLY for unlabeled elements:",
+            "     • Follow the same numbering pattern",
+            "     • Maintain the same decimal structure",
+            "     • Example: If 'Figure 1.3.1' exists on left chart:",
+            "       → Right chart becomes 'Figure 1.3.2' (not '1.32' or '1.4')",
+            "       → Middle chart (if between) would be inserted appropriately",
+            "     • Example: If 'Figure 2.5.3' exists on right:",
+            "       → Left chart becomes 'Figure 2.5.2' (not '2.52')",
+            "       → Chart to right of that becomes 'Figure 2.5.4'",
+            "  ✅ Describe EACH element separately and completely",
+            "- IF no elements have captions:",
+            "  ❌ Do NOT generate any captions",
+            "  ✅ Describe as 'Left chart:', 'Right chart:', etc.",
+            "",
+            "**NEVER:**",
+            "- Change '1.3.1' to '1.31' or any other format",
+            "- Omit decimal points from caption numbers",
+            "- Invent captions when none exist",
+            "- Skip describing any visual element",
+            "- Assume caption numbers - read them precisely",
+            "",
+            "## DESCRIPTION COMPLETENESS REQUIREMENTS",
+            "",
+            "Your description will be used in a RAG (Retrieval-Augmented Generation) system.",
+            "Therefore, it MUST be:",
+            "",
+            "**COMPREHENSIVE**: Include every detail visible in the image",
+            "**SEARCHABLE**: Use terms someone might search for",
+            "**SPECIFIC**: Include actual numbers, labels, and text",
+            "**COMPLETE**: Cover all visual elements thoroughly",
+            "",
+            "## DESCRIPTION STRUCTURE",
+            "",
+            "**For EACH visual element, provide:**",
+            "",
+            "### 1. Chart/Diagram Type Identification",
+            "- Exact type: horizontal bar chart, vertical bar chart, line graph, scatter plot, pie chart, stacked area chart, etc.",
+            "- Be specific: 'multi-line temporal graph' not just 'line chart'",
+            "",
+            "### 2. Title and Labels (if present)",
+            "- Chart title (word-for-word)",
+            "- Axis labels (exact text)",
+            "- Legend labels (all items, exact text)",
+            "- Any annotations or notes",
+            "",
+            "### 3. Axis Information",
+            "- X-axis: Label, units, range (min to max), scale type",
+            "- Y-axis: Label, units, range (min to max), scale type",
+            "- For time series: exact start year to end year",
+            "",
+            "### 4. Data Series (ALL of them)",
+            "- Name/label of each series (exact text)",
+            "- Color or pattern used",
+            "- Data point values (as many as visible)",
+            "- Starting value, ending value, peak value, lowest value",
+            "- Any labeled points with their exact values",
+            "",
+            "### 5. Data Values (Comprehensive)",
+            "- List ALL visible data points with their values",
+            "- Include exact numbers from the chart",
+            "- Note any data labels or annotations",
+            "- Mention gridline values if they help establish scale",
+            "",
+            "### 6. Trends and Patterns",
+            "- Overall trend direction (increasing, decreasing, stable, cyclical)",
+            "- Significant changes (spikes, drops, inflection points)",
+            "- Comparative relationships between series",
+            "- Notable periods or ranges",
+            "- Growth rates or changes (if calculable)",
+            "",
+            "### 7. Key Insights (3-7 insights minimum)",
+            "- Most important takeaways",
+            "- Comparisons between elements",
+            "- Ranking of values (highest to lowest)",
+            "- Significant differences or gaps",
+            "- Notable patterns or anomalies",
+            "",
+            "### 8. Source Attribution",
+            "- Copy source text exactly as shown",
+            "- Include author, year, report name if visible",
+            "",
+            "## FORMAT FOR EACH VISUAL ELEMENT",
+            "",
+            "**[Exact Caption if present]**:",
+            "",
+            "Type: [Specific chart/diagram type]",
+            "",
+            "Title: [Exact title text if present]",
+            "",
+            "Axes:",
+            "- X-axis: [Label] ([units]), range: [min] to [max]",
+            "- Y-axis: [Label] ([units]), range: [min] to [max]",
+            "",
+            "Data Series:",
+            "1. [Series name] ([color/pattern]):",
+            "   - Values: [list all visible values chronologically or categorically]",
+            "   - Range: [lowest] to [highest]",
+            "   - Notable points: [specific values at key positions]",
+            "",
+            "2. [Next series name] ([color/pattern]):",
+            "   - [Same detailed breakdown]",
+            "",
+            "Key Data Points:",
+            "- [List all specific values visible, e.g., 'United States: 40 models']",
+            "- [Include ALL countries/categories with their values]",
+            "- [Note any labeled points on the chart]",
+            "",
+            "Trends:",
+            "- [Trend 1 with specific details]",
+            "- [Trend 2 with specific details]",
+            "- [Continue with all observable trends]",
+            "",
+            "Insights:",
+            "1. [Specific insight with numbers]",
+            "2. [Comparative insight]",
+            "3. [Pattern observation]",
+            "4. [Additional insights...]",
+            "",
+            "Source: [Exact source text]",
+            "",
+            "## QUALITY CHECKLIST",
+            "",
+            "Before finalizing, verify:",
+            "- ✅ ALL captions copied EXACTLY (every dot, every space)",
+            "- ✅ ALL visual elements described (none skipped)",
+            "- ✅ ALL visible numbers extracted and included",
+            "- ✅ ALL data series identified with values",
+            "- ✅ ALL text from image reproduced verbatim",
+            "- ✅ At least 3-7 insights provided per chart",
+            "- ✅ Description is comprehensive enough for RAG retrieval",
+            "- ✅ Someone could reconstruct key information from description alone",
+            "",
+            "## CRITICAL REMINDERS",
+            "",
+            "1. **Caption Precision**: '1.3.1' ≠ '1.31' - Read decimal points carefully",
+            "2. **Completeness**: RAG systems need ALL details - be thorough",
+            "3. **Every Element**: Describe EVERY chart/diagram separately",
+            "4. **All Numbers**: Extract ALL visible data values",
+            "5. **Exact Text**: Copy ALL visible text word-for-word",
+            "",
+            "Start your analysis now.",
+            ""
         ])
         
         return "\n".join(prompt_parts)
-    
-    def _build_batch_prompt(
-        self,
-        num_images: int,
-        context: Optional[str],
-        page_number: Optional[int]
-    ) -> str:
-        """Build prompt for batch image description"""
-        prompt_parts = [
-            f"You are analyzing {num_images} images",
-        ]
-        
-        if context:
-            prompt_parts.append(f"from: {context}")
-        
-        if page_number:
-            prompt_parts.append(f"(page {page_number})")
-        
-        prompt_parts.append("\n\nFor each image (in order), provide a detailed description following this structure:\n")
-        
-        prompt_parts.append("""
-IMAGE 1:
-**Type**: [chart/graph/diagram/photo/table/illustration]
-**Content**: [Detailed description of what the image shows]
-**Text**: [Any text visible in the image]
-**Key Points**: [Important data points or visual elements]
-
-IMAGE 2:
-[Same structure...]
-
-... and so on for all images.
-
-IMPORTANT:
-- Identify image type first (chart, table, diagram, photo, etc.)
-- For charts/graphs: extract axis labels, data points, trends, legend items
-- For tables: describe structure and key data
-- For diagrams: explain relationships and flow
-- Include ALL visible text
-- Be specific and factual
-- Each description should be 2-4 sentences
-
-Start with IMAGE 1:""")
-        
-        return " ".join(prompt_parts)
     
     def _parse_batch_response(
         self,

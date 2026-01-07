@@ -1,6 +1,7 @@
 """
-Extractor Factory - Fixed Version
+Extractor Factory - Updated Version
 Automatically selects the appropriate extractor based on file type
+Includes Excel extractor registration
 """
 
 from typing import Optional, Dict, List, Type
@@ -161,6 +162,13 @@ def auto_register_extractors():
         ExtractorFactory.register_extractor(PptxExtractor)
     except ImportError as e:
         logger.warning(f"Could not register PptxExtractor: {e}")
+    
+    # Excel Extractor (NEW)
+    try:
+        from .extractors.excel_extractor import ExcelExtractor
+        ExtractorFactory.register_extractor(ExcelExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register ExcelExtractor: {e}")
     
     # Image Extractor (only register once!)
     try:
