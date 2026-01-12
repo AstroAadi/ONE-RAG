@@ -1,8 +1,6 @@
 """
-Upload Route with FULL DATABASE INTEGRATION and MANDATORY USER AUTH
-- All endpoints require X-User-ID header
-- Complete database tracking of uploads and processing
-- User-isolated file storage
+Upload Route - FIXED VERSION
+No duplicate directories, proper user isolation, consistent file IDs
 """
 
 from typing import Optional
@@ -41,19 +39,16 @@ vector_store = VectorStoreService()
 @router.post("/", response_model=FileUploadResponse)
 async def upload_file(
     file: UploadFile = File(...),
-    user_id: str = Depends(get_user_id),  # MANDATORY USER AUTH
+    user_id: str = Depends(get_user_id),
     db: Session = Depends(get_database_session)
 ):
     """
-    Upload a document file (REQUIRES X-User-ID header)
+    Upload document file with proper user isolation
     
-    Supports multiple formats: PDF, DOCX, DOC, PPTX, PPT, images, markdown, etc.
-    
-    Headers:
-        X-User-ID: User identifier (REQUIRED)
-    
-    Returns:
-        FileUploadResponse with file_id for processing
+    Directory structure:
+    - uploads/{user_id}/{filename} - Original file
+    - uploads/{user_id}/extracted_images/{doc_stem}/ - Images (created during extraction)
+    - markdown_output/{user_id}/{file_id}.md - Markdown output
     """
     
     # Validate filename
@@ -77,21 +72,17 @@ async def upload_file(
     user_upload_dir = Path(settings.upload_dir) / user_id
     user_upload_dir.mkdir(parents=True, exist_ok=True)
     
-    upload_path = user_upload_dir / safe_filename
-    
-    # Handle duplicate filenames
-    if upload_path.exists():
-        name_parts = safe_filename.rsplit('.', 1)
-        if len(name_parts) == 2:
-            safe_filename = f"{name_parts[0]}_{file_id[:8]}.{name_parts[1]}"
-        else:
-            safe_filename = f"{safe_filename}_{file_id[:8]}"
-        upload_path = user_upload_dir / safe_filename
+    # FIXED: Use file_id in filename to ensure uniqueness
+    # Format: {file_id}_{safe_filename}
+    unique_filename = f"{file_id}_{safe_filename}"
+    upload_path = user_upload_dir / unique_filename
     
     try:
-        # Save file
+        # Save file ONCE
         with upload_path.open("wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
+        
+        logger.info(f"✅ Saved file: {upload_path}")
         
         # Validate file size
         file_size = upload_path.stat().st_size
@@ -118,12 +109,12 @@ async def upload_file(
         }
         file_type_enum = file_type_map.get(file_category, FileType.OTHER)
         
-        # SAVE TO DATABASE
+        # Save to database
         file_metadata = FileMetadata(
             file_id=file_id,
             user_id=user_id,
             original_filename=file.filename,
-            safe_filename=safe_filename,
+            safe_filename=unique_filename,  # Store unique filename
             file_extension=file_extension,
             file_type=file_type_enum,
             file_size_bytes=file_size,
@@ -136,7 +127,7 @@ async def upload_file(
         db.commit()
         db.refresh(file_metadata)
         
-        logger.info(f"✓ File uploaded and saved to DB: {safe_filename} (user: {user_id}, file_id: {file_id})")
+        logger.info(f"✅ Database record created for file_id: {file_id}")
         
         return FileUploadResponse(
             file_id=file_id,
@@ -149,11 +140,9 @@ async def upload_file(
         )
     
     except HTTPException:
-        # Rollback database on validation errors
         db.rollback()
         raise
     except Exception as e:
-        # Rollback database and cleanup file on any error
         db.rollback()
         if upload_path.exists():
             upload_path.unlink()
@@ -164,37 +153,28 @@ async def upload_file(
 @router.post("/process/{file_id}", response_model=DocumentProcessResponse)
 async def process_and_index_document(
     file_id: str,
-    user_id: str = Depends(get_user_id),  # MANDATORY USER AUTH
+    user_id: str = Depends(get_user_id),
     db: Session = Depends(get_database_session)
 ):
     """
-    Process document and index to vector store (REQUIRES X-User-ID header)
+    Process document and index to vector store
     
-    - Extracts content from document
-    - Chunks text semantically
-    - Indexes to vector database
-    - Saves all metadata to SQL database
-    
-    Headers:
-        X-User-ID: User identifier (REQUIRED)
-    
-    Args:
-        file_id: Unique file identifier from upload
-        
-    Returns:
-        DocumentProcessResponse with processing status and statistics
+    FIXED:
+    - No duplicate file saving
+    - Proper image directory isolation
+    - Consistent markdown output location
     """
     
-    # GET FILE METADATA FROM DATABASE (with user isolation)
+    # Get file metadata from database
     file_metadata = db.query(FileMetadata).filter(
         FileMetadata.file_id == file_id,
-        FileMetadata.user_id == user_id  # USER ISOLATION
+        FileMetadata.user_id == user_id
     ).first()
     
     if not file_metadata:
         raise HTTPException(
             status_code=404,
-            detail=f"File not found for ID: {file_id}. Please upload the file first or check user ID."
+            detail=f"File not found for ID: {file_id}"
         )
     
     # Check if already processed
@@ -222,14 +202,14 @@ async def process_and_index_document(
             detail=f"File not found on disk: {file_metadata.safe_filename}"
         )
     
-    # UPDATE STATUS TO PROCESSING
+    # Update status to processing
     file_metadata.status = DBProcessingStatus.PROCESSING
     db.commit()
     
     try:
-        logger.info(f"Processing: {file_metadata.safe_filename} (type: {file_metadata.file_extension}) for user: {user_id}")
+        logger.info(f"📄 Processing: {file_metadata.safe_filename} (type: {file_metadata.file_extension})")
         
-        # Get appropriate extractor using factory
+        # Get extractor (will handle image directory creation internally)
         extractor = ExtractorFactory.get_extractor(
             file_metadata.file_extension,
             config={
@@ -250,7 +230,7 @@ async def process_and_index_document(
         
         logger.info(f"Using extractor: {extractor.__class__.__name__}")
         
-        # Extract text and metadata
+        # Extract (extractor creates its own image directories)
         extracted_text, success, extraction_metadata = extractor.extract(str(file_path))
         
         if not success:
@@ -269,12 +249,12 @@ async def process_and_index_document(
             db.commit()
             raise HTTPException(
                 status_code=422,
-                detail="No content extracted from document. The file may be empty or corrupted."
+                detail="No content extracted from document."
             )
         
-        logger.info(f"✓ Extracted {len(extracted_text)} characters")
+        logger.info(f"✅ Extracted {len(extracted_text)} characters")
         
-        # Save markdown
+        # Save markdown to user-specific directory
         markdown_content = markdown_converter.convert_text_to_markdown(
             extracted_text,
             file_metadata.original_filename,
@@ -292,15 +272,15 @@ async def process_and_index_document(
         )
         
         if markdown_saved:
-            logger.info(f"✓ Saved markdown: {markdown_path.name}")
+            logger.info(f"✅ Saved markdown: {markdown_path.name}")
         
-        # Prepare metadata for chunking (WITH USER_ID)
+        # Prepare metadata for chunking
         chunk_metadata = {
             "file_id": file_id,
             "filename": file_metadata.safe_filename,
             "file_type": file_metadata.file_extension,
             "original_filename": file_metadata.original_filename,
-            "user_id": user_id  # CRITICAL FOR USER ISOLATION
+            "user_id": user_id
         }
         
         # Add extraction metadata
@@ -308,7 +288,7 @@ async def process_and_index_document(
             chunk_metadata['total_pages'] = extraction_metadata['total_pages']
         
         # Count visual elements
-        image_count = extracted_text.count('IMAGE_PATH:')
+        image_count = extracted_text.count('[Image Description]')
         table_count = extracted_text.count('**[TABLE]**') + extracted_text.count('| --- |')
         chart_count = extracted_text.count('**[CHART]**') + extracted_text.count('**[FIGURE]**')
         word_count = len(extracted_text.split())
@@ -336,10 +316,10 @@ async def process_and_index_document(
             db.commit()
             raise HTTPException(
                 status_code=422, 
-                detail="No chunks created. Document may be too short or improperly formatted."
+                detail="No chunks created."
             )
         
-        logger.info(f"✓ Created {len(chunks)} chunks")
+        logger.info(f"✅ Created {len(chunks)} chunks")
         
         # Index to vector store
         logger.info("Indexing to vector store...")
@@ -350,9 +330,9 @@ async def process_and_index_document(
             structured_data=simple_structure
         )
         
-        logger.info(f"✓ Indexed {chunks_added} chunks to vector store")
+        logger.info(f"✅ Indexed {chunks_added} chunks")
         
-        # SAVE CHUNK METADATA TO DATABASE
+        # Save chunk metadata to database
         for chunk in chunks:
             chunk_db = ChunkMetadata(
                 chunk_id=chunk['chunk_id'],
@@ -365,7 +345,7 @@ async def process_and_index_document(
             )
             db.add(chunk_db)
         
-        # UPDATE FILE METADATA WITH RESULTS
+        # Update file metadata with results
         file_metadata.status = DBProcessingStatus.COMPLETED
         file_metadata.processed_at = datetime.utcnow()
         file_metadata.chunks_created = chunks_added
@@ -375,22 +355,21 @@ async def process_and_index_document(
         file_metadata.image_count = image_count
         file_metadata.table_count = table_count
         
-        # Store processing metadata as JSON
+        # Store processing metadata
         processing_meta = {
             'extraction_method': extractor.__class__.__name__,
             'chunks_created': chunks_added,
-            'processing_time': None,  # Could add timing
             'extraction_metadata': extraction_metadata
         }
         file_metadata.processing_metadata = json.dumps(processing_meta)
         
         db.commit()
         
-        logger.info(f"✓ Database updated with processing results")
+        logger.info(f"✅ Processing complete for file_id: {file_id}")
         
         # Build response message
         message_parts = [
-            f"✓ Document '{file_metadata.safe_filename}' processed successfully:",
+            f"✅ Document '{file_metadata.safe_filename}' processed successfully:",
             f"  • Format: {file_metadata.file_extension.upper()}",
             f"  • Chunks indexed: {chunks_added}",
         ]
@@ -400,9 +379,6 @@ async def process_and_index_document(
         
         if image_count > 0:
             message_parts.append(f"  • Images: {image_count}")
-        
-        if chart_count > 0:
-            message_parts.append(f"  • Charts/Figures: {chart_count}")
         
         if 'total_pages' in extraction_metadata:
             message_parts.append(f"  • Pages: {extraction_metadata['total_pages']}")
@@ -426,7 +402,7 @@ async def process_and_index_document(
     except HTTPException:
         raise
     except Exception as e:
-        # UPDATE STATUS TO FAILED
+        # Update status to failed
         file_metadata.status = DBProcessingStatus.FAILED
         file_metadata.error_message = str(e)
         db.commit()
@@ -445,17 +421,8 @@ async def list_uploaded_files(
     user_id: str = Depends(get_user_id),
     db: Session = Depends(get_database_session)
 ):
-    """
-    List all uploaded files for the current user
+    """List all uploaded files for current user"""
     
-    Headers:
-        X-User-ID: User identifier (REQUIRED)
-    
-    Returns:
-        List of uploaded files with metadata
-    """
-    
-    # Query files from database with user isolation
     files = db.query(FileMetadata).filter(
         FileMetadata.user_id == user_id
     ).order_by(
@@ -466,8 +433,8 @@ async def list_uploaded_files(
     for file_meta in files:
         file_list.append({
             "file_id": file_meta.file_id,
-            "filename": file_meta.safe_filename,
-            "original_filename": file_meta.original_filename,
+            "filename": file_meta.original_filename,  # Show original name to user
+            "safe_filename": file_meta.safe_filename,
             "file_type": file_meta.file_extension,
             "file_category": file_meta.file_type.value,
             "size_bytes": file_meta.file_size_bytes,
@@ -493,28 +460,14 @@ async def delete_uploaded_file(
     db: Session = Depends(get_database_session)
 ):
     """
-    Delete an uploaded file (with user isolation)
+    Delete uploaded file and all associated data
     
-    Deletes:
-    - File from disk
-    - Database record
-    - Vector store entries
-    - Chunk metadata
-    
-    Headers:
-        X-User-ID: User identifier (REQUIRED)
-    
-    Args:
-        file_id: File ID to delete
-        
-    Returns:
-        Success message
+    FIXED: Properly cleans up all directories
     """
     
-    # Get file metadata with user isolation
     file_metadata = db.query(FileMetadata).filter(
         FileMetadata.file_id == file_id,
-        FileMetadata.user_id == user_id  # USER ISOLATION
+        FileMetadata.user_id == user_id
     ).first()
     
     if not file_metadata:
@@ -526,28 +479,37 @@ async def delete_uploaded_file(
     try:
         # Delete from vector store
         vector_store.delete_document_by_file_id(file_id, user_id)
-        logger.info(f"✓ Deleted from vector store: {file_id}")
+        logger.info(f"✅ Deleted from vector store: {file_id}")
         
         # Delete file from disk
         file_path = Path(file_metadata.storage_path)
         if file_path.exists():
             file_path.unlink()
-            logger.info(f"✓ Deleted file from disk: {file_path.name}")
+            logger.info(f"✅ Deleted file: {file_path.name}")
         
-        # Delete markdown if exists
+        # Delete extracted images directory
+        # Format: uploads/{user_id}/extracted_images/{doc_stem}/
+        doc_stem = file_path.stem.split('_', 1)[1] if '_' in file_path.stem else file_path.stem
+        images_dir = file_path.parent / "extracted_images" / doc_stem
+        if images_dir.exists():
+            import shutil
+            shutil.rmtree(images_dir)
+            logger.info(f"✅ Deleted images directory: {images_dir}")
+        
+        # Delete markdown
         if file_metadata.markdown_path:
             markdown_path = Path(file_metadata.markdown_path)
             if markdown_path.exists():
                 markdown_path.unlink()
-                logger.info(f"✓ Deleted markdown: {markdown_path.name}")
+                logger.info(f"✅ Deleted markdown: {markdown_path.name}")
         
         # Delete from database (cascades to chunks)
         db.delete(file_metadata)
         db.commit()
-        logger.info(f"✓ Deleted database record: {file_id}")
+        logger.info(f"✅ Deleted database record: {file_id}")
         
         return {
-            "message": f"File '{file_metadata.safe_filename}' and all associated data deleted successfully",
+            "message": f"File and all associated data deleted successfully",
             "file_id": file_id,
             "user_id": user_id
         }
@@ -563,18 +525,10 @@ async def delete_uploaded_file(
 
 @router.get("/supported-formats")
 async def get_supported_formats():
-    """
-    Get list of supported file formats
-    
-    No authentication required for this endpoint.
-    
-    Returns:
-        Dictionary with supported formats and their categories
-    """
+    """Get list of supported file formats"""
     formats = ExtractorFactory.get_supported_formats()
     extractor_info = ExtractorFactory.get_extractor_info()
     
-    # Categorize formats
     categories = {
         'documents': [],
         'presentations': [],

@@ -299,8 +299,6 @@ class Settings(BaseSettings):
             self.upload_dir,
             self.markdown_dir,
             self.chroma_persist_dir,
-            self.upload_dir / "extracted_images",
-            self.log_file_path.parent
         ]
         for directory in directories:
             directory.mkdir(parents=True, exist_ok=True)
