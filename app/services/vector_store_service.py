@@ -281,7 +281,7 @@ class VectorStoreService:
                     'filename': str(metadata.get('filename', filename)),
                     'chunk_type': str(metadata.get('chunk_type', 'text')),
                     'page_number': int(metadata.get('page_number', 0)),
-                    'chunk_index': int(metadata.get('chunk_index', 0)),
+                    'chunk_index': int(chunk.get('chunk_index', metadata.get('chunk_index', 0))),
                     'chunk_id': str(chunk_id),
                     'text': text,
                     'created_at': datetime.utcnow().isoformat()

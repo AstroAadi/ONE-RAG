@@ -1,17 +1,7 @@
 """
 Optimized Markdown-Aware Chunking Service
 ==========================================
-
-Key Optimizations:
-1. Smart heading merging: Merge small heading sections until reaching target size (1500 chars)
-2. Large section splitting: Split oversized sections at semantic boundaries with controlled overlap
-3. Structure preservation: Headings never split from content, overlaps don't duplicate headings
-4. No truncation: All content preserved, respects embedding_max_length (2048 for Cohere)
-
-Integration with vector_store_service:
-- Respects embedding_max_length (chunks stay under 2048 to avoid truncation)
-- Generates unique chunk IDs compatible with Qdrant UUID conversion
-- Maintains all existing metadata structure
+FIXED: Page number assignment now happens during parsing, not after chunking
 """
 
 from typing import List, Dict, Any, Optional, Tuple
@@ -35,12 +25,7 @@ class SemanticChunkingService:
     """
     Optimized Markdown-aware chunking with intelligent heading management
     
-    Strategy:
-    - Parse markdown into sections (heading + its content)
-    - Merge small sections with next section until reaching chunk_size (1500)
-    - Split large sections at paragraph/sentence boundaries with overlap
-    - Never split headings from their content
-    - Overlaps only include content, not headings
+    FIXED: Page numbers are extracted during parsing and tracked through all elements
     """
     
     def __init__(
@@ -80,6 +65,8 @@ class SemanticChunkingService:
         """
         Split markdown into optimized chunks
         
+        FIXED: Page numbers are now tracked from parsing through to final chunks
+        
         Returns:
             List of chunk dictionaries with metadata
         """
@@ -87,7 +74,7 @@ class SemanticChunkingService:
             raise NoChunksCreatedError("Empty markdown text provided")
         
         with PerformanceTimer("chunking_process", log_result=False):
-            # Parse into structural elements
+            # Parse into structural elements WITH PAGE NUMBERS
             elements = self._parse_markdown_structure(markdown_text)
             
             if not elements:
@@ -95,11 +82,11 @@ class SemanticChunkingService:
             
             logger.debug(f"Parsed {len(elements)} elements")
             
-            # Group elements into heading-based sections
+            # Group elements into heading-based sections (preserves page numbers)
             sections = self._group_into_sections(elements)
             logger.debug(f"Grouped into {len(sections)} sections")
             
-            # Create optimized chunks from sections
+            # Create optimized chunks from sections (propagates page numbers)
             chunks = self._create_optimized_chunks(sections, base_metadata)
             
             if not chunks:
@@ -108,7 +95,7 @@ class SemanticChunkingService:
             # Validate all chunks
             self._validate_all_chunks(chunks)
             
-            # Add structured data references
+            # Add structured data references (NO page number extraction here)
             chunks = self._add_structured_references(chunks, structured_data)
             
             logger.info(
@@ -121,10 +108,18 @@ class SemanticChunkingService:
         return chunks
     
     def _parse_markdown_structure(self, text: str) -> List[Dict[str, Any]]:
-        """Parse markdown into structural elements (same as original)"""
+        """
+        Parse markdown into structural elements
+        
+        FIXED: Now extracts and tracks page numbers during parsing
+        """
         elements = []
         lines = text.split('\n')
         i = 0
+        
+        # Track current page number as we parse
+        current_page_number = 0
+        current_slide_number = 0
         
         while i < len(lines):
             line = lines[i]
@@ -134,25 +129,39 @@ class SemanticChunkingService:
                 i += 1
                 continue
             
+            # CRITICAL: Page/Slide marker detection - UPDATE CURRENT PAGE
+            if re.match(r'^##\s+(Page|Slide)\s+(\d+)', line_stripped, re.IGNORECASE):
+                marker_match = re.match(r'^##\s+(Page|Slide)\s+(\d+)', line_stripped, re.IGNORECASE)
+                marker_type = marker_match.group(1).lower()
+                marker_number = int(marker_match.group(2))
+                
+                if marker_type == 'page':
+                    current_page_number = marker_number
+                elif marker_type == 'slide':
+                    current_slide_number = marker_number
+                    # For presentations, page_number = slide_number
+                    current_page_number = marker_number
+                
+                elements.append({
+                    'type': 'page_marker',
+                    'content': line,
+                    'atomic': False,
+                    'page_number': current_page_number,  # FIXED: Add page number
+                    'slide_number': current_slide_number if current_slide_number > 0 else None
+                })
+                i += 1
+                continue
+            
             # Code block (atomic)
             if line_stripped.startswith('```'):
                 code_block, end_idx = self._extract_code_block(lines, i)
                 elements.append({
                     'type': 'code_block',
                     'content': code_block,
-                    'atomic': True
+                    'atomic': True,
+                    'page_number': current_page_number  # FIXED: Add page number
                 })
                 i = end_idx + 1
-                continue
-            
-            # Page/Slide marker
-            if re.match(r'^##\s+(Page|Slide)\s+\d+', line_stripped, re.IGNORECASE):
-                elements.append({
-                    'type': 'page_marker',
-                    'content': line,
-                    'atomic': False
-                })
-                i += 1
                 continue
             
             # Heading
@@ -164,7 +173,8 @@ class SemanticChunkingService:
                         'type': 'heading',
                         'content': line,
                         'level': level,
-                        'atomic': False
+                        'atomic': False,
+                        'page_number': current_page_number  # FIXED: Add page number
                     })
                     i += 1
                     continue
@@ -175,7 +185,8 @@ class SemanticChunkingService:
                 elements.append({
                     'type': 'table',
                     'content': table,
-                    'atomic': True
+                    'atomic': True,
+                    'page_number': current_page_number  # FIXED: Add page number
                 })
                 i = end_idx + 1
                 continue
@@ -186,7 +197,8 @@ class SemanticChunkingService:
                 elements.append({
                     'type': 'list',
                     'content': list_block,
-                    'atomic': False
+                    'atomic': False,
+                    'page_number': current_page_number  # FIXED: Add page number
                 })
                 i = end_idx + 1
                 continue
@@ -197,7 +209,8 @@ class SemanticChunkingService:
                 elements.append({
                     'type': 'image_desc',
                     'content': img_block,
-                    'atomic': False
+                    'atomic': False,
+                    'page_number': current_page_number  # FIXED: Add page number
                 })
                 i = end_idx + 1
                 continue
@@ -208,7 +221,8 @@ class SemanticChunkingService:
                 elements.append({
                     'type': 'paragraph',
                     'content': para,
-                    'atomic': False
+                    'atomic': False,
+                    'page_number': current_page_number  # FIXED: Add page number
                 })
             i = end_idx + 1
         
@@ -218,8 +232,7 @@ class SemanticChunkingService:
         """
         Group elements into sections (heading + its content)
         
-        Returns:
-            List of sections, each containing: {heading, content_elements, size}
+        FIXED: Now tracks page numbers and page ranges for each section
         """
         sections = []
         current_heading = None
@@ -229,11 +242,8 @@ class SemanticChunkingService:
             if element['type'] == 'heading':
                 # Save previous section
                 if current_heading is not None or current_content:
-                    sections.append({
-                        'heading': current_heading,
-                        'content_elements': current_content,
-                        'size': self._calculate_section_size(current_heading, current_content)
-                    })
+                    section = self._create_section(current_heading, current_content)
+                    sections.append(section)
                 
                 # Start new section
                 current_heading = element
@@ -244,13 +254,50 @@ class SemanticChunkingService:
         
         # Add final section
         if current_heading is not None or current_content:
-            sections.append({
-                'heading': current_heading,
-                'content_elements': current_content,
-                'size': self._calculate_section_size(current_heading, current_content)
-            })
+            section = self._create_section(current_heading, current_content)
+            sections.append(section)
         
         return sections
+    
+    def _create_section(
+        self,
+        heading: Optional[Dict[str, Any]],
+        content_elements: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """
+        Create section with page number tracking
+        
+        FIXED: Calculates page range for the section
+        """
+        size = self._calculate_section_size(heading, content_elements)
+        
+        # Calculate page range for this section
+        page_numbers = set()
+        
+        if heading and heading.get('page_number', 0) > 0:
+            page_numbers.add(heading['page_number'])
+        
+        for elem in content_elements:
+            if elem.get('page_number', 0) > 0:
+                page_numbers.add(elem['page_number'])
+        
+        # Determine page range
+        if page_numbers:
+            min_page = min(page_numbers)
+            max_page = max(page_numbers)
+            page_range = [min_page, max_page]
+            primary_page = min_page  # Use first page as primary
+        else:
+            page_range = [0, 0]
+            primary_page = 0
+        
+        return {
+            'heading': heading,
+            'content_elements': content_elements,
+            'size': size,
+            'page_range': page_range,  # FIXED: Track page range
+            'primary_page': primary_page  # FIXED: Track primary page
+        }
     
     def _calculate_section_size(
         self, 
@@ -273,10 +320,7 @@ class SemanticChunkingService:
         """
         Create optimized chunks from sections
         
-        Strategy:
-        1. Merge small sections until reaching chunk_size (1500)
-        2. Split large sections at semantic boundaries
-        3. Add controlled overlap between chunks (content only, no headings)
+        FIXED: Propagates page numbers from sections to chunks
         """
         chunks = []
         chunk_index = 0
@@ -288,15 +332,21 @@ class SemanticChunkingService:
             # Case 1: Section is small - try to merge with next sections
             if section['size'] < self.chunk_size:
                 merged_chunk = self._merge_small_sections(sections, i)
-                chunks.append(self._create_chunk_dict(
-                    merged_chunk['text'], chunk_index, base_metadata
-                ))
+                chunk_dict = self._create_chunk_dict(
+                    merged_chunk['text'], 
+                    chunk_index, 
+                    base_metadata,
+                    page_info=merged_chunk['page_info']  # FIXED: Pass page info
+                )
+                chunks.append(chunk_dict)
                 chunk_index += 1
                 i = merged_chunk['next_index']
             
             # Case 2: Section is large - split it
             elif section['size'] > self.chunk_size:
-                section_chunks = self._split_large_section(section, chunk_index, base_metadata)
+                section_chunks = self._split_large_section(
+                    section, chunk_index, base_metadata
+                )
                 chunks.extend(section_chunks)
                 chunk_index += len(section_chunks)
                 i += 1
@@ -304,9 +354,16 @@ class SemanticChunkingService:
             # Case 3: Section fits perfectly
             else:
                 text = self._section_to_text(section)
-                chunks.append(self._create_chunk_dict(
-                    text, chunk_index, base_metadata
-                ))
+                chunk_dict = self._create_chunk_dict(
+                    text, 
+                    chunk_index, 
+                    base_metadata,
+                    page_info={
+                        'page_number': section['primary_page'],
+                        'page_range': section['page_range']
+                    }
+                )
+                chunks.append(chunk_dict)
                 chunk_index += 1
                 i += 1
         
@@ -323,12 +380,14 @@ class SemanticChunkingService:
         """
         Merge small sections until reaching chunk_size or max_chunk_size
         
-        Returns:
-            {text: merged_text, next_index: index_of_next_unprocessed_section}
+        FIXED: Tracks page range across merged sections
         """
         merged_parts = []
         total_size = 0
         i = start_idx
+        
+        # Track page numbers from all merged sections
+        all_page_numbers = set()
         
         while i < len(sections):
             section = sections[i]
@@ -339,11 +398,17 @@ class SemanticChunkingService:
                 # If we haven't added anything yet, we must add this one
                 if not merged_parts:
                     merged_parts.append(self._section_to_text(section))
+                    all_page_numbers.update(
+                        p for p in section['page_range'] if p > 0
+                    )
                     i += 1
                 break
             
             # Add section
             merged_parts.append(self._section_to_text(section))
+            all_page_numbers.update(
+                p for p in section['page_range'] if p > 0
+            )
             total_size += section_size
             i += 1
             
@@ -353,13 +418,30 @@ class SemanticChunkingService:
                 if i < len(sections) and sections[i]['size'] < 200:
                     if total_size + sections[i]['size'] <= self.max_chunk_size:
                         merged_parts.append(self._section_to_text(sections[i]))
+                        all_page_numbers.update(
+                            p for p in sections[i]['page_range'] if p > 0
+                        )
                         total_size += sections[i]['size']
                         i += 1
                 break
         
+        # Calculate page info for merged chunk
+        if all_page_numbers:
+            page_list = sorted(all_page_numbers)
+            page_info = {
+                'page_number': page_list[0],  # Use first page as primary
+                'page_range': [page_list[0], page_list[-1]]
+            }
+        else:
+            page_info = {
+                'page_number': 0,
+                'page_range': [0, 0]
+            }
+        
         return {
             'text': '\n\n'.join(merged_parts),
-            'next_index': i
+            'next_index': i,
+            'page_info': page_info  # FIXED: Include page info
         }
     
     def _split_large_section(
@@ -371,14 +453,12 @@ class SemanticChunkingService:
         """
         Split large section into multiple chunks at semantic boundaries
         
-        Semantic boundaries (in order of preference):
-        1. Paragraphs (best for context)
-        2. Sentences (fallback)
-        
-        Heading is always kept with first chunk
+        FIXED: Propagates page numbers to split chunks
         """
         heading = section['heading']
         content_elements = section['content_elements']
+        section_page_range = section['page_range']
+        section_primary_page = section['primary_page']
         
         chunks = []
         chunk_index = start_chunk_index
@@ -390,34 +470,51 @@ class SemanticChunkingService:
         # Process content elements
         current_chunk_parts = [heading_text] if heading_text else []
         current_size = heading_size
+        current_chunk_pages = set()
+        
+        if heading and heading.get('page_number', 0) > 0:
+            current_chunk_pages.add(heading['page_number'])
         
         for elem in content_elements:
             elem_text = elem['content']
             elem_size = len(elem_text) + 2
+            elem_page = elem.get('page_number', 0)
             
             # Element alone exceeds max size - must split it
             if elem_size > self.max_chunk_size:
                 # Save current chunk if it has content
                 if len(current_chunk_parts) > (1 if heading_text else 0):
+                    page_info = self._calculate_page_info(current_chunk_pages, section_primary_page)
                     chunks.append(self._create_chunk_dict(
-                        '\n\n'.join(current_chunk_parts), chunk_index, base_metadata
+                        '\n\n'.join(current_chunk_parts), 
+                        chunk_index, 
+                        base_metadata,
+                        page_info=page_info
                     ))
                     chunk_index += 1
                     current_chunk_parts = []
                     current_size = 0
+                    current_chunk_pages = set()
                 
                 # Split the element itself
                 if elem['atomic']:
                     # Atomic elements - can't split, create as-is (will exceed limit)
                     logger.warning(f"Atomic {elem['type']} exceeds max_chunk_size ({elem_size})")
+                    page_info = self._calculate_page_info({elem_page} if elem_page > 0 else set(), section_primary_page)
                     chunks.append(self._create_chunk_dict(
-                        elem_text, chunk_index, base_metadata
+                        elem_text, 
+                        chunk_index, 
+                        base_metadata,
+                        page_info=page_info
                     ))
                     chunk_index += 1
                 else:
                     # Non-atomic - split by paragraphs/sentences
                     elem_chunks = self._split_text_content(
-                        elem_text, chunk_index, base_metadata
+                        elem_text, 
+                        chunk_index, 
+                        base_metadata,
+                        elem_page  # FIXED: Pass element's page number
                     )
                     chunks.extend(elem_chunks)
                     chunk_index += len(elem_chunks)
@@ -428,37 +525,53 @@ class SemanticChunkingService:
             if current_size + elem_size > self.max_chunk_size:
                 # Save current chunk
                 if current_chunk_parts:
+                    page_info = self._calculate_page_info(current_chunk_pages, section_primary_page)
                     chunks.append(self._create_chunk_dict(
-                        '\n\n'.join(current_chunk_parts), chunk_index, base_metadata
+                        '\n\n'.join(current_chunk_parts), 
+                        chunk_index, 
+                        base_metadata,
+                        page_info=page_info
                     ))
                     chunk_index += 1
                 
                 # Start new chunk (no heading in subsequent chunks)
                 current_chunk_parts = [elem_text]
                 current_size = elem_size
+                current_chunk_pages = {elem_page} if elem_page > 0 else set()
             
             # Would adding exceed target size? (but not max)
             elif current_size + elem_size > self.chunk_size:
                 # Save current chunk
                 if current_chunk_parts:
+                    page_info = self._calculate_page_info(current_chunk_pages, section_primary_page)
                     chunks.append(self._create_chunk_dict(
-                        '\n\n'.join(current_chunk_parts), chunk_index, base_metadata
+                        '\n\n'.join(current_chunk_parts), 
+                        chunk_index, 
+                        base_metadata,
+                        page_info=page_info
                     ))
                     chunk_index += 1
                 
                 # Start new chunk
                 current_chunk_parts = [elem_text]
                 current_size = elem_size
+                current_chunk_pages = {elem_page} if elem_page > 0 else set()
             
             # Fits fine
             else:
                 current_chunk_parts.append(elem_text)
                 current_size += elem_size
+                if elem_page > 0:
+                    current_chunk_pages.add(elem_page)
         
         # Add final chunk
         if current_chunk_parts:
+            page_info = self._calculate_page_info(current_chunk_pages, section_primary_page)
             chunks.append(self._create_chunk_dict(
-                '\n\n'.join(current_chunk_parts), chunk_index, base_metadata
+                '\n\n'.join(current_chunk_parts), 
+                chunk_index, 
+                base_metadata,
+                page_info=page_info
             ))
         
         return chunks
@@ -467,12 +580,13 @@ class SemanticChunkingService:
         self,
         text: str,
         start_chunk_index: int,
-        base_metadata: Optional[Dict[str, Any]]
+        base_metadata: Optional[Dict[str, Any]],
+        element_page: int = 0  # FIXED: Add page number parameter
     ) -> List[Dict[str, Any]]:
         """
         Split large text at paragraph/sentence boundaries
         
-        No heading duplication - pure content splitting
+        FIXED: Propagates page number to split text chunks
         """
         chunks = []
         chunk_index = start_chunk_index
@@ -493,15 +607,19 @@ class SemanticChunkingService:
             if para_size > self.max_chunk_size:
                 # Save current chunk if exists
                 if current_chunk:
+                    page_info = {'page_number': element_page, 'page_range': [element_page, element_page]}
                     chunks.append(self._create_chunk_dict(
-                        current_chunk.strip(), chunk_index, base_metadata
+                        current_chunk.strip(), 
+                        chunk_index, 
+                        base_metadata,
+                        page_info=page_info
                     ))
                     chunk_index += 1
                     current_chunk = ""
                 
                 # Split paragraph by sentences
                 sentence_chunks = self._split_by_sentences(
-                    para, chunk_index, base_metadata
+                    para, chunk_index, base_metadata, element_page
                 )
                 chunks.extend(sentence_chunks)
                 chunk_index += len(sentence_chunks)
@@ -510,8 +628,12 @@ class SemanticChunkingService:
             # Would adding this paragraph exceed max size?
             if len(current_chunk) + para_size > self.max_chunk_size:
                 if current_chunk:
+                    page_info = {'page_number': element_page, 'page_range': [element_page, element_page]}
                     chunks.append(self._create_chunk_dict(
-                        current_chunk.strip(), chunk_index, base_metadata
+                        current_chunk.strip(), 
+                        chunk_index, 
+                        base_metadata,
+                        page_info=page_info
                     ))
                     chunk_index += 1
                 current_chunk = para
@@ -519,8 +641,12 @@ class SemanticChunkingService:
             # Would adding exceed target size?
             elif len(current_chunk) + para_size > self.chunk_size:
                 if current_chunk:
+                    page_info = {'page_number': element_page, 'page_range': [element_page, element_page]}
                     chunks.append(self._create_chunk_dict(
-                        current_chunk.strip(), chunk_index, base_metadata
+                        current_chunk.strip(), 
+                        chunk_index, 
+                        base_metadata,
+                        page_info=page_info
                     ))
                     chunk_index += 1
                 current_chunk = para
@@ -531,8 +657,12 @@ class SemanticChunkingService:
         
         # Add final chunk
         if current_chunk:
+            page_info = {'page_number': element_page, 'page_range': [element_page, element_page]}
             chunks.append(self._create_chunk_dict(
-                current_chunk.strip(), chunk_index, base_metadata
+                current_chunk.strip(), 
+                chunk_index, 
+                base_metadata,
+                page_info=page_info
             ))
         
         return chunks
@@ -541,9 +671,14 @@ class SemanticChunkingService:
         self,
         text: str,
         start_chunk_index: int,
-        base_metadata: Optional[Dict[str, Any]]
+        base_metadata: Optional[Dict[str, Any]],
+        element_page: int = 0  # FIXED: Add page number parameter
     ) -> List[Dict[str, Any]]:
-        """Split text by sentences as last resort"""
+        """
+        Split text by sentences as last resort
+        
+        FIXED: Propagates page number to sentence-split chunks
+        """
         chunks = []
         chunk_index = start_chunk_index
         
@@ -558,13 +693,21 @@ class SemanticChunkingService:
             # Single sentence exceeds max size - must include it anyway
             if sentence_size > self.max_chunk_size:
                 if current_chunk:
+                    page_info = {'page_number': element_page, 'page_range': [element_page, element_page]}
                     chunks.append(self._create_chunk_dict(
-                        current_chunk.strip(), chunk_index, base_metadata
+                        current_chunk.strip(), 
+                        chunk_index, 
+                        base_metadata,
+                        page_info=page_info
                     ))
                     chunk_index += 1
                 
+                page_info = {'page_number': element_page, 'page_range': [element_page, element_page]}
                 chunks.append(self._create_chunk_dict(
-                    sentence.strip(), chunk_index, base_metadata
+                    sentence.strip(), 
+                    chunk_index, 
+                    base_metadata,
+                    page_info=page_info
                 ))
                 chunk_index += 1
                 current_chunk = ""
@@ -573,8 +716,12 @@ class SemanticChunkingService:
             # Would adding exceed max size?
             if len(current_chunk) + sentence_size > self.max_chunk_size:
                 if current_chunk:
+                    page_info = {'page_number': element_page, 'page_range': [element_page, element_page]}
                     chunks.append(self._create_chunk_dict(
-                        current_chunk.strip(), chunk_index, base_metadata
+                        current_chunk.strip(), 
+                        chunk_index, 
+                        base_metadata,
+                        page_info=page_info
                     ))
                     chunk_index += 1
                 current_chunk = sentence
@@ -582,8 +729,12 @@ class SemanticChunkingService:
             # Would adding exceed target size?
             elif len(current_chunk) + sentence_size > self.chunk_size:
                 if current_chunk:
+                    page_info = {'page_number': element_page, 'page_range': [element_page, element_page]}
                     chunks.append(self._create_chunk_dict(
-                        current_chunk.strip(), chunk_index, base_metadata
+                        current_chunk.strip(), 
+                        chunk_index, 
+                        base_metadata,
+                        page_info=page_info
                     ))
                     chunk_index += 1
                 current_chunk = sentence
@@ -594,11 +745,38 @@ class SemanticChunkingService:
         
         # Add final chunk
         if current_chunk:
+            page_info = {'page_number': element_page, 'page_range': [element_page, element_page]}
             chunks.append(self._create_chunk_dict(
-                current_chunk.strip(), chunk_index, base_metadata
+                current_chunk.strip(), 
+                chunk_index, 
+                base_metadata,
+                page_info=page_info
             ))
         
         return chunks
+    
+    def _calculate_page_info(self, page_set: set, fallback_page: int) -> Dict[str, Any]:
+        """
+        Calculate page_number and page_range from a set of page numbers
+        
+        Args:
+            page_set: Set of page numbers in the chunk
+            fallback_page: Page to use if set is empty
+            
+        Returns:
+            Dict with page_number and page_range
+        """
+        if page_set:
+            page_list = sorted(page_set)
+            return {
+                'page_number': page_list[0],
+                'page_range': [page_list[0], page_list[-1]]
+            }
+        else:
+            return {
+                'page_number': fallback_page,
+                'page_range': [fallback_page, fallback_page]
+            }
     
     def _add_content_overlap(
         self,
@@ -670,7 +848,7 @@ class SemanticChunkingService:
         
         return '\n\n'.join(parts)
     
-    # ==================== Helper Methods (same as original) ====================
+    # ==================== Helper Methods ====================
     
     def _extract_code_block(self, lines: List[str], start_idx: int) -> Tuple[str, int]:
         """Extract code block with safety limit"""
@@ -678,7 +856,6 @@ class SemanticChunkingService:
         i = start_idx + 1
         max_lines = 500
         lines_read = 0
-        
         while i < len(lines) and lines_read < max_lines:
             code_lines.append(lines[i])
             if lines[i].strip().startswith('```'):
@@ -691,7 +868,6 @@ class SemanticChunkingService:
             code_lines.append('```')
         
         return '\n'.join(code_lines), min(i, len(lines) - 1)
-    
     def _extract_table(self, lines: List[str], start_idx: int) -> Tuple[str, int]:
         """Extract markdown table"""
         table_lines = []
@@ -708,7 +884,7 @@ class SemanticChunkingService:
                 break
         
         return '\n'.join(table_lines), i - 1
-    
+
     def _extract_list(self, lines: List[str], start_idx: int) -> Tuple[str, int]:
         """Extract list block"""
         list_lines = []
@@ -729,7 +905,7 @@ class SemanticChunkingService:
                 break
         
         return '\n'.join(list_lines), i - 1
-    
+
     def _extract_image_block(self, lines: List[str], start_idx: int) -> Tuple[str, int]:
         """Extract image description block"""
         img_lines = []
@@ -751,7 +927,7 @@ class SemanticChunkingService:
                     break
         
         return '\n'.join(img_lines), i - 1
-    
+
     def _extract_paragraph(self, lines: List[str], start_idx: int) -> Tuple[str, int]:
         """Extract paragraph"""
         para_lines = []
@@ -772,7 +948,7 @@ class SemanticChunkingService:
             i += 1
         
         return '\n'.join(para_lines), i - 1
-    
+
     def _is_table_row(self, line: str) -> bool:
         """Check if line is table row"""
         if '|' not in line:
@@ -783,11 +959,11 @@ class SemanticChunkingService:
         if all(re.match(r'^:?-+:?$', p) for p in parts if p):
             return True
         return len([p for p in parts if p]) >= 2
-    
+
     def _is_list_item(self, line: str) -> bool:
         """Check if line is list item"""
         return bool(re.match(r'^(\*|-|\+|\d+\.)\s+', line))
-    
+
     def _generate_chunk_id(
         self, 
         text: str, 
@@ -806,25 +982,37 @@ class SemanticChunkingService:
         timestamp = str(int(time.time() * 1000))[-6:]
         
         return f"chunk_{index}_{content_hash}_{timestamp}"
-    
+
     def _create_chunk_dict(
-        self,
-        text: str,
-        chunk_index: int,
-        base_metadata: Optional[Dict[str, Any]]
-    ) -> Dict[str, Any]:
-        """Create chunk dictionary"""
+    self,
+    text: str,
+    chunk_index: int,
+    base_metadata: Optional[Dict[str, Any]],
+    page_info: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
         file_id = base_metadata.get('file_id') if base_metadata else None
         chunk_id = self._generate_chunk_id(text, chunk_index, file_id)
         
+        metadata = dict(base_metadata) if base_metadata else {}
+        
+        # Add page information
+        if page_info:
+            metadata['page_number'] = page_info.get('page_number', 0)
+            metadata['page_range'] = page_info.get('page_range', [0, 0])
+        else:
+            metadata['page_number'] = 0
+            metadata['page_range'] = [0, 0]
+        
+        # CRITICAL FIX: Store chunk_index in BOTH places
+        metadata['chunk_index'] = chunk_index
+        
         return {
             'chunk_id': chunk_id,
-            'chunk_index': chunk_index,
+            'chunk_index': chunk_index,  # ← Top level (for backward compatibility)
             'text': text,
             'char_count': len(text),
-            'metadata': base_metadata or {}
+            'metadata': metadata  # ← Also in metadata (for vector store)
         }
-    
     def _validate_all_chunks(self, chunks: List[Dict[str, Any]]) -> None:
         """Validate all chunks"""
         for i, chunk in enumerate(chunks):
@@ -839,58 +1027,35 @@ class SemanticChunkingService:
             
             if char_count == 0:
                 logger.warning(f"Chunk {i} is empty")
-    
+
     def _add_structured_references(
-    self,
-    chunks: List[Dict[str, Any]],
-    structured_data: Dict[str, Any]
-) -> List[Dict[str, Any]]:
+        self,
+        chunks: List[Dict[str, Any]],
+        structured_data: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
         """
-        Add structured data references with ROBUST page_number extraction
+        Add structured data references
         
-        CRITICAL FIX:
-        1. Remove all confusing fields (total_pages, total_slides) 
-        2. Extract page_number from markdown text (e.g., "## Page 3" -> 3)
-        3. Extract slide_number from markdown text (e.g., "## Slide 5" -> 5)
-        4. For PPTs, ensure page_number = slide_number
-        5. Default to 0 if no marker found
-        
-        This ensures page_number is always the ACTUAL page, never total_pages
+        This function now only adds section hierarchy for context
         """
         for chunk in chunks:
-            # STEP 1: Remove all potentially confusing fields
-            # These should NEVER be in chunk metadata as they can be confused with page_number
-            confusing_fields = ['total_pages', 'total_slides', 'num_pages', 'page_count']
-            for field in confusing_fields:
-                chunk['metadata'].pop(field, None)  # Safe deletion (no error if not present)
+            # CRITICAL: DO NOT touch page_number - it's already correct
+            # Just verify it exists and log for debugging
+            page_num = chunk['metadata'].get('page_number', -1)
+            page_range = chunk['metadata'].get('page_range', [-1, -1])
             
-            # STEP 2: Extract actual page number from markdown headers in chunk text
-            # This is the SOURCE OF TRUTH for page_number
-            page_match = re.search(r'##\s+Page\s+(\d+)', chunk['text'], re.IGNORECASE)
-            if page_match:
-                actual_page_number = int(page_match.group(1))
-                chunk['metadata']['page_number'] = actual_page_number
-                logger.debug(f"Chunk {chunk.get('chunk_index', '?')}: Found page marker -> page_number={actual_page_number}")
+            if page_num == -1:
+                logger.warning(
+                    f"Chunk {chunk.get('chunk_index', '?')} missing page_number - "
+                    f"this should not happen!"
+                )
+            else:
+                logger.debug(
+                    f"Chunk {chunk.get('chunk_index', '?')}: "
+                    f"page_number={page_num}, page_range={page_range}"
+                )
             
-            # STEP 3: Extract slide number from markdown headers
-            slide_match = re.search(r'##\s+Slide\s+(\d+)', chunk['text'], re.IGNORECASE)
-            if slide_match:
-                actual_slide_number = int(slide_match.group(1))
-                chunk['metadata']['slide_number'] = actual_slide_number
-                
-                # For PowerPoint files, page_number should equal slide_number
-                # Only set if page_number wasn't already set by a "## Page" marker
-                if 'page_number' not in chunk['metadata']:
-                    chunk['metadata']['page_number'] = actual_slide_number
-                    logger.debug(f"Chunk {chunk.get('chunk_index', '?')}: Found slide marker -> page_number={actual_slide_number}")
-            
-            # STEP 4: Default to 0 if no page or slide marker found
-            # This is better than None as it's a valid integer for filtering
-            if 'page_number' not in chunk['metadata']:
-                chunk['metadata']['page_number'] = 0
-                logger.debug(f"Chunk {chunk.get('chunk_index', '?')}: No page marker found -> page_number=0 (default)")
-            
-            # STEP 5: Extract section hierarchy (for context)
+            # Extract section hierarchy for context (optional enhancement)
             section_matches = re.findall(r'^(#{1,6})\s+(.+)$', chunk['text'], re.MULTILINE)
             if section_matches:
                 # Get up to 3 heading levels
@@ -904,57 +1069,3 @@ class SemanticChunkingService:
                     chunk['metadata']['section_hierarchy'] = section_hierarchy
         
         return chunks
-
-
-    # VERIFICATION FUNCTION - Add this to help debug
-    def verify_page_numbers(chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Verify that page_number metadata is correctly set
-        
-        Returns summary statistics for debugging
-        """
-        stats = {
-            'total_chunks': len(chunks),
-            'chunks_with_page_marker': 0,
-            'chunks_with_slide_marker': 0,
-            'chunks_with_page_number_0': 0,
-            'page_numbers': [],
-            'unique_pages': set(),
-            'issues': []
-        }
-        
-        for i, chunk in enumerate(chunks):
-            page_num = chunk['metadata'].get('page_number', None)
-            
-            if page_num is None:
-                stats['issues'].append(f"Chunk {i}: page_number is None")
-                continue
-            
-            stats['page_numbers'].append(page_num)
-            stats['unique_pages'].add(page_num)
-            
-            # Check if chunk has page marker in text
-            if re.search(r'##\s+Page\s+\d+', chunk['text'], re.IGNORECASE):
-                stats['chunks_with_page_marker'] += 1
-            
-            # Check if chunk has slide marker in text
-            if re.search(r'##\s+Slide\s+\d+', chunk['text'], re.IGNORECASE):
-                stats['chunks_with_slide_marker'] += 1
-            
-            # Count default page_number=0
-            if page_num == 0:
-                stats['chunks_with_page_number_0'] += 1
-            
-            # Check for suspicious values (e.g., page_number > 1000 suggests it's total_pages)
-            if page_num > 1000:
-                stats['issues'].append(
-                    f"Chunk {i}: Suspicious page_number={page_num} (might be total_pages!)"
-                )
-        
-        # Calculate statistics
-        if stats['page_numbers']:
-            stats['min_page'] = min(stats['page_numbers'])
-            stats['max_page'] = max(stats['page_numbers'])
-            stats['unique_page_count'] = len(stats['unique_pages'])
-        
-        return stats
