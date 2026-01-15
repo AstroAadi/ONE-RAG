@@ -1,5 +1,5 @@
 """
-Centralized Configuration for RAG System
+Centralized Configuration for RAG System - UPDATED FOR QDRANT CLOUD
 All configuration in one place with proper validation and type safety
 """
 
@@ -9,8 +9,12 @@ from pathlib import Path
 from typing import Literal
 from dotenv import load_dotenv
 import os
+import logging
 
 load_dotenv()
+
+# Get logger for validation warnings
+logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -38,6 +42,14 @@ class Settings(BaseSettings):
     embedding_model_id: str = Field(
         default="cohere.embed-english-v3",
         description="Embedding model ID"
+    )
+    
+    # Embedding model limits (characters, not tokens)
+    embedding_max_length: int = Field(
+        default=2048,
+        ge=512,
+        le=8192,
+        description="Max characters for embedding model (Cohere v3: 2048, Amazon Titan: 8192)"
     )
     
     bedrock_vision_model_id: str = Field(
@@ -93,14 +105,36 @@ class Settings(BaseSettings):
         description="Max filename length"
     )
     
-    # ==================== ChromaDB Configuration ====================
+    # ==================== QDRANT CLOUD CONFIGURATION (NEW) ====================
+    qdrant_url: str = Field(
+        default="",
+        description="Qdrant Cloud cluster URL (e.g., https://xxx.cloud.qdrant.io)"
+    )
+    qdrant_api_key: str = Field(
+        default="",
+        description="Qdrant Cloud API key"
+    )
+    qdrant_collection_name: str = Field(
+        default="rag_documents",
+        description="Qdrant collection name"
+    )
+    
+    @field_validator('qdrant_url')
+    @classmethod
+    def validate_qdrant_url(cls, v: str) -> str:
+        """Ensure Qdrant URL is properly formatted"""
+        if v and not v.startswith(('http://', 'https://')):
+            raise ValueError("qdrant_url must start with http:// or https://")
+        return v
+    
+    # ==================== ChromaDB Configuration (DEPRECATED - Keep for migration) ====================
     chroma_persist_dir: Path = Field(
         default=Path("./chroma_db"),
-        description="ChromaDB persistence directory"
+        description="ChromaDB persistence directory (DEPRECATED)"
     )
     chroma_collection_name: str = Field(
         default="rag_documents",
-        description="Default ChromaDB collection name"
+        description="Default ChromaDB collection name (DEPRECATED)"
     )
     
     # ==================== Chunking Configuration ====================
@@ -108,7 +142,7 @@ class Settings(BaseSettings):
         default=1500,
         ge=100,
         le=8000,
-        description="Target chunk size in characters"
+        description="Target chunk size in characters (keep below embedding_max_length)"
     )
     chunk_overlap: int = Field(
         default=200,
@@ -117,11 +151,23 @@ class Settings(BaseSettings):
         description="Overlap between chunks"
     )
     max_chunk_size: int = Field(
-        default=6000,
+        default=2000,  # Changed from 6000 to respect Cohere's 2048 limit
         ge=1000,
         le=10000,
-        description="Maximum chunk size (hard limit)"
+        description="Maximum chunk size (hard limit) - should be <= embedding_max_length"
     )
+    
+    @field_validator('max_chunk_size')
+    @classmethod
+    def validate_chunk_vs_embedding(cls, v: int, info) -> int:
+        """Ensure max_chunk_size doesn't exceed embedding limit"""
+        embedding_max = info.data.get('embedding_max_length', 2048)
+        if v > embedding_max:
+            logger.warning(
+                f"max_chunk_size ({v}) exceeds embedding_max_length ({embedding_max}). "
+                f"Texts will be truncated during embedding."
+            )
+        return v
     
     @field_validator('chunk_overlap')
     @classmethod
@@ -298,7 +344,7 @@ class Settings(BaseSettings):
         directories = [
             self.upload_dir,
             self.markdown_dir,
-            self.chroma_persist_dir,
+            # self.chroma_persist_dir,  # Keep for migration
         ]
         for directory in directories:
             directory.mkdir(parents=True, exist_ok=True)
@@ -310,7 +356,7 @@ class Settings(BaseSettings):
     
     def get_chroma_settings(self) -> dict:
         """
-        Get ChromaDB settings with proper type conversion
+        Get ChromaDB settings (DEPRECATED - keep for migration)
         
         Returns:
             Dictionary with ChromaDB configuration
@@ -319,10 +365,10 @@ class Settings(BaseSettings):
         self.chroma_persist_dir.mkdir(parents=True, exist_ok=True)
         
         return {
-            "persist_directory": str(self.chroma_persist_dir.absolute()),  # ← Convert to absolute string path
+            "persist_directory": str(self.chroma_persist_dir.absolute()),
             "allow_reset": True
-            
         }
+    
     def validate_configuration(self) -> tuple[bool, list[str]]:
         """
         Validate configuration and return warnings
@@ -346,6 +392,14 @@ class Settings(BaseSettings):
         
         if not self.embedding_model_id:
             warnings.append("EMBEDDING_MODEL_ID not set")
+            is_valid = False
+        
+        # Check Qdrant configuration
+        if not self.qdrant_url:
+            warnings.append("QDRANT_URL not set - using ChromaDB (deprecated)")
+        
+        if not self.qdrant_api_key and self.qdrant_url:
+            warnings.append("QDRANT_API_KEY not set but URL provided")
             is_valid = False
         
         # Check chunk size consistency
@@ -394,7 +448,7 @@ def print_configuration_summary():
     is_valid, warnings = settings.validate_configuration()
     
     print("\n" + "="*60)
-    print("RAG SYSTEM CONFIGURATION")
+    print("RAG SYSTEM CONFIGURATION - QDRANT CLOUD")
     print("="*60)
     
     print(f"\n📊 Models:")
@@ -414,7 +468,10 @@ def print_configuration_summary():
     
     print(f"\n💾 Storage:")
     print(f"  - Database: {settings.database_url}")
-    print(f"  - ChromaDB: {settings.chroma_persist_dir}")
+    print(f"  - Vector DB: {'Qdrant Cloud ✓' if settings.qdrant_url else 'ChromaDB (deprecated)'}")
+    if settings.qdrant_url:
+        print(f"  - Qdrant URL: {settings.qdrant_url}")
+        print(f"  - Qdrant Collection: {settings.qdrant_collection_name}")
     print(f"  - Uploads: {settings.upload_dir}")
     
     print(f"\n🔧 Features:")

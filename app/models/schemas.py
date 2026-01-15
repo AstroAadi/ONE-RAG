@@ -1,11 +1,11 @@
 """
 Pydantic Schemas for RAG System
 Complete type safety with proper validation
-Fixed: SourceDocument relevance_score validation
+Updated: Replaced keyword_weight/semantic_weight with search_type
 """
 
 from pydantic import BaseModel, Field, field_validator, ConfigDict, model_validator
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
 from datetime import datetime
 from enum import Enum
 
@@ -29,11 +29,11 @@ class FileCategory(str, Enum):
     OTHER = "other"
 
 
-class SearchStrategy(str, Enum):
-    """Search strategy types"""
+class SearchType(str, Enum):
+    """Search type options"""
+    DENSE = "dense"
+    SPARSE = "sparse"
     HYBRID = "hybrid"
-    SEMANTIC = "semantic"
-    KEYWORD = "keyword"
 
 
 # ==================== Request Models ====================
@@ -47,7 +47,7 @@ class FileUploadRequest(BaseModel):
 
 
 class QueryRequest(BaseModel):
-    """Query request with hybrid search parameters"""
+    """Query request with search type selection"""
     model_config = ConfigDict(str_strip_whitespace=True)
     
     question: str = Field(
@@ -77,35 +77,11 @@ class QueryRequest(BaseModel):
         description="LLM temperature (0.0-1.0)"
     )
     
-    # Hybrid search weights
-    keyword_weight: float = Field(
-        default=0.3,
-        ge=0.0,
-        le=1.0,
-        description="Weight for keyword (BM25) search"
+    # Search type selection
+    search_type: SearchType = Field(
+        default=SearchType.HYBRID,
+        description="Search type: 'dense' (semantic only), 'sparse' (keyword only), or 'hybrid' (RRF fusion)"
     )
-    
-    semantic_weight: float = Field(
-        default=0.7,
-        ge=0.0,
-        le=1.0,
-        description="Weight for semantic search"
-    )
-    
-    @field_validator('semantic_weight')
-    @classmethod
-    def validate_weights_sum(cls, v: float, info) -> float:
-        """Ensure weights sum to 1.0"""
-        keyword_weight = info.data.get('keyword_weight', 0.3)
-        total = keyword_weight + v
-        
-        if abs(total - 1.0) > 0.01:
-            # Auto-normalize
-            normalized_semantic = v / total
-            info.data['keyword_weight'] = keyword_weight / total
-            return normalized_semantic
-        
-        return v
 
 
 class ConversationQueryRequest(QueryRequest):
@@ -201,12 +177,8 @@ class QueryResponse(BaseModel):
     processing_time: float = Field(..., description="Processing time in seconds")
     
     # Search metadata
-    search_strategy: SearchStrategy = Field(default=SearchStrategy.HYBRID)
+    search_type: SearchType = Field(default=SearchType.HYBRID)
     confidence_score: float = Field(default=1.0, ge=0.0, le=1.0)
-    
-    # Hybrid search info
-    keyword_weight: float = Field(default=0.3, ge=0.0, le=1.0)
-    semantic_weight: float = Field(default=0.7, ge=0.0, le=1.0)
     
     # Optional conversation tracking
     conversation_id: Optional[str] = None

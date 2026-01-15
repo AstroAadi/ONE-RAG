@@ -1,6 +1,6 @@
 """
 Upload Route - FIXED VERSION
-No duplicate directories, proper user isolation, consistent file IDs
+CRITICAL FIX: Do not add total_pages to chunk_metadata to prevent confusion with page_number
 """
 
 from typing import Optional
@@ -163,6 +163,7 @@ async def process_and_index_document(
     - No duplicate file saving
     - Proper image directory isolation
     - Consistent markdown output location
+    - CRITICAL: Do not add total_pages to chunk_metadata (prevents page_number bug)
     """
     
     # Get file metadata from database
@@ -274,7 +275,8 @@ async def process_and_index_document(
         if markdown_saved:
             logger.info(f"✅ Saved markdown: {markdown_path.name}")
         
-        # Prepare metadata for chunking
+        # CRITICAL FIX: Prepare metadata for chunking
+        # Do NOT include total_pages here - it will be confused with page_number
         chunk_metadata = {
             "file_id": file_id,
             "filename": file_metadata.safe_filename,
@@ -283,9 +285,12 @@ async def process_and_index_document(
             "user_id": user_id
         }
         
-        # Add extraction metadata
-        if 'total_pages' in extraction_metadata:
-            chunk_metadata['total_pages'] = extraction_metadata['total_pages']
+        # ❌ REMOVED: Do NOT add total_pages to chunk metadata
+        # This was causing page_number to be set to total_pages instead of actual page
+        # if 'total_pages' in extraction_metadata:
+        #     chunk_metadata['total_pages'] = extraction_metadata['total_pages']
+        
+        logger.debug(f"Chunk metadata (without total_pages): {chunk_metadata}")
         
         # Count visual elements
         image_count = extracted_text.count('[Image Description]')
@@ -321,6 +326,10 @@ async def process_and_index_document(
         
         logger.info(f"✅ Created {len(chunks)} chunks")
         
+        # Verify page_number is correctly set
+        page_numbers = [c['metadata'].get('page_number', 0) for c in chunks]
+        logger.info(f"Page numbers in chunks: min={min(page_numbers)}, max={max(page_numbers)}, unique={len(set(page_numbers))}")
+        
         # Index to vector store
         logger.info("Indexing to vector store...")
         chunks_added = vector_store.add_document_chunks(
@@ -349,7 +358,7 @@ async def process_and_index_document(
         file_metadata.status = DBProcessingStatus.COMPLETED
         file_metadata.processed_at = datetime.utcnow()
         file_metadata.chunks_created = chunks_added
-        file_metadata.total_pages = extraction_metadata.get('total_pages', 0)
+        file_metadata.total_pages = extraction_metadata.get('total_pages', 0)  # Store here, not in chunks
         file_metadata.markdown_path = str(markdown_path) if markdown_saved else None
         file_metadata.word_count = word_count
         file_metadata.image_count = image_count
@@ -380,8 +389,8 @@ async def process_and_index_document(
         if image_count > 0:
             message_parts.append(f"  • Images: {image_count}")
         
-        if 'total_pages' in extraction_metadata:
-            message_parts.append(f"  • Pages: {extraction_metadata['total_pages']}")
+        # if 'total_pages' in extraction_metadata:
+        #     message_parts.append(f"  • Pages: {extraction_metadata['total_pages']}")
         
         return DocumentProcessResponse(
             file_id=file_id,
@@ -402,7 +411,6 @@ async def process_and_index_document(
     except HTTPException:
         raise
     except Exception as e:
-        # Update status to failed
         file_metadata.status = DBProcessingStatus.FAILED
         file_metadata.error_message = str(e)
         db.commit()
@@ -410,61 +418,20 @@ async def process_and_index_document(
         logger.error(f"Processing error: {str(e)}")
         import traceback
         traceback.print_exc()
+        
         raise HTTPException(
             status_code=500,
             detail=f"Processing error: {str(e)}"
         )
 
 
-@router.get("/list")
-async def list_uploaded_files(
-    user_id: str = Depends(get_user_id),
-    db: Session = Depends(get_database_session)
-):
-    """List all uploaded files for current user"""
-    
-    files = db.query(FileMetadata).filter(
-        FileMetadata.user_id == user_id
-    ).order_by(
-        FileMetadata.uploaded_at.desc()
-    ).all()
-    
-    file_list = []
-    for file_meta in files:
-        file_list.append({
-            "file_id": file_meta.file_id,
-            "filename": file_meta.original_filename,  # Show original name to user
-            "safe_filename": file_meta.safe_filename,
-            "file_type": file_meta.file_extension,
-            "file_category": file_meta.file_type.value,
-            "size_bytes": file_meta.file_size_bytes,
-            "size_mb": round(file_meta.file_size_bytes / (1024 * 1024), 2),
-            "status": file_meta.status.value,
-            "chunks_created": file_meta.chunks_created,
-            "uploaded_at": file_meta.uploaded_at.isoformat(),
-            "processed_at": file_meta.processed_at.isoformat() if file_meta.processed_at else None,
-            "has_error": file_meta.error_message is not None
-        })
-    
-    return {
-        "user_id": user_id,
-        "total_files": len(file_list),
-        "files": file_list
-    }
-
-
-@router.delete("/{file_id}")
-async def delete_uploaded_file(
+@router.get("/status/{file_id}")
+async def get_processing_status(
     file_id: str,
     user_id: str = Depends(get_user_id),
     db: Session = Depends(get_database_session)
 ):
-    """
-    Delete uploaded file and all associated data
-    
-    FIXED: Properly cleans up all directories
-    """
-    
+    """Get processing status for a file"""
     file_metadata = db.query(FileMetadata).filter(
         FileMetadata.file_id == file_id,
         FileMetadata.user_id == user_id
@@ -476,86 +443,13 @@ async def delete_uploaded_file(
             detail=f"File not found for ID: {file_id}"
         )
     
-    try:
-        # Delete from vector store
-        vector_store.delete_document_by_file_id(file_id, user_id)
-        logger.info(f"✅ Deleted from vector store: {file_id}")
-        
-        # Delete file from disk
-        file_path = Path(file_metadata.storage_path)
-        if file_path.exists():
-            file_path.unlink()
-            logger.info(f"✅ Deleted file: {file_path.name}")
-        
-        # Delete extracted images directory
-        # Format: uploads/{user_id}/extracted_images/{doc_stem}/
-        doc_stem = file_path.stem.split('_', 1)[1] if '_' in file_path.stem else file_path.stem
-        images_dir = file_path.parent / "extracted_images" / doc_stem
-        if images_dir.exists():
-            import shutil
-            shutil.rmtree(images_dir)
-            logger.info(f"✅ Deleted images directory: {images_dir}")
-        
-        # Delete markdown
-        if file_metadata.markdown_path:
-            markdown_path = Path(file_metadata.markdown_path)
-            if markdown_path.exists():
-                markdown_path.unlink()
-                logger.info(f"✅ Deleted markdown: {markdown_path.name}")
-        
-        # Delete from database (cascades to chunks)
-        db.delete(file_metadata)
-        db.commit()
-        logger.info(f"✅ Deleted database record: {file_id}")
-        
-        return {
-            "message": f"File and all associated data deleted successfully",
-            "file_id": file_id,
-            "user_id": user_id
-        }
-        
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Error deleting file: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error deleting file: {str(e)}"
-        )
-
-
-@router.get("/supported-formats")
-async def get_supported_formats():
-    """Get list of supported file formats"""
-    formats = ExtractorFactory.get_supported_formats()
-    extractor_info = ExtractorFactory.get_extractor_info()
-    
-    categories = {
-        'documents': [],
-        'presentations': [],
-        'spreadsheets': [],
-        'images': [],
-        'other': []
-    }
-    
-    for fmt in formats:
-        dummy_filename = f"file.{fmt}"
-        category = FileValidator.get_file_category(dummy_filename)
-        
-        if category == 'document':
-            categories['documents'].append(fmt)
-        elif category == 'presentation':
-            categories['presentations'].append(fmt)
-        elif category == 'spreadsheet':
-            categories['spreadsheets'].append(fmt)
-        elif category == 'image':
-            categories['images'].append(fmt)
-        else:
-            categories['other'].append(fmt)
-    
     return {
-        "total_formats": len(formats),
-        "formats": sorted(formats),
-        "categories": categories,
-        "extractors": extractor_info,
-        "note": "All endpoints except this one require X-User-ID header"
+        "file_id": file_id,
+        "filename": file_metadata.safe_filename,
+        "status": file_metadata.status.value,
+        "uploaded_at": file_metadata.uploaded_at,
+        "processed_at": file_metadata.processed_at,
+        "chunks_created": file_metadata.chunks_created,
+        "total_pages": file_metadata.total_pages,
+        "error_message": file_metadata.error_message
     }

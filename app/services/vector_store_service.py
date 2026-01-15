@@ -1,17 +1,23 @@
 """
-Improved Vector Store Service
-- Proper user isolation via metadata filtering
-- Better ChromaDB usage (minimal metadata)
-- Separation of concerns (store only embeddings, use SQL for metadata)
-- Better error handling
+Vector Store Service - Qdrant Cloud Implementation with Hybrid Dense+Sparse Search
+- Stores both dense (user-selectable) and sparse (SPLADE) vectors
+- Uses LOCAL SPLADE (sentence-transformers) instead of API
+- Supports three search types: dense, sparse, hybrid
+- Uses Reciprocal Rank Fusion (RRF) for hybrid search
 """
 
-import chromadb
-from chromadb.config import Settings as ChromaSettings
-from typing import List, Dict, Any, Tuple, Optional
+from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    Distance, VectorParams, PointStruct, Filter, 
+    FieldCondition, MatchValue, SparseVector, NamedVector,
+    SparseVectorParams, SparseIndexParams
+)
+from langchain_aws import BedrockEmbeddings
+from typing import List, Dict, Any, Tuple, Optional, Literal
 import logging
-
-from rank_bm25 import BM25Okapi
+import uuid
+from datetime import datetime
+import hashlib
 
 from app.core.config import settings
 from app.core.exceptions import (
@@ -25,41 +31,218 @@ from app.core.monitoring import get_logger
 logger = get_logger(__name__)
 
 
-class VectorStoreService:
+def string_to_uuid(text: str) -> str:
+    """Convert any string to a valid UUID v5"""
+    namespace = uuid.UUID('6ba7b810-9dad-11d1-80b4-00c04fd430c8')
+    return str(uuid.uuid5(namespace, text))
+
+
+class SPLADEEmbedder:
     """
-    Vector store service with user isolation
+    Local SPLADE sparse embedder using sentence-transformers
     
-    Stores document chunks with embeddings in ChromaDB
-    Filters by user_id for isolation
+    This is much more reliable than the HF Inference API!
     """
     
     def __init__(self):
-        """Initialize ChromaDB client and collection"""
+        """Initialize SPLADE embedder"""
         try:
-            self.client = chromadb.PersistentClient(
-                path=str(settings.chroma_persist_dir),
-                settings=ChromaSettings(
-                    anonymized_telemetry=False,
-                    allow_reset=True
-                )
-            )
+            from sentence_transformers import SparseEncoder
             
-            # Get or create collection
-            self.collection = self.client.get_or_create_collection(
-                name=settings.chroma_collection_name,
-                metadata={"description": "RAG document chunks with user isolation"}
-            )
+            # Try SPLADE v3 first (recommended)
+            model_name = "naver/splade-v3"
             
-            # BM25 index (in-memory)
-            self.bm25_index: Optional[BM25Okapi] = None
-            self.bm25_documents: List[str] = []
-            self.bm25_metadatas: List[Dict] = []
+            logger.info(f"Loading SPLADE model: {model_name}...")
+            self.model = SparseEncoder(model_name)
+            logger.info(f"✓ SPLADE model loaded successfully: {model_name}")
             
-            logger.info(f"Vector store initialized: {self.collection.name}")
+            self.available = True
             
         except Exception as e:
-            logger.error(f"Failed to initialize vector store: {e}", exc_info=True)
+            logger.error(f"Failed to load SPLADE model: {e}")
+            logger.warning("⚠️  SPLADE not available - sparse search will be disabled")
+            logger.warning("   Install with: pip install sentence-transformers")
+            self.model = None
+            self.available = False
+    
+    def embed_documents(self, texts: List[str]) -> List[SparseVector]:
+        """
+        Generate SPLADE sparse embeddings for multiple texts
+        
+        Args:
+            texts: List of texts to embed
+            
+        Returns:
+            List of SparseVector objects
+        """
+        if not self.available:
+            # Return empty sparse vectors as fallback
+            return [SparseVector(indices=[0], values=[0.0]) for _ in texts]
+        
+        try:
+            # Generate sparse embeddings using sentence-transformers
+            sparse_dicts = self.model.encode(texts, convert_to_tensor=False)
+            
+            sparse_vectors = []
+            for sparse_dict in sparse_dicts:
+                # Convert dict format to Qdrant SparseVector format
+                if isinstance(sparse_dict, dict) and 'indices' in sparse_dict and 'values' in sparse_dict:
+                    sparse_vectors.append(SparseVector(
+                        indices=sparse_dict['indices'],
+                        values=sparse_dict['values']
+                    ))
+                else:
+                    # Fallback for unexpected format
+                    sparse_vectors.append(SparseVector(indices=[0], values=[0.0]))
+            
+            return sparse_vectors
+            
+        except Exception as e:
+            logger.error(f"SPLADE embedding error: {e}")
+            # Return empty sparse vectors as fallback
+            return [SparseVector(indices=[0], values=[0.0]) for _ in texts]
+    
+    def embed_query(self, text: str) -> SparseVector:
+        """
+        Generate SPLADE sparse embedding for a single text
+        
+        Args:
+            text: Text to embed
+            
+        Returns:
+            SparseVector object with indices and values
+        """
+        if not self.available:
+            return SparseVector(indices=[0], values=[0.0])
+        
+        try:
+            # Generate sparse embedding
+            sparse_dict = self.model.encode([text], convert_to_tensor=False)[0]
+            
+            if isinstance(sparse_dict, dict) and 'indices' in sparse_dict and 'values' in sparse_dict:
+                return SparseVector(
+                    indices=sparse_dict['indices'],
+                    values=sparse_dict['values']
+                )
+            else:
+                return SparseVector(indices=[0], values=[0.0])
+                
+        except Exception as e:
+            logger.error(f"SPLADE query embedding error: {e}")
+            return SparseVector(indices=[0], values=[0.0])
+
+
+class VectorStoreService:
+    """Qdrant-based vector store service with hybrid dense+sparse search"""
+    
+    def __init__(self):
+        """Initialize Qdrant client and embeddings"""
+        try:
+            # Initialize Qdrant Cloud client
+            self.client = QdrantClient(
+                url=settings.qdrant_url,
+                api_key=settings.qdrant_api_key,
+                timeout=60,
+                prefer_grpc=False
+            )
+            
+            # Initialize dense embeddings (user-selectable model)
+            self.dense_embeddings = BedrockEmbeddings(
+                model_id=settings.embedding_model_id,
+                region_name=settings.aws_region,
+                credentials_profile_name=settings.aws_profile_name if settings.aws_profile_name else None
+            )
+            
+            # Initialize sparse embeddings (LOCAL SPLADE)
+            self.sparse_embeddings = SPLADEEmbedder()
+            
+            # Collection name
+            self.collection_name = settings.qdrant_collection_name
+            
+            # Initialize collection
+            self._initialize_collection()
+            
+            logger.info(f"✓ Qdrant Vector Store initialized (collection: {self.collection_name})")
+            logger.info(f"✓ Dense embeddings: {settings.embedding_model_id}")
+            logger.info(f"✓ Sparse embeddings: {'SPLADE (local)' if self.sparse_embeddings.available else 'Disabled'}")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize Qdrant: {e}", exc_info=True)
             raise VectorStoreException(f"Failed to initialize vector store: {str(e)}")
+    
+    def _initialize_collection(self):
+        """Create collection if it doesn't exist with both dense and sparse vectors"""
+        try:
+            collections = self.client.get_collections().collections
+            collection_names = [col.name for col in collections]
+            
+            if self.collection_name not in collection_names:
+                dense_dim = self._get_embedding_dimension()
+                
+                # Create collection with named vectors (dense + sparse)
+                self.client.create_collection(
+                    collection_name=self.collection_name,
+                    vectors_config={
+                        "dense": VectorParams(
+                            size=dense_dim,
+                            distance=Distance.COSINE
+                        )
+                    },
+                    sparse_vectors_config={
+                        "sparse": SparseVectorParams(
+                            index=SparseIndexParams()
+                        )
+                    }
+                )
+                
+                self._create_payload_indexes()
+                
+                logger.info(f"✓ Created Qdrant collection: {self.collection_name}")
+                logger.info(f"  - Dense vector size: {dense_dim}")
+                logger.info(f"  - Sparse vector: SPLADE (local)")
+            else:
+                logger.info(f"✓ Using existing Qdrant collection: {self.collection_name}")
+                
+        except Exception as e:
+            logger.error(f"Error initializing collection: {e}", exc_info=True)
+            raise VectorStoreException(f"Failed to initialize collection: {str(e)}")
+    
+    def _get_embedding_dimension(self) -> int:
+        """Get embedding dimension"""
+        try:
+            test_embedding = self.dense_embeddings.embed_query("test")
+            dim = len(test_embedding)
+            logger.info(f"Detected embedding dimension: {dim}")
+            return dim
+        except Exception as e:
+            logger.warning(f"Could not determine embedding dimension: {e}, using default 1024")
+            return 1024
+    
+    def _create_payload_indexes(self):
+        """Create indexes on payload fields"""
+        try:
+            self.client.create_payload_index(
+                collection_name=self.collection_name,
+                field_name="user_id",
+                field_schema="keyword"
+            )
+            
+            self.client.create_payload_index(
+                collection_name=self.collection_name,
+                field_name="file_id",
+                field_schema="keyword"
+            )
+            
+            self.client.create_payload_index(
+                collection_name=self.collection_name,
+                field_name="chunk_index",
+                field_schema="integer"
+            )
+            
+            logger.info("✓ Created payload indexes")
+            
+        except Exception as e:
+            logger.warning(f"Could not create payload indexes: {e}")
     
     def add_document_chunks(
         self,
@@ -68,32 +251,16 @@ class VectorStoreService:
         filename: str,
         structured_data: Optional[Dict] = None
     ) -> int:
-        """
-        Add document chunks to vector store
-        
-        Args:
-            chunks: List of chunk dictionaries with 'text', 'chunk_id', and 'metadata'
-            file_id: Document file ID
-            filename: Document filename
-            structured_data: Additional structured data (optional)
-            
-        Returns:
-            Number of chunks added
-            
-        Note:
-            User ID must be in chunk metadata for isolation
-        """
+        """Add document chunks to Qdrant with both dense and sparse vectors"""
         if not chunks:
             logger.warning(f"No chunks provided for {file_id}")
             return 0
         
         try:
-            texts = []
-            ids = []
-            metadatas = []
+            points = []
+            texts_for_embedding = []
             
             for chunk in chunks:
-                # Extract data
                 text = chunk.get('text', '')
                 chunk_id = chunk.get('chunk_id', '')
                 metadata = chunk.get('metadata', {})
@@ -102,328 +269,423 @@ class VectorStoreService:
                     logger.warning(f"Skipping invalid chunk: {chunk_id}")
                     continue
                 
-                # Ensure user_id is in metadata (CRITICAL for isolation)
                 if 'user_id' not in metadata:
                     logger.error(f"Chunk {chunk_id} missing user_id!")
                     raise VectorStoreException(
                         f"Cannot add chunk without user_id: {chunk_id}"
                     )
                 
-                # Prepare minimal metadata for ChromaDB
-                # Store only essential fields (ChromaDB has size limits)
-                chroma_metadata = {
+                payload = {
                     'file_id': str(metadata.get('file_id', file_id)),
-                    'user_id': str(metadata.get('user_id')),  # CRITICAL
+                    'user_id': str(metadata.get('user_id')),
                     'filename': str(metadata.get('filename', filename)),
                     'chunk_type': str(metadata.get('chunk_type', 'text')),
-                    'page_number': int(metadata.get('page_number', 0)),  # Keep as int
-                    'chunk_index': int(metadata.get('chunk_index', 0)),  # Keep as int
-                    'chunk_id': str(chunk_id)  # Add chunk_id for easier lookup
+                    'page_number': int(metadata.get('page_number', 0)),
+                    'chunk_index': int(metadata.get('chunk_index', 0)),
+                    'chunk_id': str(chunk_id),
+                    'text': text,
+                    'created_at': datetime.utcnow().isoformat()
                 }
                 
-                texts.append(text)
-                ids.append(chunk_id)
-                metadatas.append(chroma_metadata)
+                for key, value in metadata.items():
+                    if key not in payload and value is not None:
+                        payload[key] = str(value) if not isinstance(value, (int, float, bool)) else value
+                
+                texts_for_embedding.append(text)
+                points.append({
+                    'id': chunk_id,
+                    'payload': payload
+                })
             
-            if not texts:
+            if not points:
                 logger.warning(f"No valid chunks to add for {file_id}")
                 return 0
             
-            # Add to ChromaDB (will auto-generate embeddings)
-            self.collection.add(
-                documents=texts,
-                ids=ids,
-                metadatas=metadatas
-            )
+            # Truncate texts to fit embedding limits
+            max_embedding_length = settings.embedding_max_length
+            truncated_texts = []
+            truncated_count = 0
             
-            # Rebuild BM25 index
-            self._rebuild_bm25_index()
+            for i, text in enumerate(texts_for_embedding):
+                if len(text) > max_embedding_length:
+                    truncated = text[:max_embedding_length]
+                    truncated_texts.append(truncated)
+                    truncated_count += 1
+                else:
+                    truncated_texts.append(text)
+            
+            if truncated_count > 0:
+                logger.warning(
+                    f"Truncated {truncated_count}/{len(texts_for_embedding)} texts to fit {max_embedding_length} char limit"
+                )
+            
+            # Generate dense embeddings
+            logger.info(f"Generating dense embeddings for {len(truncated_texts)} chunks...")
+            dense_embeddings = self.dense_embeddings.embed_documents(truncated_texts)
+            
+            # Generate sparse embeddings (LOCAL SPLADE)
+            logger.info(f"Generating sparse embeddings (SPLADE local) for {len(truncated_texts)} chunks...")
+            sparse_embeddings = self.sparse_embeddings.embed_documents(truncated_texts)
+            
+            # Create Qdrant points with both dense and sparse vectors
+            qdrant_points = []
+            for point, dense_emb, sparse_emb in zip(points, dense_embeddings, sparse_embeddings):
+                point_uuid = string_to_uuid(point['id'])
+                
+                qdrant_points.append(
+                    PointStruct(
+                        id=point_uuid,
+                        vector={
+                            "dense": dense_emb,
+                            "sparse": sparse_emb
+                        },
+                        payload=point['payload']
+                    )
+                )
+            
+            # Upload to Qdrant
+            batch_size = 100
+            for i in range(0, len(qdrant_points), batch_size):
+                batch = qdrant_points[i:i + batch_size]
+                self.client.upsert(
+                    collection_name=self.collection_name,
+                    points=batch
+                )
+                logger.debug(f"Uploaded batch {i//batch_size + 1}/{(len(qdrant_points)-1)//batch_size + 1}")
             
             logger.info(
-                f"Added {len(texts)} chunks to vector store",
-                extra={"file_id": file_id, "chunks": len(texts)}
+                f"✓ Added {len(qdrant_points)} chunks with dense+sparse vectors to Qdrant",
+                extra={"file_id": file_id, "user_id": points[0]['payload']['user_id']}
             )
             
-            return len(texts)
+            return len(qdrant_points)
             
-        except VectorStoreException:
-            raise
         except Exception as e:
             logger.error(f"Error adding chunks: {str(e)}", exc_info=True)
-            raise VectorStoreException(f"Failed to add chunks: {str(e)}")
+            raise VectorStoreException(f"Failed to add document chunks: {str(e)}")
     
-    def hybrid_search(
+    def search(
         self,
         query: str,
         top_k: int = 5,
         user_id: Optional[str] = None,
         file_id: Optional[str] = None,
-        keyword_weight: float = 0.3,
-        semantic_weight: float = 0.7
-    ) -> Tuple[List[str], List[Dict], List[float]]:
+        search_type: Literal["dense", "sparse", "hybrid"] = "hybrid"
+    ) -> Tuple[List[str], List[Dict[str, Any]], List[float]]:
         """
-        Hybrid search combining BM25 and semantic search with user isolation
+        Search with three modes: dense, sparse, or hybrid
         
         Args:
             query: Search query
             top_k: Number of results to return
-            user_id: User ID for isolation (optional for backward compatibility)
-            file_id: Filter by specific file (optional)
-            keyword_weight: Weight for BM25 keyword search
-            semantic_weight: Weight for semantic search
+            user_id: Filter by user ID
+            file_id: Filter by file ID
+            search_type: One of "dense", "sparse", "hybrid"
             
         Returns:
             Tuple of (documents, metadatas, scores)
-            
-        Raises:
-            SearchError: If search fails
-            NoDocumentsFoundError: If no documents in collection
         """
         try:
-            # Check if collection is empty
-            collection_count = self.collection.count()
-            if collection_count == 0:
-                raise NoDocumentsFoundError()
-            
-            # Build where filter for user isolation
-            where_filter = {}
-            if user_id:
-                where_filter['user_id'] = user_id
-            if file_id:
-                where_filter['file_id'] = file_id
-            
-            # Perform semantic search
-            semantic_results = self.collection.query(
-                query_texts=[query],
-                n_results=min(top_k * 2, 50),  # Get more for hybrid ranking
-                where=where_filter if where_filter else None
-            )
-            
-            if not semantic_results or not semantic_results['documents']:
-                logger.warning(f"No semantic results for query")
-                return [], [], []
-            
-            # Extract semantic results
-            semantic_docs = semantic_results['documents'][0]
-            semantic_metas = semantic_results['metadatas'][0]
-            semantic_distances = semantic_results['distances'][0]
-            
-            # Convert distances to similarity scores (cosine distance -> similarity)
-            # ChromaDB returns L2 distances, ensure scores are always positive
-            semantic_scores = []
-            for d in semantic_distances:
-                # Convert distance to similarity (0 to 1 range)
-                # For L2 distance: similarity = 1 / (1 + distance)
-                similarity = max(0.0, min(1.0, 1.0 / (1.0 + abs(d))))
-                semantic_scores.append(similarity)
-            
-            # Perform BM25 keyword search
-            if self.bm25_index and keyword_weight > 0:
-                keyword_results = self._bm25_search(
-                    query, top_k * 2, user_id, file_id
-                )
-                
-                # Combine scores
-                final_results = self._combine_search_results(
-                    semantic_docs, semantic_metas, semantic_scores,
-                    keyword_results,
-                    keyword_weight, semantic_weight,
-                    top_k
-                )
+            if search_type == "dense":
+                return self._dense_search(query, top_k, user_id, file_id)
+            elif search_type == "sparse":
+                return self._sparse_search(query, top_k, user_id, file_id)
+            elif search_type == "hybrid":
+                return self._hybrid_search(query, top_k, user_id, file_id)
             else:
-                # Semantic only
-                final_results = list(zip(
-                    semantic_docs[:top_k],
-                    semantic_metas[:top_k],
-                    semantic_scores[:top_k]
-                ))
-            
-            if not final_results:
-                logger.info(f"No results for query after filtering")
-                return [], [], []
-            
-            # Unzip results
-            documents, metadatas, scores = zip(*final_results)
-            
-            return list(documents), list(metadatas), list(scores)
-            
-        except NoDocumentsFoundError:
-            raise
+                raise SearchError(f"Invalid search_type: {search_type}. Must be 'dense', 'sparse', or 'hybrid'")
+                
         except Exception as e:
             logger.error(f"Search error: {str(e)}", exc_info=True)
             raise SearchError(f"Search failed: {str(e)}")
     
-    def _bm25_search(
+    def _dense_search(
         self,
         query: str,
         top_k: int,
         user_id: Optional[str] = None,
         file_id: Optional[str] = None
-    ) -> List[Tuple[str, Dict, float]]:
-        """Perform BM25 keyword search with filtering"""
-        if not self.bm25_index:
-            return []
-        
-        # Tokenize query
-        tokenized_query = query.lower().split()
-        
-        # Get BM25 scores
-        scores = self.bm25_index.get_scores(tokenized_query)
-        
-        # Filter and rank
-        results = []
-        for idx, score in enumerate(scores):
-            if idx >= len(self.bm25_documents):
-                break
+    ) -> Tuple[List[str], List[Dict[str, Any]], List[float]]:
+        """Dense vector search only"""
+        try:
+            # Generate dense query embedding
+            query_embedding = self.dense_embeddings.embed_query(query)
             
-            metadata = self.bm25_metadatas[idx]
+            # Build filter
+            query_filter = self._build_filter(user_id, file_id)
             
-            # Apply filters
-            if user_id and metadata.get('user_id') != user_id:
-                continue
-            if file_id and metadata.get('file_id') != file_id:
-                continue
-            
-            if score > 0:
-                results.append((
-                    self.bm25_documents[idx],
-                    metadata,
-                    float(score)
-                ))
-        
-        # Sort by score and return top_k
-        results.sort(key=lambda x: x[2], reverse=True)
-        return results[:top_k]
-    
-    def _combine_search_results(
-        self,
-        semantic_docs: List[str],
-        semantic_metas: List[Dict],
-        semantic_scores: List[float],
-        keyword_results: List[Tuple[str, Dict, float]],
-        keyword_weight: float,
-        semantic_weight: float,
-        top_k: int
-    ) -> List[Tuple[str, Dict, float]]:
-        """Combine semantic and keyword search results"""
-        
-        # Create document map for combining
-        doc_map = {}
-        
-        # Add semantic results
-        for idx, (doc, meta, score) in enumerate(zip(semantic_docs, semantic_metas, semantic_scores)):
-            # Use chunk_id if available, otherwise use index as unique identifier
-            chunk_id = str(meta.get('chunk_id', f'semantic_{idx}'))
-            doc_map[chunk_id] = {
-                'doc': doc,
-                'meta': meta,
-                'semantic_score': score,
-                'keyword_score': 0.0
-            }
-        
-        # Add keyword results
-        for idx, (doc, meta, score) in enumerate(keyword_results):
-            chunk_id = str(meta.get('chunk_id', f'keyword_{idx}'))
-            if chunk_id in doc_map:
-                doc_map[chunk_id]['keyword_score'] = score
-            else:
-                doc_map[chunk_id] = {
-                    'doc': doc,
-                    'meta': meta,
-                    'semantic_score': 0.0,
-                    'keyword_score': score
-                }
-        
-        # Normalize scores
-        max_semantic = max((v['semantic_score'] for v in doc_map.values()), default=1.0)
-        max_keyword = max((v['keyword_score'] for v in doc_map.values()), default=1.0)
-        
-        # Calculate combined scores
-        combined_results = []
-        for chunk_id, data in doc_map.items():
-            normalized_semantic = data['semantic_score'] / max_semantic if max_semantic > 0 else 0
-            normalized_keyword = data['keyword_score'] / max_keyword if max_keyword > 0 else 0
-            
-            combined_score = (
-                semantic_weight * normalized_semantic +
-                keyword_weight * normalized_keyword
+            # Use query_points with named vector
+            results = self.client.query_points(
+                collection_name=self.collection_name,
+                query=query_embedding,
+                using="dense",  # Specify which named vector to use
+                query_filter=query_filter,
+                limit=top_k,
+                with_payload=True
             )
             
-            combined_results.append((
-                data['doc'],
-                data['meta'],
-                combined_score
-            ))
-        
-        # Sort by combined score
-        combined_results.sort(key=lambda x: x[2], reverse=True)
-        
-        return combined_results[:top_k]
-    
-    def _rebuild_bm25_index(self) -> None:
-        """Rebuild BM25 index from all documents"""
-        try:
-            # Get all documents
-            all_docs = self.collection.get()
-            
-            if not all_docs or not all_docs['documents']:
-                self.bm25_index = None
-                self.bm25_documents = []
-                self.bm25_metadatas = []
-                return
-            
-            self.bm25_documents = all_docs['documents']
-            self.bm25_metadatas = all_docs['metadatas']
-            
-            # Tokenize documents
-            tokenized_docs = [doc.lower().split() for doc in self.bm25_documents]
-            
-            # Create BM25 index
-            self.bm25_index = BM25Okapi(tokenized_docs)
-            
-            logger.info(f"BM25 index rebuilt with {len(self.bm25_documents)} documents")
+            # query_points returns a QueryResponse object with .points attribute
+            return self._process_results(results.points)
             
         except Exception as e:
-            logger.error(f"Failed to rebuild BM25 index: {e}")
-            self.bm25_index = None
+            logger.error(f"Dense search error: {e}", exc_info=True)
+            raise SearchError(f"Dense search failed: {str(e)}")
+    
+    def _sparse_search(
+        self,
+        query: str,
+        top_k: int,
+        user_id: Optional[str] = None,
+        file_id: Optional[str] = None
+    ) -> Tuple[List[str], List[Dict[str, Any]], List[float]]:
+        """Sparse vector (SPLADE) search only"""
+        try:
+            if not self.sparse_embeddings.available:
+                logger.warning("Sparse search requested but SPLADE not available, falling back to dense search")
+                return self._dense_search(query, top_k, user_id, file_id)
+            
+            # Generate sparse query embedding
+            query_sparse = self.sparse_embeddings.embed_query(query)
+            
+            # Build filter
+            query_filter = self._build_filter(user_id, file_id)
+            
+            # Use query_points with named sparse vector
+            results = self.client.query_points(
+                collection_name=self.collection_name,
+                query=query_sparse,
+                using="sparse",  # Specify which named sparse vector to use
+                query_filter=query_filter,
+                limit=top_k,
+                with_payload=True
+            )
+            
+            # query_points returns a QueryResponse object with .points attribute
+            return self._process_results(results.points)
+            
+        except Exception as e:
+            logger.error(f"Sparse search error: {e}", exc_info=True)
+            raise SearchError(f"Sparse search failed: {str(e)}")
+    
+    def _hybrid_search(
+        self,
+        query: str,
+        top_k: int,
+        user_id: Optional[str] = None,
+        file_id: Optional[str] = None
+    ) -> Tuple[List[str], List[Dict[str, Any]], List[float]]:
+        """
+        Hybrid search using Reciprocal Rank Fusion (RRF)
+        
+        Combines dense and sparse results using RRF algorithm
+        """
+        try:
+            if not self.sparse_embeddings.available:
+                logger.warning("Hybrid search requested but SPLADE not available, using dense search only")
+                return self._dense_search(query, top_k, user_id, file_id)
+            
+            # Get both dense and sparse results (retrieve more for better fusion)
+            retrieval_k = min(top_k * 3, 50)  # Retrieve 3x more for fusion
+            
+            logger.debug(f"Hybrid search: retrieving {retrieval_k} results from each method")
+            
+            # Dense search
+            dense_docs, dense_metas, dense_scores = self._dense_search(
+                query, retrieval_k, user_id, file_id
+            )
+            
+            # Sparse search
+            sparse_docs, sparse_metas, sparse_scores = self._sparse_search(
+                query, retrieval_k, user_id, file_id
+            )
+            
+            # Apply Reciprocal Rank Fusion
+            fused_results = self._reciprocal_rank_fusion(
+                dense_results=list(zip(dense_docs, dense_metas, dense_scores)),
+                sparse_results=list(zip(sparse_docs, sparse_metas, sparse_scores)),
+                k=60  # RRF constant (typical value)
+            )
+            
+            # Take top_k after fusion
+            fused_results = fused_results[:top_k]
+            
+            # Unpack results
+            if not fused_results:
+                return [], [], []
+            
+            documents = [r[0] for r in fused_results]
+            metadatas = [r[1] for r in fused_results]
+            scores = [r[2] for r in fused_results]
+            
+            logger.info(
+                f"Hybrid search returned {len(documents)} results",
+                extra={"query": query[:50], "user_id": user_id}
+            )
+            
+            return documents, metadatas, scores
+            
+        except Exception as e:
+            logger.error(f"Hybrid search error: {e}")
+            raise SearchError(f"Hybrid search failed: {str(e)}")
+    
+    def _reciprocal_rank_fusion(
+        self,
+        dense_results: List[Tuple[str, Dict, float]],
+        sparse_results: List[Tuple[str, Dict, float]],
+        k: int = 60
+    ) -> List[Tuple[str, Dict, float]]:
+        """
+        Reciprocal Rank Fusion algorithm
+        
+        RRF score = sum(1 / (k + rank)) for each result list
+        
+        Args:
+            dense_results: List of (doc, metadata, score) from dense search
+            sparse_results: List of (doc, metadata, score) from sparse search
+            k: RRF constant (typically 60)
+            
+        Returns:
+            Fused results sorted by RRF score
+        """
+        # Build RRF scores
+        rrf_scores = {}
+        
+        # Process dense results
+        for rank, (doc, meta, score) in enumerate(dense_results, start=1):
+            chunk_id = meta.get('chunk_id', '')
+            if chunk_id not in rrf_scores:
+                rrf_scores[chunk_id] = {
+                    'doc': doc,
+                    'meta': meta,
+                    'rrf_score': 0.0,
+                    'dense_rank': None,
+                    'sparse_rank': None
+                }
+            rrf_scores[chunk_id]['rrf_score'] += 1.0 / (k + rank)
+            rrf_scores[chunk_id]['dense_rank'] = rank
+        
+        # Process sparse results
+        for rank, (doc, meta, score) in enumerate(sparse_results, start=1):
+            chunk_id = meta.get('chunk_id', '')
+            if chunk_id not in rrf_scores:
+                rrf_scores[chunk_id] = {
+                    'doc': doc,
+                    'meta': meta,
+                    'rrf_score': 0.0,
+                    'dense_rank': None,
+                    'sparse_rank': None
+                }
+            rrf_scores[chunk_id]['rrf_score'] += 1.0 / (k + rank)
+            rrf_scores[chunk_id]['sparse_rank'] = rank
+        
+        # Sort by RRF score
+        sorted_results = sorted(
+            rrf_scores.values(),
+            key=lambda x: x['rrf_score'],
+            reverse=True
+        )
+        
+        # Convert to output format
+        fused = []
+        for item in sorted_results:
+            # Normalize RRF score to 0-1 range for consistency
+            # Max RRF score would be ~0.033 (1/60 + 1/60), so normalize
+            normalized_score = min(item['rrf_score'] / 0.05, 1.0)
+            fused.append((item['doc'], item['meta'], normalized_score))
+        
+        logger.debug(
+            f"RRF fusion: {len(dense_results)} dense + {len(sparse_results)} sparse "
+            f"→ {len(fused)} unique results"
+        )
+        
+        return fused
+    
+    def _build_filter(
+        self,
+        user_id: Optional[str] = None,
+        file_id: Optional[str] = None
+    ) -> Optional[Filter]:
+        """Build Qdrant filter for user and file isolation"""
+        must_conditions = []
+        
+        if user_id:
+            must_conditions.append(
+                FieldCondition(key="user_id", match=MatchValue(value=user_id))
+            )
+        
+        if file_id:
+            must_conditions.append(
+                FieldCondition(key="file_id", match=MatchValue(value=file_id))
+            )
+        
+        if must_conditions:
+            return Filter(must=must_conditions)
+        
+        return None
+    
+    def _process_results(
+        self,
+        results
+    ) -> Tuple[List[str], List[Dict[str, Any]], List[float]]:
+        """Process Qdrant search results"""
+        documents = []
+        metadatas = []
+        scores = []
+        
+        for result in results:
+            payload = result.payload
+            
+            # Extract text
+            text = payload.get('text', '')
+            documents.append(text)
+            
+            # Build metadata dict
+            metadata = {k: v for k, v in payload.items() if k != 'text'}
+            metadatas.append(metadata)
+            
+            # Get score
+            scores.append(float(result.score))
+        
+        return documents, metadatas, scores
     
     def delete_document_by_file_id(
         self,
         file_id: str,
         user_id: Optional[str] = None
     ) -> bool:
-        """
-        Delete all chunks for a specific file with user verification
-        
-        Args:
-            file_id: File ID to delete
-            user_id: User ID for verification (optional)
-            
-        Returns:
-            True if deleted, False if not found
-        """
+        """Delete all chunks for a file"""
         try:
-            # ✅ FIXED - Use $and operator for multiple conditions
-            where_filter = {
-                "$and": [
-                    {"file_id": file_id},
-                    {"user_id": user_id}
-                ]
-            }
+            must_conditions = [
+                FieldCondition(key="file_id", match=MatchValue(value=file_id))
+            ]
+            if user_id:
+                must_conditions.append(
+                    FieldCondition(key="user_id", match=MatchValue(value=user_id))
+                )
             
-            results = self.collection.get(where=where_filter)
+            query_filter = Filter(must=must_conditions)
             
-            if not results or not results['ids']:
+            result = self.client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=query_filter,
+                limit=10000,
+                with_payload=False,
+                with_vectors=False
+            )
+            
+            points_to_delete = result[0]
+            
+            if not points_to_delete:
                 return False
             
-            # Delete by IDs
-            self.collection.delete(ids=results['ids'])
-            
-            # Rebuild BM25
-            self._rebuild_bm25_index()
+            point_ids = [point.id for point in points_to_delete]
+            self.client.delete(
+                collection_name=self.collection_name,
+                points_selector=point_ids
+            )
             
             logger.info(
-                f"Deleted {len(results['ids'])} chunks for file {file_id}",
+                f"Deleted {len(point_ids)} chunks for file {file_id}",
                 extra={"file_id": file_id, "user_id": user_id}
             )
             
@@ -434,42 +696,55 @@ class VectorStoreService:
             raise VectorStoreException(f"Failed to delete document: {str(e)}")
     
     def get_collection_stats(self, user_id: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Get collection statistics with optional user filtering
-        
-        Args:
-            user_id: Filter by user ID (optional)
-            
-        Returns:
-            Dictionary with statistics
-        """
+        """Get collection statistics"""
         try:
-            # Get all documents with optional filtering
-            where_filter = {'user_id': user_id} if user_id else None
-            results = self.collection.get(where=where_filter)
+            query_filter = None
+            if user_id:
+                query_filter = Filter(
+                    must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))]
+                )
             
-            if not results or not results['metadatas']:
+            all_points = []
+            offset = None
+            
+            while True:
+                result = self.client.scroll(
+                    collection_name=self.collection_name,
+                    scroll_filter=query_filter,
+                    limit=1000,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False
+                )
+                
+                points, next_offset = result
+                all_points.extend(points)
+                
+                if next_offset is None:
+                    break
+                offset = next_offset
+            
+            if not all_points:
                 return {
                     'total_documents': 0,
                     'total_chunks': 0,
                     'documents': []
                 }
             
-            # Count unique files
             file_ids = {}
-            for meta in results['metadatas']:
-                fid = meta.get('file_id', 'unknown')
+            for point in all_points:
+                fid = point.payload.get('file_id', 'unknown')
                 if fid not in file_ids:
                     file_ids[fid] = {
                         'file_id': fid,
-                        'filename': meta.get('filename', 'unknown'),
+                        'filename': point.payload.get('filename', 'unknown'),
                         'chunk_count': 0
                     }
                 file_ids[fid]['chunk_count'] += 1
             
             return {
                 'total_documents': len(file_ids),
-                'total_chunks': len(results['ids']),
+                'total_chunks': len(all_points),
                 'documents': list(file_ids.values()),
                 'user_id': user_id
             }
@@ -484,23 +759,28 @@ class VectorStoreService:
             }
     
     def reset_collection(self) -> bool:
-        """
-        Reset entire collection (admin function - use with caution)
-        
-        Returns:
-            True if successful
-        """
+        """Reset entire collection"""
         try:
-            self.client.delete_collection(name=settings.chroma_collection_name)
+            self.client.delete_collection(collection_name=self.collection_name)
             
-            self.collection = self.client.create_collection(
-                name=settings.chroma_collection_name,
-                metadata={"description": "RAG document chunks with user isolation"}
+            # Recreate with both dense and sparse vectors
+            dense_dim = self._get_embedding_dimension()
+            self.client.create_collection(
+                collection_name=self.collection_name,
+                vectors_config={
+                    "dense": VectorParams(
+                        size=dense_dim,
+                        distance=Distance.COSINE
+                    )
+                },
+                sparse_vectors_config={
+                    "sparse": SparseVectorParams(
+                        index=SparseIndexParams()
+                    )
+                }
             )
             
-            self.bm25_index = None
-            self.bm25_documents = []
-            self.bm25_metadatas = []
+            self._create_payload_indexes()
             
             logger.warning("Collection reset - all data deleted")
             
@@ -509,3 +789,21 @@ class VectorStoreService:
         except Exception as e:
             logger.error(f"Error resetting collection: {str(e)}", exc_info=True)
             raise VectorStoreException(f"Failed to reset collection: {str(e)}")
+    
+    @property
+    def collection(self):
+        """Compatibility property for collection.count()"""
+        class CollectionMock:
+            def __init__(self, client, collection_name):
+                self._client = client
+                self._collection_name = collection_name
+                self.name = collection_name
+            
+            def count(self):
+                try:
+                    info = self._client.get_collection(self._collection_name)
+                    return info.points_count
+                except:
+                    return 0
+        
+        return CollectionMock(self.client, self.collection_name)

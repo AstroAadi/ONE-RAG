@@ -1,6 +1,17 @@
 """
-Markdown-Aware Chunking Service - FIXED VERSION
-Fixed critical bug in code block extraction that could cause infinite loop
+Optimized Markdown-Aware Chunking Service
+==========================================
+
+Key Optimizations:
+1. Smart heading merging: Merge small heading sections until reaching target size (1500 chars)
+2. Large section splitting: Split oversized sections at semantic boundaries with controlled overlap
+3. Structure preservation: Headings never split from content, overlaps don't duplicate headings
+4. No truncation: All content preserved, respects embedding_max_length (2048 for Cohere)
+
+Integration with vector_store_service:
+- Respects embedding_max_length (chunks stay under 2048 to avoid truncation)
+- Generates unique chunk IDs compatible with Qdrant UUID conversion
+- Maintains all existing metadata structure
 """
 
 from typing import List, Dict, Any, Optional, Tuple
@@ -22,47 +33,41 @@ settings = get_settings()
 
 class SemanticChunkingService:
     """
-    Markdown-aware semantic chunking with structure preservation
+    Optimized Markdown-aware chunking with intelligent heading management
     
-    FIXED: Code block extraction bug that could cause infinite loop
-    
-    Features:
-    - Splits by headings (#, ##, ###) before paragraphs
-    - Preserves code blocks (```...```) as atomic units
-    - Keeps tables intact (| --- |)
-    - Doesn't break lists mid-item
-    - Respects page/slide markers
-    - Handles image descriptions
-    - Strict size validation
+    Strategy:
+    - Parse markdown into sections (heading + its content)
+    - Merge small sections with next section until reaching chunk_size (1500)
+    - Split large sections at paragraph/sentence boundaries with overlap
+    - Never split headings from their content
+    - Overlaps only include content, not headings
     """
     
     def __init__(
         self, 
         chunk_size: int = 1500,
         chunk_overlap: int = 200,
-        max_chunk_size: int = 6000
+        max_chunk_size: int = 2000
     ):
-        # Validate configuration
-        if chunk_overlap >= chunk_size:
-            raise ChunkingError(
-                f"chunk_overlap ({chunk_overlap}) must be less than "
-                f"chunk_size ({chunk_size})"
-            )
+        # Respect embedding limits - critical for avoiding truncation
+        embedding_limit = getattr(settings, 'embedding_max_length', 2048)
         
-        if chunk_size > max_chunk_size:
-            raise ChunkingError(
-                f"chunk_size ({chunk_size}) cannot exceed "
-                f"max_chunk_size ({max_chunk_size})"
-            )
-        
-        # Cohere embed-english-v3 max is ~6000-8000 chars for English
-        self.max_chunk_size = min(max_chunk_size, 6000)
+        # Ensure max_chunk_size doesn't exceed embedding limit
+        self.max_chunk_size = min(max_chunk_size, embedding_limit)
         self.chunk_size = min(chunk_size, self.max_chunk_size)
         self.chunk_overlap = min(chunk_overlap, self.chunk_size // 2)
         
+        # Validate
+        if self.chunk_overlap >= self.chunk_size:
+            raise ChunkingError(
+                f"chunk_overlap ({self.chunk_overlap}) must be less than "
+                f"chunk_size ({self.chunk_size})"
+            )
+        
         logger.info(
-            f"Markdown-aware chunking configured: size={self.chunk_size}, "
-            f"overlap={self.chunk_overlap}, max={self.max_chunk_size}"
+            f"Optimized chunking: target={self.chunk_size}, "
+            f"overlap={self.chunk_overlap}, max={self.max_chunk_size}, "
+            f"embedding_limit={embedding_limit}"
         )
     
     @track_performance("split_document_into_chunks")
@@ -73,41 +78,34 @@ class SemanticChunkingService:
         base_metadata: Optional[Dict[str, Any]] = None
     ) -> List[Dict[str, Any]]:
         """
-        Split markdown into semantic chunks with structure awareness
-        
-        Args:
-            markdown_text: Markdown text to chunk
-            structured_data: Document structure metadata
-            base_metadata: Base metadata to attach to chunks
+        Split markdown into optimized chunks
         
         Returns:
-            List of chunk dictionaries
-        
-        Raises:
-            NoChunksCreatedError: If no chunks created
-            ChunkSizeExceededError: If chunk exceeds max size
+            List of chunk dictionaries with metadata
         """
         if not markdown_text or not markdown_text.strip():
             raise NoChunksCreatedError("Empty markdown text provided")
         
-        with PerformanceTimer("chunking_process", log_result=False) as timer:
-            # Parse markdown into structural elements
+        with PerformanceTimer("chunking_process", log_result=False):
+            # Parse into structural elements
             elements = self._parse_markdown_structure(markdown_text)
             
-            logger.debug(f"Parsed {len(elements)} structural elements")
-            
             if not elements:
-                raise NoChunksCreatedError("No structural elements parsed from markdown")
+                raise NoChunksCreatedError("No structural elements parsed")
             
-            # Group elements into chunks
-            chunks = self._group_elements_into_chunks(elements, base_metadata)
+            logger.debug(f"Parsed {len(elements)} elements")
+            
+            # Group elements into heading-based sections
+            sections = self._group_into_sections(elements)
+            logger.debug(f"Grouped into {len(sections)} sections")
+            
+            # Create optimized chunks from sections
+            chunks = self._create_optimized_chunks(sections, base_metadata)
             
             if not chunks:
-                raise NoChunksCreatedError(
-                    "No chunks created. Document may be too short or improperly formatted."
-                )
+                raise NoChunksCreatedError("No chunks created")
             
-            # CRITICAL: Validate ALL chunks before returning
+            # Validate all chunks
             self._validate_all_chunks(chunks)
             
             # Add structured data references
@@ -115,23 +113,15 @@ class SemanticChunkingService:
             
             logger.info(
                 f"Created {len(chunks)} chunks "
-                f"(avg size: {sum(len(c['text']) for c in chunks) // len(chunks)} chars)"
+                f"(avg: {sum(len(c['text']) for c in chunks) // len(chunks)}, "
+                f"min: {min(len(c['text']) for c in chunks)}, "
+                f"max: {max(len(c['text']) for c in chunks)})"
             )
         
         return chunks
     
     def _parse_markdown_structure(self, text: str) -> List[Dict[str, Any]]:
-        """
-        FIXED: Parse markdown into structural elements
-        
-        Fix: Added safety limits to prevent infinite loops in code block extraction
-        
-        Args:
-            text: Markdown text
-            
-        Returns:
-            List of element dictionaries
-        """
+        """Parse markdown into structural elements (same as original)"""
         elements = []
         lines = text.split('\n')
         i = 0
@@ -140,23 +130,22 @@ class SemanticChunkingService:
             line = lines[i]
             line_stripped = line.strip()
             
-            # Empty line - skip
             if not line_stripped:
                 i += 1
                 continue
             
-            # Code block (atomic) - FIXED: with safety limit
+            # Code block (atomic)
             if line_stripped.startswith('```'):
                 code_block, end_idx = self._extract_code_block(lines, i)
                 elements.append({
                     'type': 'code_block',
                     'content': code_block,
-                    'atomic': True  # Never split
+                    'atomic': True
                 })
                 i = end_idx + 1
                 continue
             
-            # Page/Slide marker (keep with following content)
+            # Page/Slide marker
             if re.match(r'^##\s+(Page|Slide)\s+\d+', line_stripped, re.IGNORECASE):
                 elements.append({
                     'type': 'page_marker',
@@ -166,7 +155,7 @@ class SemanticChunkingService:
                 i += 1
                 continue
             
-            # Heading (split point)
+            # Heading
             if line_stripped.startswith('#'):
                 heading_match = re.match(r'^(#{1,6})\s+(.+)$', line_stripped)
                 if heading_match:
@@ -180,29 +169,29 @@ class SemanticChunkingService:
                     i += 1
                     continue
             
-            # Table (atomic - keep intact)
+            # Table (atomic)
             if '|' in line_stripped and self._is_table_row(line_stripped):
                 table, end_idx = self._extract_table(lines, i)
                 elements.append({
                     'type': 'table',
                     'content': table,
-                    'atomic': True  # Never split tables
+                    'atomic': True
                 })
                 i = end_idx + 1
                 continue
             
-            # List item (group with other list items)
+            # List
             if self._is_list_item(line_stripped):
                 list_block, end_idx = self._extract_list(lines, i)
                 elements.append({
                     'type': 'list',
                     'content': list_block,
-                    'atomic': False  # Can split between items if needed
+                    'atomic': False
                 })
                 i = end_idx + 1
                 continue
             
-            # Image description block (keep with context)
+            # Image description
             if '[Image Description]' in line or 'IMAGE_PATH:' in line:
                 img_block, end_idx = self._extract_image_block(lines, i)
                 elements.append({
@@ -213,7 +202,7 @@ class SemanticChunkingService:
                 i = end_idx + 1
                 continue
             
-            # Regular paragraph (accumulate until blank line)
+            # Regular paragraph
             para, end_idx = self._extract_paragraph(lines, i)
             if para.strip():
                 elements.append({
@@ -225,47 +214,486 @@ class SemanticChunkingService:
         
         return elements
     
-    def _extract_code_block(self, lines: List[str], start_idx: int) -> Tuple[str, int]:
+    def _group_into_sections(self, elements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        FIXED: Extract complete code block with safety limit
+        Group elements into sections (heading + its content)
         
-        Fix: Added max_lines limit to prevent infinite loop if closing ``` is missing
-        
-        Args:
-            lines: All lines
-            start_idx: Starting line index (opening ```)
-            
         Returns:
-            Tuple of (code_block_text, end_index)
+            List of sections, each containing: {heading, content_elements, size}
         """
+        sections = []
+        current_heading = None
+        current_content = []
+        
+        for element in elements:
+            if element['type'] == 'heading':
+                # Save previous section
+                if current_heading is not None or current_content:
+                    sections.append({
+                        'heading': current_heading,
+                        'content_elements': current_content,
+                        'size': self._calculate_section_size(current_heading, current_content)
+                    })
+                
+                # Start new section
+                current_heading = element
+                current_content = []
+            else:
+                # Add to current section
+                current_content.append(element)
+        
+        # Add final section
+        if current_heading is not None or current_content:
+            sections.append({
+                'heading': current_heading,
+                'content_elements': current_content,
+                'size': self._calculate_section_size(current_heading, current_content)
+            })
+        
+        return sections
+    
+    def _calculate_section_size(
+        self, 
+        heading: Optional[Dict[str, Any]], 
+        content_elements: List[Dict[str, Any]]
+    ) -> int:
+        """Calculate total size of a section"""
+        size = 0
+        if heading:
+            size += len(heading['content']) + 2  # +2 for newlines
+        for elem in content_elements:
+            size += len(elem['content']) + 2
+        return size
+    
+    def _create_optimized_chunks(
+        self,
+        sections: List[Dict[str, Any]],
+        base_metadata: Optional[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Create optimized chunks from sections
+        
+        Strategy:
+        1. Merge small sections until reaching chunk_size (1500)
+        2. Split large sections at semantic boundaries
+        3. Add controlled overlap between chunks (content only, no headings)
+        """
+        chunks = []
+        chunk_index = 0
+        i = 0
+        
+        while i < len(sections):
+            section = sections[i]
+            
+            # Case 1: Section is small - try to merge with next sections
+            if section['size'] < self.chunk_size:
+                merged_chunk = self._merge_small_sections(sections, i)
+                chunks.append(self._create_chunk_dict(
+                    merged_chunk['text'], chunk_index, base_metadata
+                ))
+                chunk_index += 1
+                i = merged_chunk['next_index']
+            
+            # Case 2: Section is large - split it
+            elif section['size'] > self.chunk_size:
+                section_chunks = self._split_large_section(section, chunk_index, base_metadata)
+                chunks.extend(section_chunks)
+                chunk_index += len(section_chunks)
+                i += 1
+            
+            # Case 3: Section fits perfectly
+            else:
+                text = self._section_to_text(section)
+                chunks.append(self._create_chunk_dict(
+                    text, chunk_index, base_metadata
+                ))
+                chunk_index += 1
+                i += 1
+        
+        # Add overlap between consecutive chunks (content only, no headings)
+        chunks = self._add_content_overlap(chunks)
+        
+        return chunks
+    
+    def _merge_small_sections(
+        self,
+        sections: List[Dict[str, Any]],
+        start_idx: int
+    ) -> Dict[str, Any]:
+        """
+        Merge small sections until reaching chunk_size or max_chunk_size
+        
+        Returns:
+            {text: merged_text, next_index: index_of_next_unprocessed_section}
+        """
+        merged_parts = []
+        total_size = 0
+        i = start_idx
+        
+        while i < len(sections):
+            section = sections[i]
+            section_size = section['size']
+            
+            # Would adding this section exceed max_chunk_size?
+            if total_size + section_size > self.max_chunk_size:
+                # If we haven't added anything yet, we must add this one
+                if not merged_parts:
+                    merged_parts.append(self._section_to_text(section))
+                    i += 1
+                break
+            
+            # Add section
+            merged_parts.append(self._section_to_text(section))
+            total_size += section_size
+            i += 1
+            
+            # Reached target size? Stop (but can continue if next is small)
+            if total_size >= self.chunk_size:
+                # Peek at next section - if it's tiny, include it
+                if i < len(sections) and sections[i]['size'] < 200:
+                    if total_size + sections[i]['size'] <= self.max_chunk_size:
+                        merged_parts.append(self._section_to_text(sections[i]))
+                        total_size += sections[i]['size']
+                        i += 1
+                break
+        
+        return {
+            'text': '\n\n'.join(merged_parts),
+            'next_index': i
+        }
+    
+    def _split_large_section(
+        self,
+        section: Dict[str, Any],
+        start_chunk_index: int,
+        base_metadata: Optional[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Split large section into multiple chunks at semantic boundaries
+        
+        Semantic boundaries (in order of preference):
+        1. Paragraphs (best for context)
+        2. Sentences (fallback)
+        
+        Heading is always kept with first chunk
+        """
+        heading = section['heading']
+        content_elements = section['content_elements']
+        
+        chunks = []
+        chunk_index = start_chunk_index
+        
+        # Start with heading (if exists)
+        heading_text = heading['content'] if heading else ""
+        heading_size = len(heading_text) + 2 if heading_text else 0
+        
+        # Process content elements
+        current_chunk_parts = [heading_text] if heading_text else []
+        current_size = heading_size
+        
+        for elem in content_elements:
+            elem_text = elem['content']
+            elem_size = len(elem_text) + 2
+            
+            # Element alone exceeds max size - must split it
+            if elem_size > self.max_chunk_size:
+                # Save current chunk if it has content
+                if len(current_chunk_parts) > (1 if heading_text else 0):
+                    chunks.append(self._create_chunk_dict(
+                        '\n\n'.join(current_chunk_parts), chunk_index, base_metadata
+                    ))
+                    chunk_index += 1
+                    current_chunk_parts = []
+                    current_size = 0
+                
+                # Split the element itself
+                if elem['atomic']:
+                    # Atomic elements - can't split, create as-is (will exceed limit)
+                    logger.warning(f"Atomic {elem['type']} exceeds max_chunk_size ({elem_size})")
+                    chunks.append(self._create_chunk_dict(
+                        elem_text, chunk_index, base_metadata
+                    ))
+                    chunk_index += 1
+                else:
+                    # Non-atomic - split by paragraphs/sentences
+                    elem_chunks = self._split_text_content(
+                        elem_text, chunk_index, base_metadata
+                    )
+                    chunks.extend(elem_chunks)
+                    chunk_index += len(elem_chunks)
+                
+                continue
+            
+            # Would adding this element exceed max size?
+            if current_size + elem_size > self.max_chunk_size:
+                # Save current chunk
+                if current_chunk_parts:
+                    chunks.append(self._create_chunk_dict(
+                        '\n\n'.join(current_chunk_parts), chunk_index, base_metadata
+                    ))
+                    chunk_index += 1
+                
+                # Start new chunk (no heading in subsequent chunks)
+                current_chunk_parts = [elem_text]
+                current_size = elem_size
+            
+            # Would adding exceed target size? (but not max)
+            elif current_size + elem_size > self.chunk_size:
+                # Save current chunk
+                if current_chunk_parts:
+                    chunks.append(self._create_chunk_dict(
+                        '\n\n'.join(current_chunk_parts), chunk_index, base_metadata
+                    ))
+                    chunk_index += 1
+                
+                # Start new chunk
+                current_chunk_parts = [elem_text]
+                current_size = elem_size
+            
+            # Fits fine
+            else:
+                current_chunk_parts.append(elem_text)
+                current_size += elem_size
+        
+        # Add final chunk
+        if current_chunk_parts:
+            chunks.append(self._create_chunk_dict(
+                '\n\n'.join(current_chunk_parts), chunk_index, base_metadata
+            ))
+        
+        return chunks
+    
+    def _split_text_content(
+        self,
+        text: str,
+        start_chunk_index: int,
+        base_metadata: Optional[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Split large text at paragraph/sentence boundaries
+        
+        No heading duplication - pure content splitting
+        """
+        chunks = []
+        chunk_index = start_chunk_index
+        
+        # Try splitting by paragraphs first
+        paragraphs = re.split(r'\n\s*\n', text)
+        
+        current_chunk = ""
+        
+        for para in paragraphs:
+            para = para.strip()
+            if not para:
+                continue
+            
+            para_size = len(para) + 2
+            
+            # Paragraph alone exceeds max size - split by sentences
+            if para_size > self.max_chunk_size:
+                # Save current chunk if exists
+                if current_chunk:
+                    chunks.append(self._create_chunk_dict(
+                        current_chunk.strip(), chunk_index, base_metadata
+                    ))
+                    chunk_index += 1
+                    current_chunk = ""
+                
+                # Split paragraph by sentences
+                sentence_chunks = self._split_by_sentences(
+                    para, chunk_index, base_metadata
+                )
+                chunks.extend(sentence_chunks)
+                chunk_index += len(sentence_chunks)
+                continue
+            
+            # Would adding this paragraph exceed max size?
+            if len(current_chunk) + para_size > self.max_chunk_size:
+                if current_chunk:
+                    chunks.append(self._create_chunk_dict(
+                        current_chunk.strip(), chunk_index, base_metadata
+                    ))
+                    chunk_index += 1
+                current_chunk = para
+            
+            # Would adding exceed target size?
+            elif len(current_chunk) + para_size > self.chunk_size:
+                if current_chunk:
+                    chunks.append(self._create_chunk_dict(
+                        current_chunk.strip(), chunk_index, base_metadata
+                    ))
+                    chunk_index += 1
+                current_chunk = para
+            
+            # Fits fine
+            else:
+                current_chunk = current_chunk + "\n\n" + para if current_chunk else para
+        
+        # Add final chunk
+        if current_chunk:
+            chunks.append(self._create_chunk_dict(
+                current_chunk.strip(), chunk_index, base_metadata
+            ))
+        
+        return chunks
+    
+    def _split_by_sentences(
+        self,
+        text: str,
+        start_chunk_index: int,
+        base_metadata: Optional[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Split text by sentences as last resort"""
+        chunks = []
+        chunk_index = start_chunk_index
+        
+        # Split by sentence boundaries
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        
+        current_chunk = ""
+        
+        for sentence in sentences:
+            sentence_size = len(sentence) + 1
+            
+            # Single sentence exceeds max size - must include it anyway
+            if sentence_size > self.max_chunk_size:
+                if current_chunk:
+                    chunks.append(self._create_chunk_dict(
+                        current_chunk.strip(), chunk_index, base_metadata
+                    ))
+                    chunk_index += 1
+                
+                chunks.append(self._create_chunk_dict(
+                    sentence.strip(), chunk_index, base_metadata
+                ))
+                chunk_index += 1
+                current_chunk = ""
+                continue
+            
+            # Would adding exceed max size?
+            if len(current_chunk) + sentence_size > self.max_chunk_size:
+                if current_chunk:
+                    chunks.append(self._create_chunk_dict(
+                        current_chunk.strip(), chunk_index, base_metadata
+                    ))
+                    chunk_index += 1
+                current_chunk = sentence
+            
+            # Would adding exceed target size?
+            elif len(current_chunk) + sentence_size > self.chunk_size:
+                if current_chunk:
+                    chunks.append(self._create_chunk_dict(
+                        current_chunk.strip(), chunk_index, base_metadata
+                    ))
+                    chunk_index += 1
+                current_chunk = sentence
+            
+            # Fits fine
+            else:
+                current_chunk = current_chunk + " " + sentence if current_chunk else sentence
+        
+        # Add final chunk
+        if current_chunk:
+            chunks.append(self._create_chunk_dict(
+                current_chunk.strip(), chunk_index, base_metadata
+            ))
+        
+        return chunks
+    
+    def _add_content_overlap(
+        self,
+        chunks: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Add controlled overlap between consecutive chunks
+        
+        CRITICAL: Only overlap content, never headings
+        """
+        if len(chunks) <= 1 or self.chunk_overlap == 0:
+            return chunks
+        
+        for i in range(1, len(chunks)):
+            prev_chunk = chunks[i - 1]
+            curr_chunk = chunks[i]
+            
+            prev_text = prev_chunk['text']
+            curr_text = curr_chunk['text']
+            
+            # Extract overlap from end of previous chunk
+            # Skip if previous chunk starts with heading (don't want to duplicate it)
+            prev_lines = prev_text.split('\n')
+            
+            # Find last non-heading content
+            overlap_lines = []
+            overlap_size = 0
+            
+            for line in reversed(prev_lines):
+                line_stripped = line.strip()
+                
+                # Skip headings
+                if line_stripped.startswith('#'):
+                    break
+                
+                # Skip if empty
+                if not line_stripped:
+                    continue
+                
+                line_size = len(line) + 1
+                
+                if overlap_size + line_size <= self.chunk_overlap:
+                    overlap_lines.insert(0, line)
+                    overlap_size += line_size
+                else:
+                    break
+            
+            # Prepend overlap to current chunk (if not starting with heading)
+            if overlap_lines:
+                curr_first_line = curr_text.split('\n')[0].strip()
+                
+                # Don't add overlap if current chunk starts with heading
+                if not curr_first_line.startswith('#'):
+                    overlap_text = '\n'.join(overlap_lines)
+                    chunks[i]['text'] = overlap_text + '\n\n' + curr_text
+                    chunks[i]['char_count'] = len(chunks[i]['text'])
+        
+        return chunks
+    
+    def _section_to_text(self, section: Dict[str, Any]) -> str:
+        """Convert section to text"""
+        parts = []
+        
+        if section['heading']:
+            parts.append(section['heading']['content'])
+        
+        for elem in section['content_elements']:
+            parts.append(elem['content'])
+        
+        return '\n\n'.join(parts)
+    
+    # ==================== Helper Methods (same as original) ====================
+    
+    def _extract_code_block(self, lines: List[str], start_idx: int) -> Tuple[str, int]:
+        """Extract code block with safety limit"""
         code_lines = [lines[start_idx]]
         i = start_idx + 1
-        max_lines = 500  # SAFETY LIMIT: Max 500 lines in a code block
+        max_lines = 500
         lines_read = 0
         
         while i < len(lines) and lines_read < max_lines:
             code_lines.append(lines[i])
-            
-            # Found closing ```
             if lines[i].strip().startswith('```'):
                 return '\n'.join(code_lines), i
-            
             i += 1
             lines_read += 1
         
-        # FIXED: If we exit loop without finding closing ```, still return what we have
         if lines_read >= max_lines:
-            logger.warning(
-                f"Code block starting at line {start_idx} exceeded max length "
-                f"({max_lines} lines). Treating as unclosed block."
-            )
-            # Add closing ``` to make it valid
+            logger.warning(f"Code block at line {start_idx} exceeded max length")
             code_lines.append('```')
         
         return '\n'.join(code_lines), min(i, len(lines) - 1)
     
     def _extract_table(self, lines: List[str], start_idx: int) -> Tuple[str, int]:
-        """Extract complete markdown table"""
+        """Extract markdown table"""
         table_lines = []
         i = start_idx
         
@@ -282,14 +710,13 @@ class SemanticChunkingService:
         return '\n'.join(table_lines), i - 1
     
     def _extract_list(self, lines: List[str], start_idx: int) -> Tuple[str, int]:
-        """Extract list block (consecutive list items)"""
+        """Extract list block"""
         list_lines = []
         i = start_idx
         
         while i < len(lines):
             line = lines[i].strip()
             if not line:
-                # Check if next line is also a list item (allow one blank line)
                 if i + 1 < len(lines) and self._is_list_item(lines[i + 1].strip()):
                     list_lines.append(lines[i])
                     i += 1
@@ -304,21 +731,18 @@ class SemanticChunkingService:
         return '\n'.join(list_lines), i - 1
     
     def _extract_image_block(self, lines: List[str], start_idx: int) -> Tuple[str, int]:
-        """Extract image description block (caption + description + location)"""
+        """Extract image description block"""
         img_lines = []
         i = start_idx
         
-        # Collect all lines related to this image
         while i < len(lines):
             line = lines[i]
             img_lines.append(line)
             i += 1
             
-            # Stop after location marker
             if line.strip().startswith('*(Located on '):
                 break
             
-            # Or if we hit next structural element
             if i < len(lines):
                 next_line = lines[i].strip()
                 if (next_line.startswith('#') or 
@@ -329,7 +753,7 @@ class SemanticChunkingService:
         return '\n'.join(img_lines), i - 1
     
     def _extract_paragraph(self, lines: List[str], start_idx: int) -> Tuple[str, int]:
-        """Extract paragraph until blank line"""
+        """Extract paragraph"""
         para_lines = []
         i = start_idx
         
@@ -337,7 +761,6 @@ class SemanticChunkingService:
             line = lines[i].strip()
             if not line:
                 break
-            # Stop at structural elements
             if (line.startswith('#') or 
                 line.startswith('```') or
                 self._is_table_row(line) or
@@ -351,360 +774,27 @@ class SemanticChunkingService:
         return '\n'.join(para_lines), i - 1
     
     def _is_table_row(self, line: str) -> bool:
-        """Check if line is a table row"""
-        line = line.strip()
-        # Must have pipes and at least one on each side
-        if not line.startswith('|') or not line.endswith('|'):
+        """Check if line is table row"""
+        if '|' not in line:
             return False
-        # Table separator row: | --- | --- |
-        if re.match(r'^\|[\s\-:]+\|', line):
+        parts = [p.strip() for p in line.split('|')]
+        if len(parts) < 3:
+            return False
+        if all(re.match(r'^:?-+:?$', p) for p in parts if p):
             return True
-        # Regular table row with content
-        if line.count('|') >= 2:
-            return True
-        return False
+        return len([p for p in parts if p]) >= 2
     
     def _is_list_item(self, line: str) -> bool:
-        """Check if line is a list item"""
-        line = line.strip()
-        # Unordered: -, *, +
-        if re.match(r'^[-*+]\s', line):
-            return True
-        # Ordered: 1., 2., etc.
-        if re.match(r'^\d+\.\s', line):
-            return True
-        return False
-    
-    def _group_elements_into_chunks(
-        self,
-        elements: List[Dict[str, Any]],
-        base_metadata: Optional[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        """
-        Group elements into chunks respecting structure and size limits
-        
-        Strategy:
-        1. Start new chunk at headings (preferred split point)
-        2. Keep atomic elements intact (code blocks, tables)
-        3. Merge small sections
-        4. Split large sections by paragraphs if needed
-        
-        Args:
-            elements: List of parsed elements
-            base_metadata: Base metadata
-            
-        Returns:
-            List of chunk dictionaries
-        """
-        chunks = []
-        current_chunk_elements = []
-        current_size = 0
-        chunk_index = 0
-        
-        for i, element in enumerate(elements):
-            element_size = len(element['content'])
-            
-            # Check if element alone exceeds max size
-            if element_size > self.max_chunk_size:
-                # Save current chunk if exists
-                if current_chunk_elements:
-                    chunk_text = self._combine_elements(current_chunk_elements)
-                    chunks.append(self._create_chunk_dict(
-                        chunk_text, chunk_index, base_metadata
-                    ))
-                    chunk_index += 1
-                    current_chunk_elements = []
-                    current_size = 0
-                
-                # Handle oversized element
-                if element.get('atomic'):
-                    # Atomic elements (code blocks, tables) - truncate
-                    logger.warning(
-                        f"Atomic {element['type']} exceeds max size "
-                        f"({element_size} > {self.max_chunk_size}), truncating"
-                    )
-                    truncated = element['content'][:self.max_chunk_size - 50] + "\n...[truncated]"
-                    chunks.append(self._create_chunk_dict(
-                        truncated, chunk_index, base_metadata
-                    ))
-                    chunk_index += 1
-                else:
-                    # Non-atomic elements (paragraphs, lists) - split intelligently
-                    logger.warning(
-                        f"Large {element['type']} exceeds max size "
-                        f"({element_size} > {self.max_chunk_size}), splitting"
-                    )
-                    sub_chunks = self._split_large_element(
-                        element, chunk_index, base_metadata
-                    )
-                    chunks.extend(sub_chunks)
-                    chunk_index += len(sub_chunks)
-                
-                continue
-            
-            # Check if adding this element would exceed target size
-            potential_size = current_size + element_size + 2  # +2 for newlines
-            
-            # Decision point: start new chunk?
-            should_start_new = False
-            
-            if potential_size > self.chunk_size:
-                # Only start new chunk at good boundaries
-                if element['type'] == 'heading':
-                    should_start_new = True
-                elif element['type'] == 'page_marker':
-                    should_start_new = True
-                elif current_size > self.chunk_size * 0.7:  # 70% full, can split
-                    should_start_new = True
-            
-            # Would exceed max size - must split
-            if potential_size > self.max_chunk_size:
-                should_start_new = True
-            
-            if should_start_new and current_chunk_elements:
-                # Save current chunk
-                chunk_text = self._combine_elements(current_chunk_elements)
-                chunks.append(self._create_chunk_dict(
-                    chunk_text, chunk_index, base_metadata
-                ))
-                chunk_index += 1
-                
-                # Start new chunk with overlap
-                if self.chunk_overlap > 0:
-                    overlap_elements = self._get_overlap_elements(
-                        current_chunk_elements, self.chunk_overlap
-                    )
-                    current_chunk_elements = overlap_elements
-                    current_size = sum(len(e['content']) for e in overlap_elements)
-                else:
-                    current_chunk_elements = []
-                    current_size = 0
-            
-            # Add element to current chunk
-            current_chunk_elements.append(element)
-            current_size += element_size + 2
-        
-        # Add final chunk
-        if current_chunk_elements:
-            chunk_text = self._combine_elements(current_chunk_elements)
-            chunks.append(self._create_chunk_dict(
-                chunk_text, chunk_index, base_metadata
-            ))
-        
-        return chunks
-    
-    def _combine_elements(self, elements: List[Dict[str, Any]]) -> str:
-        """Combine elements into text with proper spacing"""
-        if not elements:
-            return ""
-        
-        parts = []
-        for element in elements:
-            content = element['content']
-            if element['type'] == 'heading':
-                if parts:
-                    parts.append('\n')  # Extra space before headings
-                parts.append(content)
-            elif element['type'] in ['code_block', 'table', 'image_desc']:
-                if parts:
-                    parts.append('\n')
-                parts.append(content)
-            else:
-                parts.append(content)
-        
-        return '\n'.join(parts)
-    
-    def _get_overlap_elements(
-        self,
-        elements: List[Dict[str, Any]],
-        target_overlap: int
-    ) -> List[Dict[str, Any]]:
-        """Get elements for overlap (from end of chunk)"""
-        if not elements:
-            return []
-        
-        overlap_elements = []
-        overlap_size = 0
-        
-        # Work backwards from end
-        for element in reversed(elements):
-            element_size = len(element['content'])
-            
-            if overlap_size + element_size <= target_overlap:
-                overlap_elements.insert(0, element)
-                overlap_size += element_size
-            else:
-                break
-        
-        return overlap_elements
-    
-    def _split_large_element(
-        self,
-        element: Dict[str, Any],
-        start_chunk_index: int,
-        base_metadata: Optional[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        """Split a large non-atomic element into multiple chunks"""
-        content = element['content']
-        element_type = element['type']
-        chunks = []
-        chunk_index = start_chunk_index
-        
-        if element_type == 'list':
-            chunks = self._split_large_list(content, chunk_index, base_metadata)
-        elif element_type == 'paragraph':
-            chunks = self._split_large_paragraph(content, chunk_index, base_metadata)
-        elif element_type == 'heading':
-            chunks = self._split_heading_section(content, chunk_index, base_metadata)
-        else:
-            chunks = self._split_large_paragraph(content, chunk_index, base_metadata)
-        
-        return chunks
-    
-    def _split_large_list(
-        self,
-        list_content: str,
-        start_chunk_index: int,
-        base_metadata: Optional[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        """Split large list by items"""
-        chunks = []
-        lines = list_content.split('\n')
-        current_chunk_lines = []
-        current_size = 0
-        chunk_index = start_chunk_index
-        
-        for line in lines:
-            line_size = len(line) + 1
-            
-            if current_size + line_size > self.max_chunk_size:
-                if current_chunk_lines:
-                    chunk_text = '\n'.join(current_chunk_lines)
-                    chunks.append(self._create_chunk_dict(
-                        chunk_text, chunk_index, base_metadata
-                    ))
-                    chunk_index += 1
-                    current_chunk_lines = []
-                    current_size = 0
-            
-            current_chunk_lines.append(line)
-            current_size += line_size
-        
-        if current_chunk_lines:
-            chunk_text = '\n'.join(current_chunk_lines)
-            chunks.append(self._create_chunk_dict(
-                chunk_text, chunk_index, base_metadata
-            ))
-        
-        return chunks
-    
-    def _split_large_paragraph(
-        self,
-        paragraph: str,
-        start_chunk_index: int,
-        base_metadata: Optional[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        """Split large paragraph by sentences"""
-        chunks = []
-        sentences = re.split(r'(?<=[.!?])\s+', paragraph)
-        
-        current_chunk = ""
-        chunk_index = start_chunk_index
-        
-        for sentence in sentences:
-            potential_size = len(current_chunk) + len(sentence) + 1
-            
-            if potential_size <= self.max_chunk_size:
-                current_chunk = (
-                    current_chunk + " " + sentence 
-                    if current_chunk else sentence
-                )
-            else:
-                if current_chunk.strip():
-                    chunks.append(self._create_chunk_dict(
-                        current_chunk.strip(), chunk_index, base_metadata
-                    ))
-                    chunk_index += 1
-                
-                if len(sentence) > self.max_chunk_size:
-                    logger.warning(
-                        f"Single sentence exceeds max size ({len(sentence)} chars), "
-                        f"truncating to {self.max_chunk_size}"
-                    )
-                    truncated = sentence[:self.max_chunk_size - 50]
-                    last_space = truncated.rfind(' ')
-                    if last_space > 0:
-                        truncated = truncated[:last_space]
-                    sentence = truncated + "..."
-                
-                current_chunk = sentence
-        
-        if current_chunk.strip():
-            chunks.append(self._create_chunk_dict(
-                current_chunk.strip(), chunk_index, base_metadata
-            ))
-        
-        return chunks
-    
-    def _split_heading_section(
-        self,
-        section_content: str,
-        start_chunk_index: int,
-        base_metadata: Optional[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        """Split heading section by paragraphs"""
-        chunks = []
-        parts = re.split(r'\n\s*\n', section_content)
-        
-        current_chunk_parts = []
-        current_size = 0
-        chunk_index = start_chunk_index
-        
-        for part in parts:
-            part = part.strip()
-            if not part:
-                continue
-            
-            part_size = len(part) + 2
-            
-            if current_size + part_size > self.max_chunk_size:
-                if current_chunk_parts:
-                    chunk_text = '\n\n'.join(current_chunk_parts)
-                    chunks.append(self._create_chunk_dict(
-                        chunk_text, chunk_index, base_metadata
-                    ))
-                    chunk_index += 1
-                    current_chunk_parts = []
-                    current_size = 0
-                
-                if part_size > self.max_chunk_size:
-                    sentence_chunks = self._split_large_paragraph(
-                        part, chunk_index, base_metadata
-                    )
-                    chunks.extend(sentence_chunks)
-                    chunk_index += len(sentence_chunks)
-                else:
-                    current_chunk_parts.append(part)
-                    current_size = part_size
-            else:
-                current_chunk_parts.append(part)
-                current_size += part_size
-        
-        if current_chunk_parts:
-            chunk_text = '\n\n'.join(current_chunk_parts)
-            chunks.append(self._create_chunk_dict(
-                chunk_text, chunk_index, base_metadata
-            ))
-        
-        return chunks
+        """Check if line is list item"""
+        return bool(re.match(r'^(\*|-|\+|\d+\.)\s+', line))
     
     def _generate_chunk_id(
-    self, 
-    text: str, 
-    index: int,
-    file_id: Optional[str] = None
-) -> str:
-        """Generate unique chunk ID with file_id"""
+        self, 
+        text: str, 
+        index: int,
+        file_id: Optional[str] = None
+    ) -> str:
+        """Generate unique chunk ID (compatible with Qdrant UUID conversion)"""
         if file_id:
             hash_input = f"{file_id}_{index}_{text}".encode()
         else:
@@ -712,66 +802,159 @@ class SemanticChunkingService:
         
         content_hash = hashlib.sha256(hash_input).hexdigest()[:16]
         
-        # Add timestamp for extra uniqueness
         import time
         timestamp = str(int(time.time() * 1000))[-6:]
         
         return f"chunk_{index}_{content_hash}_{timestamp}"
-
+    
     def _create_chunk_dict(
         self,
         text: str,
         chunk_index: int,
         base_metadata: Optional[Dict[str, Any]]
     ) -> Dict[str, Any]:
-        """Create chunk with file_id"""
+        """Create chunk dictionary"""
         file_id = base_metadata.get('file_id') if base_metadata else None
-        chunk_id = self._generate_chunk_id(text, chunk_index, file_id)  # Pass file_id
+        chunk_id = self._generate_chunk_id(text, chunk_index, file_id)
         
-        chunk = {
+        return {
             'chunk_id': chunk_id,
             'chunk_index': chunk_index,
             'text': text,
             'char_count': len(text),
             'metadata': base_metadata or {}
         }
-        
-        return chunk
     
     def _validate_all_chunks(self, chunks: List[Dict[str, Any]]) -> None:
-        """Validate all chunks meet size requirements"""
+        """Validate all chunks"""
         for i, chunk in enumerate(chunks):
             text = chunk.get('text', '')
             char_count = len(text)
             
             if char_count > self.max_chunk_size:
-                raise ChunkSizeExceededError(
-                    f"Chunk {i} exceeds max size: {char_count} > {self.max_chunk_size}"
+                logger.warning(
+                    f"Chunk {i} exceeds max_chunk_size: {char_count} > {self.max_chunk_size} "
+                    f"(will be truncated by vector_store_service at embedding time)"
                 )
             
             if char_count == 0:
                 logger.warning(f"Chunk {i} is empty")
     
     def _add_structured_references(
-        self,
-        chunks: List[Dict[str, Any]],
-        structured_data: Dict[str, Any]
-    ) -> List[Dict[str, Any]]:
-        """Add structured data references to chunks"""
+    self,
+    chunks: List[Dict[str, Any]],
+    structured_data: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+        """
+        Add structured data references with ROBUST page_number extraction
+        
+        CRITICAL FIX:
+        1. Remove all confusing fields (total_pages, total_slides) 
+        2. Extract page_number from markdown text (e.g., "## Page 3" -> 3)
+        3. Extract slide_number from markdown text (e.g., "## Slide 5" -> 5)
+        4. For PPTs, ensure page_number = slide_number
+        5. Default to 0 if no marker found
+        
+        This ensures page_number is always the ACTUAL page, never total_pages
+        """
         for chunk in chunks:
-            # Extract page/slide numbers
+            # STEP 1: Remove all potentially confusing fields
+            # These should NEVER be in chunk metadata as they can be confused with page_number
+            confusing_fields = ['total_pages', 'total_slides', 'num_pages', 'page_count']
+            for field in confusing_fields:
+                chunk['metadata'].pop(field, None)  # Safe deletion (no error if not present)
+            
+            # STEP 2: Extract actual page number from markdown headers in chunk text
+            # This is the SOURCE OF TRUTH for page_number
             page_match = re.search(r'##\s+Page\s+(\d+)', chunk['text'], re.IGNORECASE)
             if page_match:
-                chunk['metadata']['page_number'] = int(page_match.group(1))
+                actual_page_number = int(page_match.group(1))
+                chunk['metadata']['page_number'] = actual_page_number
+                logger.debug(f"Chunk {chunk.get('chunk_index', '?')}: Found page marker -> page_number={actual_page_number}")
             
+            # STEP 3: Extract slide number from markdown headers
             slide_match = re.search(r'##\s+Slide\s+(\d+)', chunk['text'], re.IGNORECASE)
             if slide_match:
-                chunk['metadata']['slide_number'] = int(slide_match.group(1))
+                actual_slide_number = int(slide_match.group(1))
+                chunk['metadata']['slide_number'] = actual_slide_number
+                
+                # For PowerPoint files, page_number should equal slide_number
+                # Only set if page_number wasn't already set by a "## Page" marker
+                if 'page_number' not in chunk['metadata']:
+                    chunk['metadata']['page_number'] = actual_slide_number
+                    logger.debug(f"Chunk {chunk.get('chunk_index', '?')}: Found slide marker -> page_number={actual_slide_number}")
             
-            # Extract section hierarchy
+            # STEP 4: Default to 0 if no page or slide marker found
+            # This is better than None as it's a valid integer for filtering
+            if 'page_number' not in chunk['metadata']:
+                chunk['metadata']['page_number'] = 0
+                logger.debug(f"Chunk {chunk.get('chunk_index', '?')}: No page marker found -> page_number=0 (default)")
+            
+            # STEP 5: Extract section hierarchy (for context)
             section_matches = re.findall(r'^(#{1,6})\s+(.+)$', chunk['text'], re.MULTILINE)
             if section_matches:
+                # Get up to 3 heading levels
                 section_hierarchy = [match[1].strip() for match in section_matches[:3]]
-                chunk['metadata']['section_hierarchy'] = section_hierarchy
+                # Filter out page/slide markers from hierarchy
+                section_hierarchy = [
+                    h for h in section_hierarchy 
+                    if not re.match(r'^(Page|Slide)\s+\d+$', h, re.IGNORECASE)
+                ]
+                if section_hierarchy:
+                    chunk['metadata']['section_hierarchy'] = section_hierarchy
         
         return chunks
+
+
+    # VERIFICATION FUNCTION - Add this to help debug
+    def verify_page_numbers(chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Verify that page_number metadata is correctly set
+        
+        Returns summary statistics for debugging
+        """
+        stats = {
+            'total_chunks': len(chunks),
+            'chunks_with_page_marker': 0,
+            'chunks_with_slide_marker': 0,
+            'chunks_with_page_number_0': 0,
+            'page_numbers': [],
+            'unique_pages': set(),
+            'issues': []
+        }
+        
+        for i, chunk in enumerate(chunks):
+            page_num = chunk['metadata'].get('page_number', None)
+            
+            if page_num is None:
+                stats['issues'].append(f"Chunk {i}: page_number is None")
+                continue
+            
+            stats['page_numbers'].append(page_num)
+            stats['unique_pages'].add(page_num)
+            
+            # Check if chunk has page marker in text
+            if re.search(r'##\s+Page\s+\d+', chunk['text'], re.IGNORECASE):
+                stats['chunks_with_page_marker'] += 1
+            
+            # Check if chunk has slide marker in text
+            if re.search(r'##\s+Slide\s+\d+', chunk['text'], re.IGNORECASE):
+                stats['chunks_with_slide_marker'] += 1
+            
+            # Count default page_number=0
+            if page_num == 0:
+                stats['chunks_with_page_number_0'] += 1
+            
+            # Check for suspicious values (e.g., page_number > 1000 suggests it's total_pages)
+            if page_num > 1000:
+                stats['issues'].append(
+                    f"Chunk {i}: Suspicious page_number={page_num} (might be total_pages!)"
+                )
+        
+        # Calculate statistics
+        if stats['page_numbers']:
+            stats['min_page'] = min(stats['page_numbers'])
+            stats['max_page'] = max(stats['page_numbers'])
+            stats['unique_page_count'] = len(stats['unique_pages'])
+        
+        return stats

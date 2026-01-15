@@ -4,13 +4,14 @@ Query Route with MANDATORY USER AUTH and DATABASE-BACKED CONVERSATION HISTORY
 - Full user isolation in vector search
 - Conversation history stored in database (FIFO)
 - Query logging to database
+- UPDATED: Uses search_type (dense/sparse/hybrid) instead of weights
 """
 
 from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.orm import Session
 from app.models.schemas import (
     QueryRequest, QueryResponse, SourceDocument,
-    ConversationQueryRequest
+    ConversationQueryRequest, SearchType
 )
 from app.services.vector_store_service import VectorStoreService
 from app.services.llm_service import LLMService
@@ -62,16 +63,15 @@ async def query_knowledge_base(
     db: Session = Depends(get_database_session)
 ):
     """
-    Query with hybrid search (BM25 + Semantic) and USER ISOLATION
+    Query with search type selection (dense/sparse/hybrid) and USER ISOLATION
     
     Headers:
         X-User-ID: User identifier (REQUIRED)
     
-    Default weights:
-    - Keyword (BM25): 0.3
-    - Semantic: 0.7
-    
-    You can adjust weights, but they must sum to 1.0
+    Search Types:
+    - dense: Semantic search only (using user-selected embedding model)
+    - sparse: Keyword search only (using SPLADE)
+    - hybrid: Both methods combined with RRF fusion (default)
     
     Returns:
         QueryResponse with answer and sources
@@ -79,25 +79,18 @@ async def query_knowledge_base(
     start_time = time.time()
     
     try:
-        # Validate and normalize weights
-        keyword_weight = request.keyword_weight if request.keyword_weight is not None else 0.3
-        semantic_weight = request.semantic_weight if request.semantic_weight is not None else 0.7
+        # Get search type (default to hybrid)
+        search_type = request.search_type or SearchType.HYBRID
         
-        # Ensure they sum to 1.0
-        total = keyword_weight + semantic_weight
-        if abs(total - 1.0) > 0.01:
-            keyword_weight = keyword_weight / total
-            semantic_weight = semantic_weight / total
-            logger.info(f"Normalized weights: keyword={keyword_weight:.2f}, semantic={semantic_weight:.2f}")
+        logger.info(f"Query with search_type={search_type.value}, top_k={request.top_k}")
         
-        # Hybrid search with USER ISOLATION
-        documents, metadatas, scores = vector_store.hybrid_search(
+        # Search with USER ISOLATION
+        documents, metadatas, scores = vector_store.search(
             query=request.question,
             top_k=request.top_k,
             user_id=user_id,  # CRITICAL: USER ISOLATION
             file_id=getattr(request, 'file_id', None),
-            keyword_weight=keyword_weight,
-            semantic_weight=semantic_weight
+            search_type=search_type.value
         )
         
         if not documents:
@@ -166,8 +159,8 @@ async def query_knowledge_base(
                 question=request.question,
                 answer=answer,
                 top_k=request.top_k,
-                keyword_weight=keyword_weight,
-                semantic_weight=semantic_weight,
+                keyword_weight=0.0,  # No longer used but kept for DB compatibility
+                semantic_weight=0.0,  # No longer used but kept for DB compatibility
                 chunks_retrieved=len(documents),
                 processing_time_seconds=processing_time,
                 confidence_score=confidence,
@@ -185,10 +178,8 @@ async def query_knowledge_base(
             answer=answer,
             sources=sources,
             processing_time=round(processing_time, 2),
-            search_strategy="hybrid",
-            confidence_score=round(confidence, 3),
-            keyword_weight=round(keyword_weight, 2),
-            semantic_weight=round(semantic_weight, 2)
+            search_type=search_type,
+            confidence_score=round(confidence, 3)
         )
     
     except HTTPException:
@@ -221,35 +212,35 @@ async def query_with_conversation(
     - Oldest pairs deleted automatically (FIFO)
     - Fully user-isolated
     
+    Search Types:
+    - dense: Semantic search only
+    - sparse: Keyword search only (SPLADE)
+    - hybrid: Both methods combined with RRF fusion
+    
     Returns:
         QueryResponse with answer and sources
     """
     start_time = time.time()
     
     try:
-        # Validate and normalize weights
-        keyword_weight = request.keyword_weight if request.keyword_weight is not None else 0.3
-        semantic_weight = request.semantic_weight if request.semantic_weight is not None else 0.7
+        # Get search type (default to hybrid)
+        search_type = request.search_type or SearchType.HYBRID
         
-        total = keyword_weight + semantic_weight
-        if abs(total - 1.0) > 0.01:
-            keyword_weight = keyword_weight / total
-            semantic_weight = semantic_weight / total
+        logger.info(f"Conversation query with search_type={search_type.value}")
         
-        # Retrieve chunks with hybrid search and USER ISOLATION
-        documents, metadatas, scores = vector_store.hybrid_search(
+        # Retrieve chunks with search and USER ISOLATION
+        documents, metadatas, scores = vector_store.search(
             query=request.question,
             top_k=request.top_k,
             user_id=user_id,  # CRITICAL: USER ISOLATION
-            file_id=request.file_id,
-            keyword_weight=keyword_weight,
-            semantic_weight=semantic_weight
+            file_id=getattr(request, 'file_id', None),
+            search_type=search_type.value
         )
         
         if not documents:
             raise HTTPException(
                 status_code=404,
-                detail="No documents found."
+                detail="No documents found. Please upload and process documents first."
             )
         
         # Build context with safe metadata access
@@ -307,8 +298,8 @@ async def query_with_conversation(
                 question=request.question,
                 answer=answer,
                 top_k=request.top_k,
-                keyword_weight=keyword_weight,
-                semantic_weight=semantic_weight,
+                keyword_weight=0.0,  # No longer used but kept for DB compatibility
+                semantic_weight=0.0,  # No longer used but kept for DB compatibility
                 chunks_retrieved=len(documents),
                 processing_time_seconds=processing_time,
                 confidence_score=confidence,
@@ -325,11 +316,9 @@ async def query_with_conversation(
             answer=answer,
             sources=sources,
             processing_time=round(processing_time, 2),
-            search_strategy="hybrid",
+            search_type=search_type,
             confidence_score=round(confidence, 3),
-            conversation_id=request.conversation_id,
-            keyword_weight=round(keyword_weight, 2),
-            semantic_weight=round(semantic_weight, 2)
+            conversation_id=request.conversation_id
         )
     
     except HTTPException:
