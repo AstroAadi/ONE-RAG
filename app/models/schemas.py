@@ -1,7 +1,7 @@
 """
 Pydantic Schemas for RAG System
 Complete type safety with proper validation
-Updated: Replaced keyword_weight/semantic_weight with search_type
+Updated: Added chunk editing support with chunk_id, file_id, and full_text
 """
 
 from pydantic import BaseModel, Field, field_validator, ConfigDict, model_validator
@@ -94,6 +94,47 @@ class ConversationQueryRequest(QueryRequest):
     )
 
 
+# ==================== NEW: Chunk Editing Request Models ====================
+
+class ChunkRetrievalRequest(BaseModel):
+    """Request to retrieve a specific chunk"""
+    model_config = ConfigDict(str_strip_whitespace=True)
+    
+    chunk_id: str = Field(..., min_length=1, max_length=200, description="Unique chunk identifier")
+    file_id: Optional[str] = Field(None, description="Optional file ID for validation")
+
+
+class UpdateChunkRequest(BaseModel):
+    """Request to update/edit a chunk"""
+    model_config = ConfigDict(str_strip_whitespace=True)
+    
+    chunk_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description="Unique chunk identifier"
+    )
+    
+    file_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="Parent file ID (for validation)"
+    )
+    
+    new_text: str = Field(
+        ...,
+        min_length=1,
+        max_length=10000,
+        description="New chunk text content"
+    )
+    
+    preserve_metadata: bool = Field(
+        default=True,
+        description="Whether to preserve existing metadata"
+    )
+
+
 # ==================== Response Models ====================
 
 class FileUploadResponse(BaseModel):
@@ -125,12 +166,36 @@ class DocumentProcessResponse(BaseModel):
 
 
 class SourceDocument(BaseModel):
-    """Source document chunk in query results"""
+    """
+    ENHANCED: Source document chunk in query results with chunk editing support
+    
+    Now includes:
+    - chunk_id: For identifying the exact chunk to edit
+    - file_id: For parent file identification
+    - full_text: Complete chunk text (not truncated) for editing
+    """
     model_config = ConfigDict(from_attributes=True)
     
-    content: str = Field(..., description="Chunk content")
+    # Core content
+    content: str = Field(..., description="Chunk content (may be truncated for display)")
+    
+    # NEW: Full text for editing (not truncated)
+    full_text: Optional[str] = Field(
+        default=None,
+        description="Complete chunk text (for editing purposes)"
+    )
+    
+    # Identifiers
     filename: str = Field(..., description="Source filename")
-    chunk_id: str = Field(..., description="Unique chunk ID")
+    chunk_id: str = Field(..., description="Unique chunk ID (for editing)")
+    
+    # NEW: File ID for editing validation
+    file_id: str = Field(
+        default="unknown",
+        description="Parent file ID (for editing validation)"
+    )
+    
+    # Scores
     relevance_score: float = Field(..., description="Relevance score")
     
     # Optional metadata
@@ -171,7 +236,7 @@ class QueryResponse(BaseModel):
     
     question: str
     answer: str
-    sources: List[SourceDocument]
+    sources: List[SourceDocument]  # Now includes chunk_id, file_id, and full_text
     
     # Performance metrics
     processing_time: float = Field(..., description="Processing time in seconds")
@@ -183,6 +248,77 @@ class QueryResponse(BaseModel):
     # Optional conversation tracking
     conversation_id: Optional[str] = None
 
+
+# ==================== NEW: Chunk Editing Response Models ====================
+
+class ChunkDetailResponse(BaseModel):
+    """Response with complete chunk details"""
+    model_config = ConfigDict(from_attributes=True)
+    
+    chunk_id: str
+    file_id: str
+    text: str = Field(..., description="Complete chunk text")
+    filename: str
+    user_id: str
+    
+    # Metadata
+    chunk_type: str = Field(default="text")
+    page_number: int = Field(default=0, ge=0)
+    char_count: int = Field(..., ge=0)
+    chunk_index: int = Field(default=0, ge=0)
+    
+    # Timestamps
+    created_at: str
+    updated_at: Optional[str] = None
+    
+    # Edit tracking
+    edited: bool = Field(default=False)
+    
+    # Additional metadata
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class UpdateChunkResponse(BaseModel):
+    """Response after chunk update"""
+    model_config = ConfigDict(from_attributes=True)
+    
+    message: str
+    chunk_id: str
+    file_id: str
+    user_id: str
+    
+    # Changes
+    old_char_count: int = Field(..., ge=0)
+    new_char_count: int = Field(..., ge=0)
+    
+    # Timestamp
+    updated_at: str
+
+
+class ChunkListItem(BaseModel):
+    """Individual chunk in file chunk list"""
+    model_config = ConfigDict(from_attributes=True)
+    
+    chunk_id: str
+    chunk_index: int = Field(..., ge=0)
+    chunk_type: str = Field(default="text")
+    char_count: int = Field(..., ge=0)
+    page_number: int = Field(default=0, ge=0)
+    created_at: Optional[str] = None
+    edited: bool = Field(default=False)
+
+
+class FileChunksResponse(BaseModel):
+    """Response with all chunks for a file"""
+    model_config = ConfigDict(from_attributes=True)
+    
+    file_id: str
+    filename: str
+    total_chunks: int = Field(..., ge=0)
+    chunks: List[ChunkListItem]
+
+
+# ==================== Existing Models (Unchanged) ====================
 
 class DocumentInfo(BaseModel):
     """Document information in knowledge base"""

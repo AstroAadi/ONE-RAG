@@ -41,7 +41,7 @@ class SPLADEEmbedder:
     """
     Local SPLADE sparse embedder using sentence-transformers
     
-    This is much more reliable than the HF Inference API!
+    CORRECTED: Properly handles scipy sparse matrix output
     """
     
     def __init__(self):
@@ -65,6 +65,117 @@ class SPLADEEmbedder:
             self.model = None
             self.available = False
     
+    def _sparse_matrix_to_qdrant(self, sparse_output) -> SparseVector:
+        """
+        Convert SPLADE output to Qdrant SparseVector
+        
+        Handles PyTorch sparse tensors (COO format) from sentence-transformers
+        
+        Args:
+            sparse_output: PyTorch sparse tensor in COO format
+                
+        Returns:
+            SparseVector with indices and values
+        """
+        try:
+            import torch
+            
+            # Check if it's a PyTorch tensor
+            if isinstance(sparse_output, torch.Tensor):
+                
+                # CASE 1: PyTorch Sparse Tensor (COO format)
+                if sparse_output.is_sparse:
+                    logger.debug(f"Converting PyTorch sparse tensor: shape={sparse_output.shape}")
+                    
+                    # Get sparse tensor in COO format
+                    sparse_tensor = sparse_output.coalesce()  # Ensure it's coalesced
+                    
+                    # Extract indices and values
+                    # For 1D or 2D sparse tensor, indices() returns [2, nnz] or [1, nnz]
+                    indices_tensor = sparse_tensor.indices()
+                    values_tensor = sparse_tensor.values()
+                    
+                    # Handle 2D tensor (batch_size=1, vocab_size)
+                    if indices_tensor.dim() == 2:
+                        # Take the last row (column indices for vocab positions)
+                        indices_numpy = indices_tensor[-1].cpu().numpy()
+                    else:
+                        # 1D tensor
+                        indices_numpy = indices_tensor.cpu().numpy()
+                    
+                    values_numpy = values_tensor.cpu().numpy()
+                    
+                    # Handle empty vectors
+                    if len(indices_numpy) == 0 or len(values_numpy) == 0:
+                        logger.warning("Generated empty sparse vector (no non-zero values)")
+                        return SparseVector(indices=[0], values=[0.0])
+                    
+                    # Convert to required types
+                    indices = [int(idx) for idx in indices_numpy]
+                    values = [float(val) for val in values_numpy]
+                    
+                    logger.debug(
+                        f"Converted sparse tensor: {len(indices)} non-zero elements, "
+                        f"max_value={max(values):.4f}, max_idx={max(indices)}"
+                    )
+                    
+                    return SparseVector(indices=indices, values=values)
+                
+                # CASE 2: Dense PyTorch Tensor (fallback)
+                else:
+                    logger.debug(f"Converting dense PyTorch tensor: shape={sparse_output.shape}")
+                    
+                    # Squeeze to remove batch dimensions
+                    if sparse_output.dim() > 1:
+                        sparse_output = sparse_output.squeeze()
+                    
+                    numpy_vector = sparse_output.cpu().numpy()
+                    
+                    # Get non-zero indices and values
+                    nonzero_indices = numpy_vector.nonzero()[0]
+                    nonzero_values = numpy_vector[nonzero_indices]
+                    
+                    if len(nonzero_indices) == 0:
+                        logger.warning("Generated empty sparse vector (no non-zero values)")
+                        return SparseVector(indices=[0], values=[0.0])
+                    
+                    indices = [int(idx) for idx in nonzero_indices]
+                    values = [float(val) for val in nonzero_values]
+                    
+                    return SparseVector(indices=indices, values=values)
+            
+            # CASE 3: scipy sparse matrix (legacy support)
+            else:
+                import scipy.sparse
+                
+                if scipy.sparse.issparse(sparse_output):
+                    logger.debug("Converting scipy sparse matrix")
+                    
+                    coo = sparse_output.tocoo()
+                    indices = coo.col.tolist()
+                    values = coo.data.tolist()
+                    
+                    if len(indices) == 0 or len(values) == 0:
+                        logger.warning("Generated empty sparse vector from sparse matrix")
+                        return SparseVector(indices=[0], values=[0.0])
+                    
+                    indices = [int(idx) for idx in indices]
+                    values = [float(val) for val in values]
+                    
+                    return SparseVector(indices=indices, values=values)
+                else:
+                    logger.warning(
+                        f"Unexpected sparse output type: {type(sparse_output)}, "
+                        f"using fallback"
+                    )
+                    return SparseVector(indices=[0], values=[0.0])
+                
+        except Exception as e:
+            logger.error(f"Error converting sparse output: {e}")
+            import traceback
+            traceback.print_exc()
+            return SparseVector(indices=[0], values=[0.0])
+    
     def embed_documents(self, texts: List[str]) -> List[SparseVector]:
         """
         Generate SPLADE sparse embeddings for multiple texts
@@ -76,29 +187,39 @@ class SPLADEEmbedder:
             List of SparseVector objects
         """
         if not self.available:
-            # Return empty sparse vectors as fallback
+            logger.debug("SPLADE not available, returning empty sparse vectors")
             return [SparseVector(indices=[0], values=[0.0]) for _ in texts]
         
         try:
             # Generate sparse embeddings using sentence-transformers
-            sparse_dicts = self.model.encode(texts, convert_to_tensor=False)
+            # This returns a list of scipy sparse matrices
+            sparse_matrices = self.model.encode(texts, convert_to_tensor=False)
             
+            logger.debug(f"Generated {len(sparse_matrices)} sparse embeddings")
+            
+            # Convert each sparse matrix to Qdrant SparseVector format
             sparse_vectors = []
-            for sparse_dict in sparse_dicts:
-                # Convert dict format to Qdrant SparseVector format
-                if isinstance(sparse_dict, dict) and 'indices' in sparse_dict and 'values' in sparse_dict:
-                    sparse_vectors.append(SparseVector(
-                        indices=sparse_dict['indices'],
-                        values=sparse_dict['values']
-                    ))
-                else:
-                    # Fallback for unexpected format
+            for i, sparse_matrix in enumerate(sparse_matrices):
+                try:
+                    sparse_vector = self._sparse_matrix_to_qdrant(sparse_matrix)
+                    sparse_vectors.append(sparse_vector)
+                    
+                    # Log first few for debugging
+                    if i < 3:
+                        logger.debug(
+                            f"Sparse vector {i}: {len(sparse_vector.indices)} non-zero elements, "
+                            f"first 5 indices: {sparse_vector.indices[:5]}"
+                        )
+                except Exception as e:
+                    logger.warning(f"Error processing sparse matrix {i}: {e}")
                     sparse_vectors.append(SparseVector(indices=[0], values=[0.0]))
             
             return sparse_vectors
             
         except Exception as e:
             logger.error(f"SPLADE embedding error: {e}")
+            import traceback
+            traceback.print_exc()
             # Return empty sparse vectors as fallback
             return [SparseVector(indices=[0], values=[0.0]) for _ in texts]
     
@@ -113,22 +234,31 @@ class SPLADEEmbedder:
             SparseVector object with indices and values
         """
         if not self.available:
+            logger.debug("SPLADE not available, returning empty sparse vector")
             return SparseVector(indices=[0], values=[0.0])
         
         try:
-            # Generate sparse embedding
-            sparse_dict = self.model.encode([text], convert_to_tensor=False)[0]
+            # Generate sparse embedding for single text
+            # Returns a list with one sparse matrix
+            sparse_matrices = self.model.encode([text], convert_to_tensor=False)
             
-            if isinstance(sparse_dict, dict) and 'indices' in sparse_dict and 'values' in sparse_dict:
-                return SparseVector(
-                    indices=sparse_dict['indices'],
-                    values=sparse_dict['values']
-                )
-            else:
+            if len(sparse_matrices) == 0:
+                logger.warning("No sparse embedding generated")
                 return SparseVector(indices=[0], values=[0.0])
+            
+            # Convert the first (and only) sparse matrix
+            sparse_vector = self._sparse_matrix_to_qdrant(sparse_matrices[0])
+            
+            logger.debug(
+                f"Query sparse vector: {len(sparse_vector.indices)} non-zero elements"
+            )
+            
+            return sparse_vector
                 
         except Exception as e:
             logger.error(f"SPLADE query embedding error: {e}")
+            import traceback
+            traceback.print_exc()
             return SparseVector(indices=[0], values=[0.0])
 
 
@@ -169,7 +299,7 @@ class VectorStoreService:
         except Exception as e:
             logger.error(f"Failed to initialize Qdrant: {e}", exc_info=True)
             raise VectorStoreException(f"Failed to initialize vector store: {str(e)}")
-    
+        
     def _initialize_collection(self):
         """Create collection if it doesn't exist with both dense and sparse vectors"""
         try:
@@ -206,7 +336,7 @@ class VectorStoreService:
         except Exception as e:
             logger.error(f"Error initializing collection: {e}", exc_info=True)
             raise VectorStoreException(f"Failed to initialize collection: {str(e)}")
-    
+        
     def _get_embedding_dimension(self) -> int:
         """Get embedding dimension"""
         try:
@@ -219,31 +349,34 @@ class VectorStoreService:
             return 1024
     
     def _create_payload_indexes(self):
-        """Create indexes on payload fields"""
+        """Create indexes on payload fields for faster filtering"""
         try:
+            # Index user_id for user isolation
             self.client.create_payload_index(
                 collection_name=self.collection_name,
                 field_name="user_id",
                 field_schema="keyword"
             )
             
+            # Index file_id for file-specific queries
             self.client.create_payload_index(
                 collection_name=self.collection_name,
                 field_name="file_id",
                 field_schema="keyword"
             )
             
+            # ADD THIS: Index chunk_id for direct chunk retrieval
             self.client.create_payload_index(
                 collection_name=self.collection_name,
-                field_name="chunk_index",
-                field_schema="integer"
+                field_name="chunk_id",
+                field_schema="keyword"
             )
             
-            logger.info("✓ Created payload indexes")
+            logger.info("✓ Created payload indexes for user_id, file_id, and chunk_id")
             
         except Exception as e:
             logger.warning(f"Could not create payload indexes: {e}")
-    
+
     def add_document_chunks(
         self,
         chunks: List[Dict[str, Any]],
@@ -365,38 +498,64 @@ class VectorStoreService:
             raise VectorStoreException(f"Failed to add document chunks: {str(e)}")
     
     def search(
-        self,
-        query: str,
-        top_k: int = 5,
-        user_id: Optional[str] = None,
-        file_id: Optional[str] = None,
-        search_type: Literal["dense", "sparse", "hybrid"] = "hybrid"
-    ) -> Tuple[List[str], List[Dict[str, Any]], List[float]]:
+    self,
+    query: str,
+    top_k: int = 5,
+    user_id: Optional[str] = None,
+    file_id: Optional[str] = None,
+    search_type: Literal["dense", "sparse", "hybrid"] = "hybrid"
+) -> Tuple[List[str], List[Dict[str, Any]], List[float]]:
         """
-        Search with three modes: dense, sparse, or hybrid
+        Enhanced search method that returns full chunk metadata
+        
+        MODIFIED to include:
+        - chunk_id in metadata
+        - file_id in metadata  
+        - Full text in documents (not truncated)
         
         Args:
             query: Search query
-            top_k: Number of results to return
-            user_id: Filter by user ID
-            file_id: Filter by file ID
-            search_type: One of "dense", "sparse", "hybrid"
+            top_k: Number of results
+            user_id: User ID for isolation
+            file_id: Optional file ID filter
+            search_type: "dense", "sparse", or "hybrid"
             
         Returns:
-            Tuple of (documents, metadatas, scores)
+            Tuple of (documents, metadatas, scores) where metadatas includes
+            chunk_id, file_id, and all other original metadata
         """
         try:
+            # Perform search based on type
+            # FIXED: Pass user_id and file_id strings, NOT query_filter
             if search_type == "dense":
-                return self._dense_search(query, top_k, user_id, file_id)
+                results = self._dense_search(query, top_k, user_id, file_id)
             elif search_type == "sparse":
-                return self._sparse_search(query, top_k, user_id, file_id)
-            elif search_type == "hybrid":
-                return self._hybrid_search(query, top_k, user_id, file_id)
-            else:
-                raise SearchError(f"Invalid search_type: {search_type}. Must be 'dense', 'sparse', or 'hybrid'")
+                results = self._sparse_search(query, top_k, user_id, file_id)
+            else:  # hybrid
+                results = self._hybrid_search(query, top_k, user_id, file_id)
+            
+            # Unpack results (they're already processed tuples)
+            documents, metadatas, scores = results
+            
+            # Ensure chunk_id and file_id are in metadata
+            for i, meta in enumerate(metadatas):
+                if 'chunk_id' not in meta:
+                    logger.warning(f"chunk_id missing from metadata, generating fallback")
+                    meta['chunk_id'] = f"unknown_{hash(documents[i]) % 10000}"
                 
+                if 'file_id' not in meta:
+                    logger.warning(f"file_id missing from metadata")
+                    meta['file_id'] = 'unknown'
+            
+            logger.info(
+                f"Search completed: query='{query[:50]}...', "
+                f"type={search_type}, results={len(documents)}"
+            )
+            
+            return documents, metadatas, scores
+            
         except Exception as e:
-            logger.error(f"Search error: {str(e)}", exc_info=True)
+            logger.error(f"Search error: {e}", exc_info=True)
             raise SearchError(f"Search failed: {str(e)}")
     
     def _dense_search(
@@ -807,3 +966,233 @@ class VectorStoreService:
                     return 0
         
         return CollectionMock(self.client, self.collection_name)
+    def get_chunk_by_id(
+        self,
+        chunk_id: str,
+        user_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Retrieve a specific chunk by chunk_id with full payload
+        
+        Args:
+            chunk_id: The unique chunk identifier
+            user_id: Optional user ID for isolation (recommended)
+            
+        Returns:
+            Dictionary with chunk data including:
+            - chunk_id: Unique chunk identifier
+            - file_id: Parent file identifier
+            - text: Complete chunk text
+            - All other metadata fields
+            
+            Returns None if chunk not found
+        """
+        try:
+            # Build filter conditions
+            must_conditions = [
+                FieldCondition(key="chunk_id", match=MatchValue(value=chunk_id))
+            ]
+            
+            if user_id:
+                must_conditions.append(
+                    FieldCondition(key="user_id", match=MatchValue(value=user_id))
+                )
+            
+            query_filter = Filter(must=must_conditions)
+            
+            # Retrieve the chunk
+            result = self.client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=query_filter,
+                limit=1,
+                with_payload=True,
+                with_vectors=False  # Don't need vectors for retrieval
+            )
+            
+            points, _ = result
+            
+            if not points:
+                logger.warning(
+                    f"Chunk not found: chunk_id={chunk_id}, user_id={user_id}"
+                )
+                return None
+            
+            # Extract full payload
+            point = points[0]
+            payload = point.payload
+            
+            # Return structured chunk data
+            return {
+                "chunk_id": payload.get("chunk_id", chunk_id),
+                "file_id": payload.get("file_id", ""),
+                "text": payload.get("text", ""),
+                "filename": payload.get("filename", ""),
+                "user_id": payload.get("user_id", ""),
+                "chunk_type": payload.get("chunk_type", "text"),
+                "page_number": payload.get("page_number", 0),
+                "char_count": payload.get("char_count", 0),
+                "chunk_index": payload.get("chunk_index", 0),
+                "created_at": payload.get("created_at", ""),
+                # Include any other metadata fields
+                "metadata": {k: v for k, v in payload.items() 
+                           if k not in ['text', 'chunk_id', 'file_id']}
+            }
+            
+        except Exception as e:
+            logger.error(f"Error retrieving chunk {chunk_id}: {e}", exc_info=True)
+            raise VectorStoreException(f"Failed to retrieve chunk: {str(e)}")
+    
+    def update_chunk(
+        self,
+        chunk_id: str,
+        file_id: str,
+        new_text: str,
+        user_id: str,
+        preserve_metadata: bool = True
+    ) -> bool:
+        """
+        Update an existing chunk with new text using upsert
+        
+        This method:
+        1. Retrieves the existing chunk to get its metadata and point ID
+        2. Re-embeds the new text (both dense and sparse)
+        3. Upserts the chunk, replacing old vectors while preserving metadata
+        
+        Args:
+            chunk_id: Unique chunk identifier
+            file_id: Parent file identifier (for validation)
+            new_text: New chunk text to embed and store
+            user_id: User ID (for isolation and validation)
+            preserve_metadata: If True, preserve all existing metadata
+            
+        Returns:
+            True if update successful, raises exception otherwise
+        """
+        try:
+            # Step 1: Retrieve existing chunk to get metadata and validate ownership
+            logger.info(f"Updating chunk: chunk_id={chunk_id}, file_id={file_id}")
+            
+            existing_chunk = self.get_chunk_by_id(chunk_id, user_id)
+            
+            if not existing_chunk:
+                raise VectorStoreException(
+                    f"Chunk not found or access denied: {chunk_id}"
+                )
+            
+            # Validate file_id matches
+            if existing_chunk['file_id'] != file_id:
+                raise VectorStoreException(
+                    f"File ID mismatch: expected {existing_chunk['file_id']}, got {file_id}"
+                )
+            
+            # Validate user ownership
+            if existing_chunk['user_id'] != user_id:
+                raise VectorStoreException(
+                    f"Access denied: chunk belongs to different user"
+                )
+            
+            # Step 2: Generate new embeddings
+            logger.info(f"Generating new embeddings for chunk {chunk_id}")
+            
+            # Truncate text if needed
+            truncated_text = new_text
+            if len(new_text) > settings.embedding_max_length:
+                logger.warning(
+                    f"Text exceeds max length ({settings.embedding_max_length}), truncating"
+                )
+                truncated_text = new_text[:settings.embedding_max_length]
+            
+            # Generate dense embedding
+            try:
+                dense_vector = self.dense_embeddings.embed_query(truncated_text)
+            except Exception as e:
+                logger.error(f"Dense embedding failed: {e}")
+                raise EmbeddingError(f"Failed to generate dense embedding: {str(e)}")
+            
+            # Generate sparse embedding
+            try:
+                sparse_vector = self.sparse_embeddings.embed_query(truncated_text)
+            except Exception as e:
+                logger.warning(f"Sparse embedding failed: {e}, using empty vector")
+                sparse_vector = SparseVector(indices=[0], values=[0.0])
+            
+            # Step 3: Prepare updated payload
+            if preserve_metadata:
+                # Keep all existing metadata, only update text and timestamp
+                updated_payload = existing_chunk['metadata'].copy()
+                updated_payload.update({
+                    "text": new_text,  # Store full text (not truncated)
+                    "chunk_id": chunk_id,
+                    "file_id": file_id,
+                    "user_id": user_id,
+                    "char_count": len(new_text),
+                    "updated_at": datetime.utcnow().isoformat(),
+                    "edited": True  # Flag to indicate this chunk was edited
+                })
+            else:
+                # Create minimal payload
+                updated_payload = {
+                    "text": new_text,
+                    "chunk_id": chunk_id,
+                    "file_id": file_id,
+                    "user_id": user_id,
+                    "char_count": len(new_text),
+                    "updated_at": datetime.utcnow().isoformat(),
+                    "edited": True
+                }
+            
+            # Step 4: Get the point ID for this chunk
+            # We need to find the actual Qdrant point ID
+            must_conditions = [
+                FieldCondition(key="chunk_id", match=MatchValue(value=chunk_id)),
+                FieldCondition(key="user_id", match=MatchValue(value=user_id))
+            ]
+            query_filter = Filter(must=must_conditions)
+            
+            result = self.client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=query_filter,
+                limit=1,
+                with_payload=False,
+                with_vectors=False
+            )
+            
+            points, _ = result
+            if not points:
+                raise VectorStoreException(f"Could not find point for chunk {chunk_id}")
+            
+            point_id = points[0].id
+            
+            # Step 5: Upsert the chunk (replaces existing vectors and payload)
+            logger.info(f"Upserting chunk with point_id={point_id}")
+            
+            self.client.upsert(
+                collection_name=self.collection_name,
+                points=[
+                    PointStruct(
+                        id=point_id,  # Use existing point ID to replace
+                        vector={
+                            "dense": dense_vector,
+                            "sparse": sparse_vector
+                        },
+                        payload=updated_payload
+                    )
+                ]
+            )
+            
+            logger.info(
+                f"✓ Successfully updated chunk: {chunk_id}\n"
+                f"  - Point ID: {point_id}\n"
+                f"  - New char count: {len(new_text)}\n"
+                f"  - Metadata preserved: {preserve_metadata}"
+            )
+            
+            return True
+            
+        except VectorStoreException:
+            raise
+        except Exception as e:
+            logger.error(f"Error updating chunk {chunk_id}: {e}", exc_info=True)
+            raise VectorStoreException(f"Failed to update chunk: {str(e)}")
+    
+    

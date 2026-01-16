@@ -59,22 +59,22 @@ def safe_get_score(score: float) -> float:
 @router.post("/", response_model=QueryResponse)
 async def query_knowledge_base(
     request: QueryRequest,
-    user_id: str = Depends(get_user_id),  # MANDATORY USER AUTH
+    user_id: str = Depends(get_user_id),
     db: Session = Depends(get_database_session)
 ):
     """
-    Query with search type selection (dense/sparse/hybrid) and USER ISOLATION
+    ENHANCED Query endpoint with full chunk metadata for editing
     
     Headers:
         X-User-ID: User identifier (REQUIRED)
     
-    Search Types:
-    - dense: Semantic search only (using user-selected embedding model)
-    - sparse: Keyword search only (using SPLADE)
-    - hybrid: Both methods combined with RRF fusion (default)
-    
     Returns:
-        QueryResponse with answer and sources
+        QueryResponse where each source includes:
+        - chunk_id: Unique chunk identifier (for editing)
+        - file_id: Parent file identifier (for editing)
+        - full_text: Complete chunk text (not truncated)
+        - content: Display text (may be truncated)
+        - All other metadata fields
     """
     start_time = time.time()
     
@@ -84,11 +84,11 @@ async def query_knowledge_base(
         
         logger.info(f"Query with search_type={search_type.value}, top_k={request.top_k}")
         
-        # Search with USER ISOLATION
+        # Search with USER ISOLATION - returns full metadata
         documents, metadatas, scores = vector_store.search(
             query=request.question,
             top_k=request.top_k,
-            user_id=user_id,  # CRITICAL: USER ISOLATION
+            user_id=user_id,
             file_id=getattr(request, 'file_id', None),
             search_type=search_type.value
         )
@@ -99,7 +99,7 @@ async def query_knowledge_base(
                 detail="No documents found. Please upload and process documents first."
             )
         
-        # Build context
+        # Build context for LLM
         context_parts = []
         sources = []
         
@@ -118,27 +118,39 @@ async def query_knowledge_base(
             
             context_parts.append(f"{source_header}:\n{doc}\n")
             
-            # Prepare source - safe metadata access
+            # ENHANCED: Include full chunk metadata for editing
             sources.append(SourceDocument(
+                # Display content (truncated for UI)
                 content=doc[:500] + "..." if len(doc) > 500 else doc,
-                filename=safe_get_str(metadata, 'filename', 'unknown'),
+                
+                # FULL text for editing (not truncated)
+                full_text=doc,
+                
+                # CRITICAL: chunk_id and file_id for editing
                 chunk_id=safe_get_str(metadata, 'chunk_id', f'chunk_{i}'),
+                file_id=safe_get_str(metadata, 'file_id', 'unknown'),
+                
+                # Other metadata
+                filename=safe_get_str(metadata, 'filename', 'unknown'),
                 relevance_score=safe_get_score(score),
                 page_number=page,
                 chunk_type=chunk_type,
+                chunk_index=safe_get_int(metadata, 'chunk_index', i),
+                
+                # Optional scores
                 semantic_score=None,
                 keyword_score=None
             ))
         
         context = "\n\n".join(context_parts)
         
-        # Generate answer with DATABASE-BACKED history
+        # Generate answer
         answer = llm_service.generate_answer(
             question=request.question,
             context=context,
-            user_id=user_id,  # For conversation isolation
-            db=db,  # For database-backed history
-            conversation_id=None,  # No conversation for single query
+            user_id=user_id,
+            db=db,
+            conversation_id=None,
             include_citations=True,
             temperature=request.temperature
         )
@@ -159,8 +171,8 @@ async def query_knowledge_base(
                 question=request.question,
                 answer=answer,
                 top_k=request.top_k,
-                keyword_weight=0.0,  # No longer used but kept for DB compatibility
-                semantic_weight=0.0,  # No longer used but kept for DB compatibility
+                keyword_weight=0.0,
+                semantic_weight=0.0,
                 chunks_retrieved=len(documents),
                 processing_time_seconds=processing_time,
                 confidence_score=confidence,
@@ -171,12 +183,11 @@ async def query_knowledge_base(
             db.commit()
         except Exception as e:
             logger.warning(f"Failed to log query: {e}")
-            # Don't fail the request if logging fails
         
         return QueryResponse(
             question=request.question,
             answer=answer,
-            sources=sources,
+            sources=sources,  # Now includes chunk_id, file_id, and full_text
             processing_time=round(processing_time, 2),
             search_type=search_type,
             confidence_score=round(confidence, 3)
@@ -197,28 +208,17 @@ async def query_knowledge_base(
 @router.post("/conversation", response_model=QueryResponse)
 async def query_with_conversation(
     request: ConversationQueryRequest,
-    user_id: str = Depends(get_user_id),  # MANDATORY USER AUTH
+    user_id: str = Depends(get_user_id),
     db: Session = Depends(get_database_session)
 ):
     """
-    Multi-turn conversational query with DATABASE-BACKED HISTORY (FIFO)
+    ENHANCED Conversational query with full chunk metadata
     
     Headers:
         X-User-ID: User identifier (REQUIRED)
     
-    Conversation history:
-    - Stored in database (not in-memory)
-    - Last 4 Q&A pairs kept per conversation
-    - Oldest pairs deleted automatically (FIFO)
-    - Fully user-isolated
-    
-    Search Types:
-    - dense: Semantic search only
-    - sparse: Keyword search only (SPLADE)
-    - hybrid: Both methods combined with RRF fusion
-    
     Returns:
-        QueryResponse with answer and sources
+        QueryResponse with sources containing chunk_id, file_id, and full_text
     """
     start_time = time.time()
     
@@ -228,11 +228,11 @@ async def query_with_conversation(
         
         logger.info(f"Conversation query with search_type={search_type.value}")
         
-        # Retrieve chunks with search and USER ISOLATION
+        # Retrieve chunks with full metadata
         documents, metadatas, scores = vector_store.search(
             query=request.question,
             top_k=request.top_k,
-            user_id=user_id,  # CRITICAL: USER ISOLATION
+            user_id=user_id,
             file_id=getattr(request, 'file_id', None),
             search_type=search_type.value
         )
@@ -261,24 +261,28 @@ async def query_with_conversation(
             
             context_parts.append(f"{source_header}:\n{doc}\n")
             
+            # ENHANCED: Full metadata for editing
             sources.append(SourceDocument(
                 content=doc[:500] + "..." if len(doc) > 500 else doc,
-                filename=safe_get_str(metadata, 'filename', 'unknown'),
+                full_text=doc,  # Complete text
                 chunk_id=safe_get_str(metadata, 'chunk_id', f'chunk_{i}'),
+                file_id=safe_get_str(metadata, 'file_id', 'unknown'),
+                filename=safe_get_str(metadata, 'filename', 'unknown'),
                 relevance_score=safe_get_score(score),
                 page_number=page,
-                chunk_type=chunk_type
+                chunk_type=chunk_type,
+                chunk_index=safe_get_int(metadata, 'chunk_index', i)
             ))
         
         context = "\n\n".join(context_parts)
         
-        # Generate answer with DATABASE-BACKED conversation history
+        # Generate answer with conversation history
         answer = llm_service.generate_answer(
             question=request.question,
             context=context,
-            user_id=user_id,  # For conversation isolation
-            db=db,  # For database-backed history
-            conversation_id=request.conversation_id,  # Enable conversation
+            user_id=user_id,
+            db=db,
+            conversation_id=request.conversation_id,
             include_citations=True,
             temperature=request.temperature
         )
@@ -314,7 +318,7 @@ async def query_with_conversation(
         return QueryResponse(
             question=request.question,
             answer=answer,
-            sources=sources,
+            sources=sources,  # Includes chunk_id, file_id, full_text
             processing_time=round(processing_time, 2),
             search_type=search_type,
             confidence_score=round(confidence, 3),

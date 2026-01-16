@@ -4,7 +4,7 @@ Main Application Entry Point - UPDATED WITH DATABASE INITIALIZATION
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api.routes import upload, query, knowledge_base, settings, markdown_output
+from app.api.routes import chunk_edit, upload, query, knowledge_base, settings, markdown_output
 from app.db.session import init_db, close_db_connections
 import logging
 
@@ -38,6 +38,7 @@ app.include_router(query.router)
 app.include_router(knowledge_base.router)
 app.include_router(settings.router)
 app.include_router(markdown_output.router)
+app.include_router(chunk_edit.router)
 
 
 @app.on_event("startup")
