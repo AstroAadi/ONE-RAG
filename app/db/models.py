@@ -148,8 +148,6 @@ class QueryLog(Base):
     
     # Search parameters
     top_k = Column(Integer, default=5)
-    keyword_weight = Column(Float, default=0.3)
-    semantic_weight = Column(Float, default=0.7)
     
     # Results
     chunks_retrieved = Column(Integer, default=0)

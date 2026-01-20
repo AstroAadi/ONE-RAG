@@ -269,31 +269,17 @@ class Settings(BaseSettings):
         description="Max context length for LLM"
     )
     
-    # Hybrid Search Weights
-    default_keyword_weight: float = Field(
-        default=0.3,
-        ge=0.0,
-        le=1.0,
-        description="Default BM25 weight"
-    )
-    default_semantic_weight: float = Field(
-        default=0.7,
-        ge=0.0,
-        le=1.0,
-        description="Default semantic weight"
-    )
-    
-    @field_validator('default_semantic_weight')
-    @classmethod
-    def validate_weights_sum(cls, v: float, info) -> float:
-        """Ensure weights sum to 1.0"""
-        keyword_weight = info.data.get('default_keyword_weight', 0.3)
-        total = keyword_weight + v
-        if abs(total - 1.0) > 0.01:
-            raise ValueError(
-                f"keyword_weight ({keyword_weight}) + semantic_weight ({v}) must equal 1.0"
-            )
-        return v
+    # @field_validator('default_semantic_weight')
+    # @classmethod
+    # def validate_weights_sum(cls, v: float, info) -> float:
+    #     """Ensure weights sum to 1.0"""
+    #     keyword_weight = info.data.get('default_keyword_weight', 0.3)
+    #     total = keyword_weight + v
+    #     if abs(total - 1.0) > 0.01:
+    #         raise ValueError(
+    #             f"keyword_weight ({keyword_weight}) + semantic_weight ({v}) must equal 1.0"
+    #         )
+    #     return v
     
     # ==================== Conversation Configuration ====================
     max_conversation_turns: int = Field(
@@ -467,7 +453,7 @@ class Settings(BaseSettings):
         
         # Check Qdrant configuration
         if not self.qdrant_url:
-            warnings.append("QDRANT_URL not set - using ChromaDB (deprecated)")
+            warnings.append("QDRANT_URL not set ")
         
         if not self.qdrant_api_key and self.qdrant_url:
             warnings.append("QDRANT_API_KEY not set but URL provided")
@@ -531,8 +517,8 @@ def print_configuration_summary():
     
     print(f"\n🔍 Search:")
     print(f"  - Default top_k: {settings.default_top_k}")
-    print(f"  - Keyword weight: {settings.default_keyword_weight}")
-    print(f"  - Semantic weight: {settings.default_semantic_weight}")
+    # print(f"  - Keyword weight: {settings.default_keyword_weight}")
+    # print(f"  - Semantic weight: {settings.default_semantic_weight}")
     
     print(f"\n💾 Storage:")
     print(f"  - Database: {settings.database_url}")

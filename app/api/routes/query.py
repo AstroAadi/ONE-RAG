@@ -137,9 +137,6 @@ async def query_knowledge_base(
                 chunk_type=chunk_type,
                 chunk_index=safe_get_int(metadata, 'chunk_index', i),
                 
-                # Optional scores
-                semantic_score=None,
-                keyword_score=None
             ))
         
         context = "\n\n".join(context_parts)
@@ -171,8 +168,6 @@ async def query_knowledge_base(
                 question=request.question,
                 answer=answer,
                 top_k=request.top_k,
-                keyword_weight=0.0,
-                semantic_weight=0.0,
                 chunks_retrieved=len(documents),
                 processing_time_seconds=processing_time,
                 confidence_score=confidence,
@@ -302,8 +297,6 @@ async def query_with_conversation(
                 question=request.question,
                 answer=answer,
                 top_k=request.top_k,
-                keyword_weight=0.0,  # No longer used but kept for DB compatibility
-                semantic_weight=0.0,  # No longer used but kept for DB compatibility
                 chunks_retrieved=len(documents),
                 processing_time_seconds=processing_time,
                 confidence_score=confidence,
