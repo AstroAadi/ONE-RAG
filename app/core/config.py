@@ -1,5 +1,5 @@
 """
-Centralized Configuration for RAG System - UPDATED FOR QDRANT CLOUD
+Centralized Configuration for RAG System - UPDATED WITH TOKEN CONSTRAINTS
 All configuration in one place with proper validation and type safety
 """
 
@@ -105,7 +105,7 @@ class Settings(BaseSettings):
         description="Max filename length"
     )
     
-    # ==================== QDRANT CLOUD CONFIGURATION (NEW) ====================
+    # ==================== QDRANT CLOUD CONFIGURATION ====================
     qdrant_url: str = Field(
         default="",
         description="Qdrant Cloud cluster URL (e.g., https://xxx.cloud.qdrant.io)"
@@ -127,7 +127,119 @@ class Settings(BaseSettings):
             raise ValueError("qdrant_url must start with http:// or https://")
         return v
     
-    # ==================== ChromaDB Configuration (DEPRECATED - Keep for migration) ====================
+    # ==================== TOKEN-BASED CHUNKING CONSTRAINTS (NEW) ====================
+    
+    # Token limits (the primary constraints)
+    min_chunk_tokens: int = Field(
+        default=200,
+        ge=50,
+        le=500,
+        description="Minimum chunk size in tokens"
+    )
+    
+    target_chunk_tokens: int = Field(
+        default=512,
+        ge=200,
+        le=2000,
+        description="Target chunk size in tokens (aim for this)"
+    )
+    
+    max_chunk_tokens: int = Field(
+        default=600,
+        ge=300,
+        le=2000,
+        description="Maximum chunk size in tokens (hard limit)"
+    )
+    
+    chunk_overlap_tokens: int = Field(
+        default=50,
+        ge=0,
+        le=200,
+        description="Overlap between chunks in tokens (10-20% of target)"
+    )
+    
+    # Tokenizer configuration
+    tokenizer_model: str = Field(
+        default="cl100k_base",  # For OpenAI models
+        description="Tokenizer to use (cl100k_base, p50k_base, or gpt2)"
+    )
+    
+    # Character-based limits (DEPRECATED - kept for backward compatibility)
+    chunk_size: int = Field(
+        default=1500,
+        ge=100,
+        le=8000,
+        description="DEPRECATED: Use token-based limits instead"
+    )
+    chunk_overlap: int = Field(
+        default=200,
+        ge=0,
+        le=1000,
+        description="DEPRECATED: Use chunk_overlap_tokens instead"
+    )
+    max_chunk_size: int = Field(
+        default=2000,
+        ge=1000,
+        le=10000,
+        description="DEPRECATED: Use max_chunk_tokens instead"
+    )
+    
+    @field_validator('max_chunk_tokens')
+    @classmethod
+    def validate_token_limits(cls, v: int, info) -> int:
+        """Ensure token limits are consistent"""
+        target = info.data.get('target_chunk_tokens', 512)
+        min_tokens = info.data.get('min_chunk_tokens', 200)
+        
+        if v < target:
+            raise ValueError(
+                f"max_chunk_tokens ({v}) must be >= target_chunk_tokens ({target})"
+            )
+        
+        if target < min_tokens:
+            raise ValueError(
+                f"target_chunk_tokens ({target}) must be >= min_chunk_tokens ({min_tokens})"
+            )
+        
+        return v
+    
+    @field_validator('chunk_overlap_tokens')
+    @classmethod
+    def validate_overlap_tokens(cls, v: int, info) -> int:
+        """Ensure overlap is reasonable (10-30% of target)"""
+        target = info.data.get('target_chunk_tokens', 512)
+        
+        max_overlap = int(target * 0.3)  # 30% max
+        
+        if v > max_overlap:
+            logger.warning(
+                f"chunk_overlap_tokens ({v}) exceeds 30% of target ({max_overlap}). "
+                f"Consider reducing overlap for better performance."
+            )
+        
+        return v
+    
+    # Atomic element handling (NEW)
+    max_atomic_element_tokens: int = Field(
+        default=1000,
+        ge=500,
+        le=4000,
+        description="Max tokens for atomic elements (tables, code blocks). Exceeding this splits them."
+    )
+    
+    split_oversized_atomic: bool = Field(
+        default=True,
+        description="Split atomic elements that exceed max_atomic_element_tokens"
+    )
+    
+    max_code_block_lines: int = Field(
+        default=500,
+        ge=100,
+        le=2000,
+        description="Maximum lines in a code block before splitting"
+    )
+    
+    # ==================== ChromaDB Configuration (DEPRECATED) ====================
     chroma_persist_dir: Path = Field(
         default=Path("./chroma_db"),
         description="ChromaDB persistence directory (DEPRECATED)"
@@ -136,47 +248,6 @@ class Settings(BaseSettings):
         default="rag_documents",
         description="Default ChromaDB collection name (DEPRECATED)"
     )
-    
-    # ==================== Chunking Configuration ====================
-    chunk_size: int = Field(
-        default=1500,
-        ge=100,
-        le=8000,
-        description="Target chunk size in characters (keep below embedding_max_length)"
-    )
-    chunk_overlap: int = Field(
-        default=200,
-        ge=0,
-        le=1000,
-        description="Overlap between chunks"
-    )
-    max_chunk_size: int = Field(
-        default=2000,  # Changed from 6000 to respect Cohere's 2048 limit
-        ge=1000,
-        le=10000,
-        description="Maximum chunk size (hard limit) - should be <= embedding_max_length"
-    )
-    
-    @field_validator('max_chunk_size')
-    @classmethod
-    def validate_chunk_vs_embedding(cls, v: int, info) -> int:
-        """Ensure max_chunk_size doesn't exceed embedding limit"""
-        embedding_max = info.data.get('embedding_max_length', 2048)
-        if v > embedding_max:
-            logger.warning(
-                f"max_chunk_size ({v}) exceeds embedding_max_length ({embedding_max}). "
-                f"Texts will be truncated during embedding."
-            )
-        return v
-    
-    @field_validator('chunk_overlap')
-    @classmethod
-    def validate_overlap(cls, v: int, info) -> int:
-        """Ensure overlap is less than chunk_size"""
-        chunk_size = info.data.get('chunk_size', 1500)
-        if v >= chunk_size:
-            raise ValueError(f"chunk_overlap ({v}) must be less than chunk_size ({chunk_size})")
-        return v
     
     # ==================== RAG Configuration ====================
     default_top_k: int = Field(
@@ -344,7 +415,7 @@ class Settings(BaseSettings):
         directories = [
             self.upload_dir,
             self.markdown_dir,
-            # self.chroma_persist_dir,  # Keep for migration
+            self.log_file_path.parent,
         ]
         for directory in directories:
             directory.mkdir(parents=True, exist_ok=True)
@@ -402,17 +473,11 @@ class Settings(BaseSettings):
             warnings.append("QDRANT_API_KEY not set but URL provided")
             is_valid = False
         
-        # Check chunk size consistency
-        if self.chunk_overlap >= self.chunk_size:
+        # Check token limits
+        if self.max_chunk_tokens > 2000:
             warnings.append(
-                f"chunk_overlap ({self.chunk_overlap}) should be less than "
-                f"chunk_size ({self.chunk_size})"
-            )
-        
-        if self.chunk_size > self.max_chunk_size:
-            warnings.append(
-                f"chunk_size ({self.chunk_size}) exceeds "
-                f"max_chunk_size ({self.max_chunk_size})"
+                f"max_chunk_tokens ({self.max_chunk_tokens}) exceeds recommended 2000. "
+                f"Very large chunks may hurt search quality."
             )
         
         # Check Bedrock availability
@@ -429,7 +494,6 @@ class Settings(BaseSettings):
                     boto3.client('bedrock-runtime', region_name=self.aws_region)
             except Exception as e:
                 warnings.append(f"Bedrock not accessible: {e}")
-                # Don't set is_valid to False - non-critical
         
         return is_valid, warnings
 
@@ -448,18 +512,22 @@ def print_configuration_summary():
     is_valid, warnings = settings.validate_configuration()
     
     print("\n" + "="*60)
-    print("RAG SYSTEM CONFIGURATION - QDRANT CLOUD")
+    print("RAG SYSTEM CONFIGURATION - TOKEN-CONSTRAINED SEMANTIC CHUNKING")
     print("="*60)
     
     print(f"\n📊 Models:")
     print(f"  - LLM: {settings.bedrock_model_id}")
     print(f"  - Embedding: {settings.embedding_model_id}")
     print(f"  - Vision: {settings.bedrock_vision_model_id}")
+    print(f"  - Tokenizer: {settings.tokenizer_model}")
     
-    print(f"\n📦 Chunking:")
-    print(f"  - Size: {settings.chunk_size} chars")
-    print(f"  - Overlap: {settings.chunk_overlap} chars")
-    print(f"  - Max: {settings.max_chunk_size} chars")
+    print(f"\n📦 Chunking (Token-Based Constraints):")
+    print(f"  - Min Tokens: {settings.min_chunk_tokens}")
+    print(f"  - Target Tokens: {settings.target_chunk_tokens}")
+    print(f"  - Max Tokens: {settings.max_chunk_tokens}")
+    print(f"  - Overlap: {settings.chunk_overlap_tokens} tokens ({settings.chunk_overlap_tokens/settings.target_chunk_tokens*100:.1f}%)")
+    print(f"  - Max Atomic Element: {settings.max_atomic_element_tokens} tokens")
+    print(f"  - Split Oversized Atomic: {'✅' if settings.split_oversized_atomic else '❌'}")
     
     print(f"\n🔍 Search:")
     print(f"  - Default top_k: {settings.default_top_k}")

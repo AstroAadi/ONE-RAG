@@ -30,8 +30,8 @@ router = APIRouter(prefix="/api/upload", tags=["Upload"])
 # Initialize services
 markdown_converter = MarkdownConverter()
 chunking_service = SemanticChunkingService(
-    chunk_size=settings.chunk_size,
-    chunk_overlap=settings.chunk_overlap
+#     chunk_size=settings.chunk_size,
+#     chunk_overlap=settings.chunk_overlap
 )
 vector_store = VectorStoreService()
 
@@ -346,7 +346,7 @@ async def process_and_index_document(
             chunk_db = ChunkMetadata(
                 chunk_id=chunk['chunk_id'],
                 file_id=file_id,
-                chunk_index=chunk['chunk_index'],
+                chunk_index=chunk['metadata']['chunk_index'],  # FIXED: Access from metadata
                 chunk_type=chunk['metadata'].get('chunk_type', 'text'),
                 char_count=chunk['char_count'],
                 page_number=chunk['metadata'].get('page_number', 0),
