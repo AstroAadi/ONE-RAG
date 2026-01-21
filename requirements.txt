@@ -1,90 +1,45 @@
-# ==================== Core Framework ====================
-fastapi==0.115.0
-uvicorn[standard]==0.32.0
-pydantic==2.9.2
-pydantic-settings==2.6.0
-python-multipart==0.0.12
-python-dotenv==1.0.1
+# Core Framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+pydantic==2.5.0
+pydantic-settings==2.1.0
 
-# ==================== Database ====================
+# Database
 sqlalchemy==2.0.23
-psycopg2-binary==2.9.9  # PostgreSQL adapter
+alembic==1.12.1
 
-# ==================== Document Processing ====================
-# Docling for intelligent document extraction
-docling==2.15.0
+# Vector Store
+qdrant-client==1.7.0
 
-# Unstructured for fallback PDF extraction (NEW)
-unstructured[all-docs]==0.11.8
-
-# Pillow for image handling
-pillow==11.0.0
-
-# PyMuPDF for PDF operations and validation (NEW - REQUIRED)
-PyMuPDF==1.23.8
-
-# python-docx for DOCX files (fallback)
-python-docx==1.1.2
-
-# python-pptx for PPTX files (fallback)
-python-pptx==0.6.23
-
-# ==================== AI & Embeddings ====================
-# AWS Bedrock
-boto3==1.35.63
-langchain-aws==0.2.6
-
-# LangChain core
-langchain==0.3.7
-langchain-core==0.3.19
-langchain-community==0.3.7
-
-# ==================== Vector Database ====================
-# Qdrant Cloud
-qdrant-client==1.7.3
-langchain-qdrant==0.1.0
-
-# Sentence transformers for embeddings
+# Embeddings & NLP (No AWS dependencies)
 sentence-transformers==2.2.2
+tiktoken==0.5.1
 
-# BM25 for hybrid keyword search
-rank-bm25==0.2.2
+# HTTP Requests (for HuggingFace API)
+requests==2.31.0
+httpx==0.25.2
 
-# ==================== Token Counting (NEW - REQUIRED) ====================
-# tiktoken for accurate token counting in chunking
-tiktoken==0.5.2
+# Document Processing
+pymupdf==1.23.8
+python-docx==1.1.0
+python-pptx==0.6.23
+openpyxl==3.1.2
+pypdf==3.17.4
+pillow==10.1.0
+python-magic==0.4.27
 
-# ==================== Image Processing ====================
-# imagehash for perceptual image hashing (deduplication)
-imagehash==4.3.1
+# PDF & Image Processing
+pdf2image==1.16.3
+pytesseract==0.3.10
 
-# ==================== Utilities ====================
-aiofiles==24.1.0
-requests==2.32.3
-orjson==3.10.11
+# Utilities
+python-dotenv==1.0.0
+pathlib==1.0.1
 
-# ==================== Optional Testing ====================
-pytest==8.3.4
-pytest-asyncio==0.24.0
-httpx==0.27.2
+# Logging & Monitoring
+colorlog==6.8.0
 
-# ==================== System Notes ====================
-# IMPORTANT: System dependencies required (install separately):
-#
-# For Unstructured PDF extraction:
-#   Ubuntu/Debian:
-#     sudo apt-get update
-#     sudo apt-get install -y poppler-utils tesseract-ocr libreoffice pandoc
-#
-#   macOS:
-#     brew install poppler tesseract
-#
-#   Docker:
-#     RUN apt-get update && apt-get install -y \
-#         poppler-utils tesseract-ocr libreoffice pandoc
-#
-# For PyMuPDF (usually no extra deps needed):
-#   - Works out of the box on most systems
-#
-# For Docling (if issues):
-#   - May need additional system packages for OCR
+# Optional: For local SPLADE (sparse search)
+scipy==1.11.4
+torch==2.1.0
