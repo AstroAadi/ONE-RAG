@@ -2,7 +2,7 @@
 Enhanced PDF Extractor with Docling + Unstructured Fallback
 =============================================================
 
-COMPLETE IMPLEMENTATION with all helper functions
+COMPLETE IMPLEMENTATION with Direct Markdown Table Extraction
 
 Strategy:
 1. Get page count from Docling and Unstructured (BEFORE extraction)
@@ -10,9 +10,10 @@ Strategy:
 3. If Docling matches → Use Docling (fast, better layout)
 4. If Unstructured matches → Use Unstructured (robust fallback)
 5. Both methods: Extract images, describe with Vision LLM, preserve layout
+6. Tables: Extract directly as Markdown (no HTML conversion!)
 
-Author: Complete Dual-Extractor Solution
-Date: 2026-01-19
+Author: Complete Dual-Extractor Solution with Direct Markdown Tables
+Date: 2026-01-21
 """
 
 import os
@@ -58,6 +59,7 @@ class PDFExtractor(BaseExtractor):
     - Page count validation BEFORE extraction
     - Automatic fallback to Unstructured when Docling fails
     - Full Vision LLM image description pipeline
+    - Direct Markdown table extraction (no HTML conversion!)
     - Layout-aware extraction
     - Header/footer filtering
     - Image caching
@@ -69,12 +71,12 @@ class PDFExtractor(BaseExtractor):
         from app.services.header_footer_detector import get_header_footer_detector
         from app.services.image_cache_manager import get_image_cache
         from app.services.image_description_service import get_image_description_service
-        from app.services.extraction.processors.caption_detector import CaptionDetector
+        # from app.services.extraction.processors.caption_detector import CaptionDetector
         
         self.header_footer_detector = get_header_footer_detector()
         self.image_cache = get_image_cache()
         self.image_service = get_image_description_service()
-        self.caption_detector = CaptionDetector
+        # self.caption_detector = CaptionDetector
         
         # Statistics tracking
         self.extraction_stats = {
@@ -368,7 +370,7 @@ class PDFExtractor(BaseExtractor):
         return final_markdown, metadata
     
     # ============================================================================
-    # UNSTRUCTURED EXTRACTION (FALLBACK PIPELINE)
+    # UNSTRUCTURED EXTRACTION (FALLBACK PIPELINE WITH DIRECT MARKDOWN TABLES)
     # ============================================================================
     
     def _extract_with_unstructured_full(
@@ -380,13 +382,11 @@ class PDFExtractor(BaseExtractor):
         zones: any
     ) -> Tuple[str, Dict]:
         """
-        Full Unstructured extraction WITH image description
+        Full Unstructured extraction with DIRECT Markdown tables
         
-        Replicates Docling pipeline using Unstructured:
-        - Extract elements with hi_res strategy
-        - Treat images/tables/charts as images
-        - Describe with Vision LLM
-        - Build markdown with descriptions
+        Key Feature:
+        - Tables extracted directly as Markdown (no HTML conversion!)
+        - Uses elem.metadata.text_as_markdown for clean, proper table format
         """
         logger.info("🔄 Full Unstructured extraction (fallback)...")
         
@@ -420,6 +420,7 @@ class PDFExtractor(BaseExtractor):
             
             # Track images and statistics
             image_data = {}
+            table_counter = 0
             image_counter = 0
             current_page = 0
             
@@ -501,14 +502,36 @@ class PDFExtractor(BaseExtractor):
                         logger.info(f"  {cache_icon} Image {image_counter} -> {final_filename} (page {page_num})")
                     
                 elif elem.category == "Table":
-                    # Table element - render as HTML/markdown
-                    if hasattr(elem.metadata, 'text_as_html') and elem.metadata.text_as_html:
+                    # ============================================================
+                    # TABLE HANDLING - DIRECT MARKDOWN EXTRACTION (NO CONVERSION!)
+                    # ============================================================
+                    table_counter += 1
+                    
+                    # Try to get table as Markdown DIRECTLY!
+                    if hasattr(elem.metadata, 'text_as_markdown') and elem.metadata.text_as_markdown:
+                        # SUCCESS - Direct Markdown table! ✅
+                        result_lines.append(f"**Table {table_counter}** (Page {page_num}):")
+                        result_lines.append("")
+                        result_lines.append(elem.metadata.text_as_markdown)
+                        result_lines.append("")
+                        logger.info(f"  ✓ Table {table_counter} -> Markdown (page {page_num})")
+                    
+                    # Fallback: Try HTML (if markdown not available)
+                    elif hasattr(elem.metadata, 'text_as_html') and elem.metadata.text_as_html:
+                        result_lines.append(f"**Table {table_counter}** (Page {page_num}):")
+                        result_lines.append("")
                         result_lines.append(elem.metadata.text_as_html)
                         result_lines.append("")
+                        logger.warning(f"  ⚠️  Table {table_counter} -> HTML fallback (page {page_num})")
+                    
+                    # Last resort: Plain text
                     else:
+                        result_lines.append(f"**Table {table_counter}** (Page {page_num}):")
+                        result_lines.append("")
                         result_lines.append(str(elem))
                         result_lines.append("")
-                    
+                        logger.warning(f"  ⚠️  Table {table_counter} -> Plain text fallback (page {page_num})")
+                
                 else:
                     # Text, Title, etc.
                     result_lines.append(str(elem))
@@ -533,6 +556,7 @@ class PDFExtractor(BaseExtractor):
                 'images_cached': cache_stats['hits'],
                 'images_skipped_duplicates': self._duplicates_skipped,
                 'images_skipped_headers': self._headers_skipped,
+                'tables_extracted': table_counter,
                 'header_footer_detected': zones is not None,
                 'cache_hit_rate': cache_stats['hit_rate_percent'],
                 'image_directory': str(image_output_dir),
@@ -540,7 +564,7 @@ class PDFExtractor(BaseExtractor):
             
             logger.info(
                 f"✅ Unstructured extraction complete: {total_pages} pages, "
-                f"{len(image_data)} images ({metadata['images_cached']} cached)"
+                f"{len(image_data)} images, {table_counter} tables"
             )
             
             return final_markdown, metadata
