@@ -163,14 +163,14 @@ def auto_register_extractors():
     except ImportError as e:
         logger.warning(f"Could not register PptxExtractor: {e}")
     
-    # Excel Extractor (NEW)
+    # Excel Extractor 
     try:
         from .extractors.excel_extractor import ExcelExtractor
         ExtractorFactory.register_extractor(ExcelExtractor)
     except ImportError as e:
         logger.warning(f"Could not register ExcelExtractor: {e}")
     
-    # Image Extractor (only register once!)
+    # Image Extractor 
     try:
         from .extractors.image_extractor import ImageExtractor
         ExtractorFactory.register_extractor(ImageExtractor)

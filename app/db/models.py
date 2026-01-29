@@ -1,6 +1,6 @@
 """
-Database Models for RAG System
-Tracks file metadata, processing status, and user ownership
+Enhanced Database Models for RAG System with Chunking Strategy Support
+Tracks file metadata, processing status, chunking strategies, and user ownership
 """
 
 from sqlalchemy import (
@@ -33,7 +33,7 @@ class FileType(str, enum.Enum):
 
 class FileMetadata(Base):
     """
-    File metadata table with user isolation
+    File metadata table with user isolation and chunking strategy tracking
     
     Tracks all uploaded files and their processing status
     """
@@ -65,7 +65,8 @@ class FileMetadata(Base):
     last_accessed = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
     # Processing metadata (JSON-like text field)
-    processing_metadata = Column(Text, nullable=True)  # Store JSON string
+    # Now includes: chunking_strategy, chunking_params, chunk_breakdown, etc.
+    processing_metadata = Column(Text, nullable=True)
     error_message = Column(Text, nullable=True)
     
     # Statistics
@@ -101,10 +102,12 @@ class FileMetadata(Base):
 
 class ChunkMetadata(Base):
     """
-    Chunk metadata table
+    ENHANCED: Chunk metadata table with parent-child relationship support
     
     Tracks individual chunks created from files
-    Links to ChromaDB chunk IDs
+    Links to vector database chunk IDs
+    
+    NEW: Supports parent-child relationships for hierarchical chunking
     """
     __tablename__ = "chunk_metadata"
     
@@ -116,18 +119,28 @@ class ChunkMetadata(Base):
     
     # Chunk information
     chunk_index = Column(Integer, nullable=False)
-    chunk_type = Column(String(20), default="text")  # text, image, table, chart
+    chunk_type = Column(String(20), default="text")  # text, image, table, chart, parent, child
     char_count = Column(Integer, nullable=False)
     page_number = Column(Integer, default=0)
     
+    # NEW: Parent-child relationship fields
+    is_parent = Column(Boolean, default=False, nullable=True)
+    parent_chunk_id = Column(String(100), nullable=True, index=True)
+    child_index = Column(Integer, nullable=True)  # Index within parent's children
+    
     # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, nullable=True)
+    
+    # Edit tracking
+    edited = Column(Boolean, default=False)
     
     # Relationship
     file = relationship("FileMetadata", back_populates="chunks")
     
     def __repr__(self) -> str:
-        return f"<ChunkMetadata(chunk_id={self.chunk_id}, file_id={self.file_id}, index={self.chunk_index})>"
+        parent_info = f", parent={self.parent_chunk_id}" if self.parent_chunk_id else ""
+        return f"<ChunkMetadata(chunk_id={self.chunk_id}, file_id={self.file_id}, index={self.chunk_index}{parent_info})>"
 
 
 class QueryLog(Base):
@@ -148,6 +161,7 @@ class QueryLog(Base):
     
     # Search parameters
     top_k = Column(Integer, default=5)
+    search_type = Column(String(20), nullable=True)  # dense, sparse, hybrid
     
     # Results
     chunks_retrieved = Column(Integer, default=0)
