@@ -68,8 +68,13 @@ async def startup_event():
     try:
         from app.services.vector_store_service import VectorStoreService
         vector_store = VectorStoreService()
-        count = vector_store.collection.count()
-        logger.info(f"✓ Vector store initialized ({count} chunks)")
+
+        # Use QdrantClient methods
+        collection_name = "rag_documents"  # ← change to your actual collection name
+        collection_info = vector_store.client.get_collection(collection_name)
+        count = collection_info.points_count
+
+        logger.info(f"✓ Vector store initialized ({count} points in '{collection_name}')")
     except Exception as e:
         logger.warning(f"⚠ Vector store check failed: {e}")
     

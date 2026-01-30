@@ -190,6 +190,70 @@ def auto_register_extractors():
         ExtractorFactory.register_extractor(PlainTextExtractor)
     except ImportError as e:
         logger.warning(f"Could not register PlainTextExtractor: {e}")
+
+    # EPUB Extractor
+    try:
+        from .extractors.epub_extractor import EPUBExtractor
+        ExtractorFactory.register_extractor(EPUBExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register EPUBExtractor: {e}")
+    
+    # MSG Extractor
+    try:
+        from .extractors.msg_extractor import MSGExtractor
+        ExtractorFactory.register_extractor(MSGExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register MSGExtractor: {e}")
+    
+    # EML Extractor
+    try:
+        from .extractors.eml_extractor import EMLExtractor
+        ExtractorFactory.register_extractor(EMLExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register EMLExtractor: {e}")
+
+    # HTML Extractor
+    try:
+        from .extractors.html_extractor import HTMLExtractor
+        ExtractorFactory.register_extractor(HTMLExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register HTMLExtractor: {e}")
+
+    # XML Extractor
+    try:
+        from .extractors.xml_extractor import XMLExtractor
+        ExtractorFactory.register_extractor(XMLExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register XMLExtractor: {e}")
+
+    # VTT Extractor
+    try:
+        from .extractors.vtt_extractor import VTTExtractor
+        ExtractorFactory.register_extractor(VTTExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register VTTExtractor: {e}")
+
+    # PROPERTIES Extractor
+    try:
+        from .extractors.properties_extractor import PropertiesExtractor
+        ExtractorFactory.register_extractor(PropertiesExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register PropertiesExtractor: {e}")
+    
+    #MDX Extractor
+    try:
+        from .extractors.mdx_extractor import MDXExtractor
+        ExtractorFactory.register_extractor(MDXExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register MDXExtractor: {e}")
+    
+    # XLS Extractor
+    try:
+        from .extractors.xls_extractor import XLSExtractor
+        ExtractorFactory.register_extractor(XLSExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register XLSExtractor: {e}")
+
     
     # Log final status
     supported = ExtractorFactory.get_supported_formats()
