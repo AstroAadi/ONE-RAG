@@ -1,6 +1,7 @@
 """
-Enhanced Database Models for RAG System with Chunking Strategy Support
-Tracks file metadata, processing status, chunking strategies, and user ownership
+Database Models for RAG System
+Tracks file metadata, processing status, user ownership, and chunking strategy
+Updated: Added chunking_strategy field to FileMetadata
 """
 
 from sqlalchemy import (
@@ -31,11 +32,21 @@ class FileType(str, enum.Enum):
     OTHER = "other"
 
 
+class ChunkingStrategyEnum(str, enum.Enum):
+    """Chunking strategies"""
+    FIXED_SIZE = "fixed_size"
+    SENTENCE = "sentence"
+    PARAGRAPH = "paragraph"
+    SLIDING_WINDOW = "sliding_window"
+    RECURSIVE = "recursive"
+    SEMANTIC = "semantic"
+
+
 class FileMetadata(Base):
     """
-    File metadata table with user isolation and chunking strategy tracking
+    File metadata table with user isolation and chunking strategy
     
-    Tracks all uploaded files and their processing status
+    Tracks all uploaded files, their processing status, and chunking method used
     """
     __tablename__ = "file_metadata"
     
@@ -59,14 +70,22 @@ class FileMetadata(Base):
     chunks_created = Column(Integer, default=0)
     total_pages = Column(Integer, default=0)
     
+    # NEW: Chunking strategy
+    chunking_strategy = Column(
+        Enum(ChunkingStrategyEnum),
+        default=ChunkingStrategyEnum.FIXED_SIZE,
+        nullable=True
+    )
+    target_chunk_tokens = Column(Integer, default=512)
+    chunk_overlap_tokens = Column(Integer, default=50)
+    
     # Timestamps
     uploaded_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
     processed_at = Column(DateTime, nullable=True)
     last_accessed = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
     # Processing metadata (JSON-like text field)
-    # Now includes: chunking_strategy, chunking_params, chunk_breakdown, etc.
-    processing_metadata = Column(Text, nullable=True)
+    processing_metadata = Column(Text, nullable=True)  # Store JSON string
     error_message = Column(Text, nullable=True)
     
     # Statistics
@@ -92,6 +111,9 @@ class FileMetadata(Base):
             "status": self.status.value if self.status else None,
             "chunks_created": self.chunks_created,
             "total_pages": self.total_pages,
+            "chunking_strategy": self.chunking_strategy.value if self.chunking_strategy else None,
+            "target_chunk_tokens": self.target_chunk_tokens,
+            "chunk_overlap_tokens": self.chunk_overlap_tokens,
             "uploaded_at": self.uploaded_at.isoformat() if self.uploaded_at else None,
             "processed_at": self.processed_at.isoformat() if self.processed_at else None,
             "word_count": self.word_count,
@@ -102,12 +124,10 @@ class FileMetadata(Base):
 
 class ChunkMetadata(Base):
     """
-    ENHANCED: Chunk metadata table with parent-child relationship support
+    Chunk metadata table
     
     Tracks individual chunks created from files
-    Links to vector database chunk IDs
-    
-    NEW: Supports parent-child relationships for hierarchical chunking
+    Links to vector store chunk IDs
     """
     __tablename__ = "chunk_metadata"
     
@@ -119,28 +139,18 @@ class ChunkMetadata(Base):
     
     # Chunk information
     chunk_index = Column(Integer, nullable=False)
-    chunk_type = Column(String(20), default="text")  # text, image, table, chart, parent, child
+    chunk_type = Column(String(20), default="text")  # text, image, table, chart
     char_count = Column(Integer, nullable=False)
     page_number = Column(Integer, default=0)
     
-    # NEW: Parent-child relationship fields
-    is_parent = Column(Boolean, default=False, nullable=True)
-    parent_chunk_id = Column(String(100), nullable=True, index=True)
-    child_index = Column(Integer, nullable=True)  # Index within parent's children
-    
     # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(DateTime, nullable=True)
-    
-    # Edit tracking
-    edited = Column(Boolean, default=False)
     
     # Relationship
     file = relationship("FileMetadata", back_populates="chunks")
     
     def __repr__(self) -> str:
-        parent_info = f", parent={self.parent_chunk_id}" if self.parent_chunk_id else ""
-        return f"<ChunkMetadata(chunk_id={self.chunk_id}, file_id={self.file_id}, index={self.chunk_index}{parent_info})>"
+        return f"<ChunkMetadata(chunk_id={self.chunk_id}, file_id={self.file_id}, index={self.chunk_index})>"
 
 
 class QueryLog(Base):
@@ -161,7 +171,6 @@ class QueryLog(Base):
     
     # Search parameters
     top_k = Column(Integer, default=5)
-    search_type = Column(String(20), nullable=True)  # dense, sparse, hybrid
     
     # Results
     chunks_retrieved = Column(Integer, default=0)

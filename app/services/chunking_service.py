@@ -1,24 +1,20 @@
 """
-Character-Based Multi-Strategy Chunking Service
-================================================
+Enhanced Chunking Service with 6 Strategies
+=============================================
 
-Key Principles:
-1. NO token-based limits (except document-level parent: max 10K tokens)
-2. ALL chunking based on CHARACTER COUNT
-3. User-defined delimiters for splitting
-4. Maximum chunk size = limit (chunks can be smaller, never larger)
-5. User selects embedding model
+Chunking Strategies:
+1. Fixed-size (token-based) - Current implementation
+2. Sentence chunking - Split by sentence boundaries
+3. Paragraph chunking - Split by paragraph boundaries
+4. Sliding window - Overlapping fixed-size windows
+5. Recursive chunking - Hierarchical split by separators
+6. Semantic chunking - Group semantically similar sentences
 
-Supported Strategies:
-- Fixed Character Chunking (with delimiter)
-- Parent-Child Paragraph Chunking
-- Parent-Child Document Chunking (10K token parent limit only)
-
-Author: Character-Based Chunker
-Date: 2026-01-28
+Author: Enhanced Chunker
+Date: 2026-01-27
 """
 
-from typing import List, Dict, Any, Optional, Literal
+from typing import List, Dict, Any, Optional
 from enum import Enum
 import re
 import hashlib
@@ -31,22 +27,36 @@ except ImportError:
     TIKTOKEN_AVAILABLE = False
     logging.warning("tiktoken not installed. Install with: pip install tiktoken")
 
+try:
+    import nltk
+    NLTK_AVAILABLE = True
+    # Download required NLTK data
+    try:
+        nltk.data.find('tokenizers/punkt')
+    except LookupError:
+        nltk.download('punkt', quiet=True)
+except ImportError:
+    NLTK_AVAILABLE = False
+    logging.warning("nltk not installed. Install with: pip install nltk")
+
+from app.core.config import get_settings
+
 logger = logging.getLogger(__name__)
+settings = get_settings()
 
-
-# ==================== Chunking Strategy Enum ====================
 
 class ChunkingStrategy(str, Enum):
-    """Supported chunking strategies"""
-    FIXED_CHARACTER = "fixed_character"
-    PARENT_CHILD_PARAGRAPH = "parent_child_paragraph"
-    PARENT_CHILD_DOCUMENT = "parent_child_document"
+    """Available chunking strategies"""
+    FIXED_SIZE = "fixed_size"
+    SENTENCE = "sentence"
+    PARAGRAPH = "paragraph"
+    SLIDING_WINDOW = "sliding_window"
+    RECURSIVE = "recursive"
+    SEMANTIC = "semantic"
 
-
-# ==================== Token Counter (Only for Document-Level Parent) ====================
 
 class TokenCounter:
-    """Token counting utility - ONLY used for document-level parent 10K limit"""
+    """Token counting utility with fallback"""
     
     def __init__(self, model: str = "cl100k_base"):
         """Initialize token counter"""
@@ -55,13 +65,13 @@ class TokenCounter:
         if TIKTOKEN_AVAILABLE:
             try:
                 self.encoding = tiktoken.get_encoding(model)
-                logger.info(f"✓ Token counter initialized: {model} (for document-level parent only)")
+                logger.info(f"✓ Token counter initialized: {model}")
             except Exception as e:
                 logger.warning(f"Failed to load tiktoken encoding: {e}")
                 self.encoding = None
         
         if not self.encoding:
-            logger.warning("Using character-based token estimation for document-level parent limit")
+            logger.warning("Using character-based token estimation (4 chars ≈ 1 token)")
     
     def count_tokens(self, text: str) -> int:
         """Count tokens in text"""
@@ -74,83 +84,84 @@ class TokenCounter:
             except Exception as e:
                 logger.debug(f"Token counting failed: {e}, using fallback")
         
-        # Fallback: estimate tokens (4 chars ≈ 1 token)
+        # Fallback: estimate tokens
         return max(1, len(text) // 4)
     
-    def truncate_to_tokens(self, text: str, max_tokens: int) -> str:
-        """Truncate text to max tokens - ONLY for document-level parent"""
+    def get_tokens(self, text: str) -> List[int]:
+        """Get token IDs"""
         if not text:
+            return []
+        
+        if self.encoding:
+            try:
+                return self.encoding.encode(text)
+            except Exception as e:
+                logger.debug(f"Token encoding failed: {e}")
+                return []
+        
+        return []
+    
+    def decode_tokens(self, tokens: List[int]) -> str:
+        """Decode tokens back to text"""
+        if not tokens:
             return ""
         
         if self.encoding:
             try:
-                tokens = self.encoding.encode(text)
-                if len(tokens) <= max_tokens:
-                    return text
-                truncated_tokens = tokens[:max_tokens]
-                return self.encoding.decode(truncated_tokens)
+                return self.encoding.decode(tokens)
             except Exception as e:
-                logger.debug(f"Token truncation failed: {e}, using fallback")
+                logger.debug(f"Token decoding failed: {e}")
+                return ""
         
-        # Fallback: character-based truncation
-        max_chars = max_tokens * 4
-        return text[:max_chars]
+        return ""
 
 
-# ==================== Main Character-Based Chunking Service ====================
-
-class CharacterBasedChunkingService:
+class EnhancedChunkingService:
     """
-    Character-based chunking service
+    Enhanced chunking service with 6 different strategies
     
-    Key Features:
-    - NO token limits (except 10K for document-level parent)
-    - ALL chunking based on CHARACTER COUNT
-    - User-defined delimiters
-    - Maximum chunk size enforced (chunks can be smaller)
+    Strategies:
+    1. Fixed-size (token-based)
+    2. Sentence chunking
+    3. Paragraph chunking
+    4. Sliding window
+    5. Recursive chunking
+    6. Semantic chunking
     """
     
     def __init__(
         self,
-        # General chunking parameters
-        max_chunk_chars: int = 2000,
-        overlap_chars: int = 200,
-        delimiter: str = "\n\n",
-        
-        # Parent-child parameters
-        max_child_chunk_chars: int = 1000,
-        max_document_parent_tokens: int = 10000,
-        
-        # Tokenizer (only for document-level parent)
-        tokenizer_model: str = "cl100k_base"
+        target_chunk_tokens: int = 512,
+        chunk_overlap_tokens: int = 50,
+        tokenizer_model: str = "cl100k_base",
+        min_chunk_tokens: int = 100,
+        max_chunk_tokens: int = 1024
     ):
         """
-        Initialize character-based chunker
+        Initialize enhanced chunker
         
         Args:
-            max_chunk_chars: Maximum chunk size in characters (for fixed chunking)
-            overlap_chars: Overlap size in characters
-            delimiter: Delimiter for splitting (e.g., "\n\n", "\n", ".", etc.)
-            max_child_chunk_chars: Maximum child chunk size in characters
-            max_document_parent_tokens: Max tokens for document-level parent (10K limit)
-            tokenizer_model: Tokenizer model (only for document parent limit)
+            target_chunk_tokens: Target chunk size in tokens (default: 512)
+            chunk_overlap_tokens: Overlap between chunks in tokens (default: 50)
+            tokenizer_model: Tokenizer model (default: cl100k_base)
+            min_chunk_tokens: Minimum chunk size (default: 100)
+            max_chunk_tokens: Maximum chunk size (default: 1024)
         """
-        self.max_chunk_chars = max_chunk_chars
-        self.overlap_chars = overlap_chars
-        self.delimiter = delimiter
-        self.max_child_chunk_chars = max_child_chunk_chars
-        self.max_document_parent_tokens = max_document_parent_tokens
+        self.target_chunk_tokens = target_chunk_tokens
+        self.chunk_overlap_tokens = chunk_overlap_tokens
+        self.tokenizer_model = tokenizer_model
+        self.min_chunk_tokens = min_chunk_tokens
+        self.max_chunk_tokens = max_chunk_tokens
         
-        # Token counter (ONLY for document-level parent limit)
+        # Initialize token counter
         self.token_counter = TokenCounter(model=tokenizer_model)
         
         logger.info(
-            f"✓ Character-based chunker initialized:\n"
-            f"  - Max chunk size: {max_chunk_chars} characters\n"
-            f"  - Overlap: {overlap_chars} characters\n"
-            f"  - Delimiter: {repr(delimiter)}\n"
-            f"  - Max child chunk: {max_child_chunk_chars} characters\n"
-            f"  - Document parent limit: {max_document_parent_tokens} tokens"
+            f"✓ Enhanced chunker initialized:\n"
+            f"  - Target chunk size: {target_chunk_tokens} tokens\n"
+            f"  - Overlap: {chunk_overlap_tokens} tokens\n"
+            f"  - Min/Max: {min_chunk_tokens}/{max_chunk_tokens} tokens\n"
+            f"  - Tokenizer: {tokenizer_model}"
         )
     
     def split_document_into_chunks(
@@ -158,8 +169,7 @@ class CharacterBasedChunkingService:
         markdown_text: str,
         structured_data: Optional[Dict] = None,
         base_metadata: Optional[Dict] = None,
-        strategy: ChunkingStrategy = ChunkingStrategy.FIXED_CHARACTER,
-        embedding_model: str = "cohere.embed-english-v3"
+        strategy: ChunkingStrategy = ChunkingStrategy.FIXED_SIZE
     ) -> List[Dict[str, Any]]:
         """
         Split document into chunks using specified strategy
@@ -169,7 +179,6 @@ class CharacterBasedChunkingService:
             structured_data: Optional structured data
             base_metadata: Base metadata for all chunks
             strategy: Chunking strategy to use
-            embedding_model: Embedding model name (stored in metadata)
             
         Returns:
             List of chunk dictionaries with metadata
@@ -178,26 +187,28 @@ class CharacterBasedChunkingService:
             logger.warning("Empty document provided")
             return []
         
+        # Initialize base metadata
         if base_metadata is None:
             base_metadata = {}
         
-        # Add embedding model to metadata
-        base_metadata['embedding_model'] = embedding_model
+        logger.info(f"Chunking document using {strategy.value} strategy ({len(markdown_text)} characters)...")
         
-        logger.info(
-            f"Chunking document with strategy: {strategy.value}, "
-            f"embedding model: {embedding_model}"
-        )
-        
-        # Route to appropriate chunking method
-        if strategy == ChunkingStrategy.FIXED_CHARACTER:
-            chunks = self._chunk_fixed_character(markdown_text, base_metadata)
-        elif strategy == ChunkingStrategy.PARENT_CHILD_PARAGRAPH:
-            chunks = self._chunk_parent_child_paragraph(markdown_text, base_metadata)
-        elif strategy == ChunkingStrategy.PARENT_CHILD_DOCUMENT:
-            chunks = self._chunk_parent_child_document(markdown_text, base_metadata)
+        # Route to appropriate chunking strategy
+        if strategy == ChunkingStrategy.FIXED_SIZE:
+            chunks = self._chunk_fixed_size(markdown_text, base_metadata)
+        elif strategy == ChunkingStrategy.SENTENCE:
+            chunks = self._chunk_by_sentence(markdown_text, base_metadata)
+        elif strategy == ChunkingStrategy.PARAGRAPH:
+            chunks = self._chunk_by_paragraph(markdown_text, base_metadata)
+        elif strategy == ChunkingStrategy.SLIDING_WINDOW:
+            chunks = self._chunk_sliding_window(markdown_text, base_metadata)
+        elif strategy == ChunkingStrategy.RECURSIVE:
+            chunks = self._chunk_recursive(markdown_text, base_metadata)
+        elif strategy == ChunkingStrategy.SEMANTIC:
+            chunks = self._chunk_semantic(markdown_text, base_metadata)
         else:
-            raise ValueError(f"Unknown chunking strategy: {strategy}")
+            logger.warning(f"Unknown strategy {strategy}, falling back to fixed_size")
+            chunks = self._chunk_fixed_size(markdown_text, base_metadata)
         
         if not chunks:
             logger.warning("No chunks created")
@@ -207,417 +218,441 @@ class CharacterBasedChunkingService:
         
         return chunks
     
-    # ==================== Fixed Character Chunking ====================
+    # ==================== STRATEGY 1: Fixed-size (Token-based) ====================
     
-    def _chunk_fixed_character(
+    def _chunk_fixed_size(
         self,
         text: str,
         base_metadata: Dict
     ) -> List[Dict[str, Any]]:
         """
-        Fixed character-based chunking with delimiter-aware splitting
+        Strategy 1: Fixed-size token-based chunking
         
-        Strategy:
-        1. Split text by delimiter
-        2. Combine segments until max_chunk_chars is reached
-        3. Never exceed max_chunk_chars
-        4. Apply overlap between chunks
+        Creates chunks of exactly target_chunk_tokens size
+        No overlap, simple sequential split
         """
         chunks = []
         
-        # Split by delimiter
-        segments = text.split(self.delimiter)
-        
-        logger.info(f"Split document into {len(segments)} segments using delimiter: {repr(self.delimiter)}")
-        
-        current_chunk = ""
-        chunk_index = 1
-        
-        for segment in segments:
-            segment = segment.strip()
-            if not segment:
-                continue
+        if self.token_counter.encoding:
+            tokens = self.token_counter.get_tokens(text)
             
-            # Check if adding this segment would exceed limit
-            potential_chunk = current_chunk + self.delimiter + segment if current_chunk else segment
+            if not tokens:
+                return self._chunk_fixed_size_chars(text, base_metadata)
             
-            if len(potential_chunk) <= self.max_chunk_chars:
-                # Add segment to current chunk
-                current_chunk = potential_chunk
-            else:
-                # Current chunk is full, save it
-                if current_chunk:
-                    chunk = self._create_chunk(
-                        current_chunk,
-                        chunk_index,
-                        base_metadata,
-                        chunk_type='text'
-                    )
-                    chunks.append(chunk)
+            chunk_index = 1
+            position = 0
+            
+            while position < len(tokens):
+                chunk_tokens = tokens[position:position + self.target_chunk_tokens]
+                chunk_text = self.token_counter.decode_tokens(chunk_tokens)
+                
+                if chunk_text.strip():
+                    chunks.append(self._create_chunk(
+                        chunk_text, chunk_index, base_metadata, 
+                        position=position, total_tokens=len(tokens)
+                    ))
                     chunk_index += 1
                 
-                # Start new chunk with current segment
-                # If segment itself exceeds limit, split it
-                if len(segment) > self.max_chunk_chars:
-                    # Split large segment
-                    sub_chunks = self._split_large_segment(
-                        segment,
-                        chunk_index,
-                        base_metadata
-                    )
-                    chunks.extend(sub_chunks)
-                    chunk_index += len(sub_chunks)
-                    current_chunk = ""
-                else:
-                    current_chunk = segment
-        
-        # Add final chunk
-        if current_chunk:
-            chunk = self._create_chunk(
-                current_chunk,
-                chunk_index,
-                base_metadata,
-                chunk_type='text'
-            )
-            chunks.append(chunk)
-        
-        # Apply overlap if requested
-        if self.overlap_chars > 0:
-            chunks = self._apply_overlap(chunks)
+                position += self.target_chunk_tokens
+        else:
+            chunks = self._chunk_fixed_size_chars(text, base_metadata)
         
         return chunks
     
-    # ==================== Parent-Child Paragraph Chunking ====================
+    # ==================== STRATEGY 2: Sentence Chunking ====================
     
-    def _chunk_parent_child_paragraph(
+    def _chunk_by_sentence(
         self,
         text: str,
         base_metadata: Dict
     ) -> List[Dict[str, Any]]:
         """
-        Parent-child chunking with paragraph-level parents
+        Strategy 2: Sentence-based chunking
         
-        Strategy:
-        1. Split document by delimiter (paragraphs)
-        2. Each paragraph = parent chunk (NO size limit)
-        3. Create child chunks from parent (max: max_child_chunk_chars)
-        4. Children can be smaller, never larger than max
+        Groups sentences until target token count is reached
+        Preserves sentence boundaries
         """
         chunks = []
+        
+        # Split into sentences
+        sentences = self._split_into_sentences(text)
+        
+        if not sentences:
+            logger.warning("No sentences detected, falling back to fixed-size")
+            return self._chunk_fixed_size(text, base_metadata)
+        
         chunk_index = 1
+        current_chunk = []
+        current_tokens = 0
         
-        # Split into paragraphs using delimiter
-        paragraphs = text.split(self.delimiter)
-        paragraphs = [p.strip() for p in paragraphs if p.strip()]
-        
-        logger.info(f"Found {len(paragraphs)} paragraphs using delimiter: {repr(self.delimiter)}")
-        
-        for para_index, paragraph in enumerate(paragraphs):
-            if not paragraph.strip():
+        for sentence in sentences:
+            sentence_tokens = self.token_counter.count_tokens(sentence)
+            
+            # If single sentence exceeds max, split it
+            if sentence_tokens > self.max_chunk_tokens:
+                # Save current chunk if exists
+                if current_chunk:
+                    chunk_text = " ".join(current_chunk)
+                    chunks.append(self._create_chunk(chunk_text, chunk_index, base_metadata))
+                    chunk_index += 1
+                    current_chunk = []
+                    current_tokens = 0
+                
+                # Split long sentence using fixed-size
+                sub_chunks = self._chunk_fixed_size(sentence, base_metadata)
+                for sub_chunk in sub_chunks:
+                    sub_chunk['metadata']['chunk_index'] = chunk_index
+                    chunks.append(sub_chunk)
+                    chunk_index += 1
                 continue
             
-            # Detect page number
-            page_number = self._extract_page_number(paragraph)
+            # Check if adding sentence exceeds target
+            if current_tokens + sentence_tokens > self.target_chunk_tokens and current_chunk:
+                # Save current chunk
+                chunk_text = " ".join(current_chunk)
+                chunks.append(self._create_chunk(chunk_text, chunk_index, base_metadata))
+                chunk_index += 1
+                current_chunk = []
+                current_tokens = 0
             
-            # Create parent chunk (FULL paragraph, NO truncation)
-            parent_chunk_id = self._generate_chunk_id(paragraph, chunk_index)
-            
-            parent_chunk = {
-                'chunk_id': parent_chunk_id,
-                'text': paragraph,
-                'char_count': len(paragraph),
-                'metadata': {
-                    'chunk_index': chunk_index,
-                    'chunk_type': 'parent',
-                    'page_number': page_number,
-                    'paragraph_index': para_index,
-                    'chunking_strategy': ChunkingStrategy.PARENT_CHILD_PARAGRAPH.value,
-                    'is_parent': True,
-                    **base_metadata
-                }
-            }
-            
-            chunks.append(parent_chunk)
-            chunk_index += 1
-            
-            # Create child chunks from paragraph
-            child_chunks = self._create_child_chunks(
-                paragraph,
-                parent_chunk_id,
-                page_number,
-                chunk_index,
-                base_metadata
-            )
-            
-            chunks.extend(child_chunks)
-            chunk_index += len(child_chunks)
+            # Add sentence to current chunk
+            current_chunk.append(sentence)
+            current_tokens += sentence_tokens
+        
+        # Save remaining chunk
+        if current_chunk:
+            chunk_text = " ".join(current_chunk)
+            chunks.append(self._create_chunk(chunk_text, chunk_index, base_metadata))
         
         return chunks
     
-    # ==================== Parent-Child Document Chunking ====================
+    # ==================== STRATEGY 3: Paragraph Chunking ====================
     
-    def _chunk_parent_child_document(
+    def _chunk_by_paragraph(
         self,
         text: str,
         base_metadata: Dict
     ) -> List[Dict[str, Any]]:
         """
-        Parent-child chunking with document-level parent
+        Strategy 3: Paragraph-based chunking
         
-        Strategy:
-        1. ENTIRE document = parent (LIMITED TO 10,000 TOKENS ONLY)
-        2. Create child chunks (max: max_child_chunk_chars)
-        3. Children can be smaller, never larger than max
+        Groups paragraphs until target token count is reached
+        Preserves paragraph boundaries
         """
         chunks = []
+        
+        # Split into paragraphs (double newline or more)
+        paragraphs = re.split(r'\n\s*\n+', text)
+        paragraphs = [p.strip() for p in paragraphs if p.strip()]
+        
+        if not paragraphs:
+            logger.warning("No paragraphs detected, falling back to sentence chunking")
+            return self._chunk_by_sentence(text, base_metadata)
+        
         chunk_index = 1
+        current_chunk = []
+        current_tokens = 0
         
-        # Check document token count (ONLY token limit in entire system)
-        doc_tokens = self.token_counter.count_tokens(text)
+        for paragraph in paragraphs:
+            para_tokens = self.token_counter.count_tokens(paragraph)
+            
+            # If single paragraph exceeds max, split it by sentences
+            if para_tokens > self.max_chunk_tokens:
+                # Save current chunk if exists
+                if current_chunk:
+                    chunk_text = "\n\n".join(current_chunk)
+                    chunks.append(self._create_chunk(chunk_text, chunk_index, base_metadata))
+                    chunk_index += 1
+                    current_chunk = []
+                    current_tokens = 0
+                
+                # Split long paragraph by sentences
+                sub_chunks = self._chunk_by_sentence(paragraph, base_metadata)
+                for sub_chunk in sub_chunks:
+                    sub_chunk['metadata']['chunk_index'] = chunk_index
+                    chunks.append(sub_chunk)
+                    chunk_index += 1
+                continue
+            
+            # Check if adding paragraph exceeds target
+            if current_tokens + para_tokens > self.target_chunk_tokens and current_chunk:
+                # Save current chunk
+                chunk_text = "\n\n".join(current_chunk)
+                chunks.append(self._create_chunk(chunk_text, chunk_index, base_metadata))
+                chunk_index += 1
+                current_chunk = []
+                current_tokens = 0
+            
+            # Add paragraph to current chunk
+            current_chunk.append(paragraph)
+            current_tokens += para_tokens
         
-        parent_text = text
-        if doc_tokens > self.max_document_parent_tokens:
-            logger.warning(
-                f"Document has {doc_tokens} tokens, truncating to "
-                f"{self.max_document_parent_tokens} for parent chunk"
+        # Save remaining chunk
+        if current_chunk:
+            chunk_text = "\n\n".join(current_chunk)
+            chunks.append(self._create_chunk(chunk_text, chunk_index, base_metadata))
+        
+        return chunks
+    
+    # ==================== STRATEGY 4: Sliding Window ====================
+    
+    def _chunk_sliding_window(
+        self,
+        text: str,
+        base_metadata: Dict
+    ) -> List[Dict[str, Any]]:
+        """
+        Strategy 4: Sliding window chunking
+        
+        Creates overlapping chunks with specified overlap
+        Ensures continuity across chunks
+        """
+        chunks = []
+        
+        if self.token_counter.encoding:
+            tokens = self.token_counter.get_tokens(text)
+            
+            if not tokens:
+                return self._chunk_sliding_window_chars(text, base_metadata)
+            
+            stride = self.target_chunk_tokens - self.chunk_overlap_tokens
+            
+            if stride <= 0:
+                stride = max(1, self.target_chunk_tokens // 2)
+            
+            chunk_index = 1
+            position = 0
+            
+            while position < len(tokens):
+                chunk_tokens = tokens[position:position + self.target_chunk_tokens]
+                chunk_text = self.token_counter.decode_tokens(chunk_tokens)
+                
+                if chunk_text.strip():
+                    chunks.append(self._create_chunk(
+                        chunk_text, chunk_index, base_metadata,
+                        position=position, total_tokens=len(tokens)
+                    ))
+                    chunk_index += 1
+                
+                position += stride
+        else:
+            chunks = self._chunk_sliding_window_chars(text, base_metadata)
+        
+        return chunks
+    
+    # ==================== STRATEGY 5: Recursive Chunking ====================
+    
+    def _chunk_recursive(
+        self,
+        text: str,
+        base_metadata: Dict
+    ) -> List[Dict[str, Any]]:
+        """
+        Strategy 5: Recursive chunking
+        
+        Hierarchically splits text by separators:
+        1. Paragraphs (\\n\\n)
+        2. Sentences (. ! ?)
+        3. Words
+        
+        Tries to keep chunks at target size while preserving structure
+        """
+        separators = [
+            "\n\n\n",  # Section breaks
+            "\n\n",    # Paragraph breaks
+            "\n",      # Line breaks
+            ". ",      # Sentences
+            "! ",
+            "? ",
+            "; ",      # Clauses
+            ", ",      # Phrases
+            " "        # Words
+        ]
+        
+        chunks = self._recursive_split(text, separators, base_metadata)
+        
+        # Add chunk indices
+        for i, chunk in enumerate(chunks, 1):
+            chunk['metadata']['chunk_index'] = i
+        
+        return chunks
+    
+    def _recursive_split(
+        self,
+        text: str,
+        separators: List[str],
+        base_metadata: Dict,
+        depth: int = 0
+    ) -> List[Dict[str, Any]]:
+        """Recursively split text by separators"""
+        
+        # Base case: text is small enough
+        tokens = self.token_counter.count_tokens(text)
+        if tokens <= self.target_chunk_tokens:
+            if tokens >= self.min_chunk_tokens or depth > len(separators):
+                return [self._create_chunk(text, 0, base_metadata)]
+            else:
+                return []
+        
+        # No more separators, force split
+        if not separators:
+            return self._chunk_fixed_size(text, base_metadata)
+        
+        # Try current separator
+        separator = separators[0]
+        remaining_separators = separators[1:]
+        
+        parts = text.split(separator)
+        
+        # If split didn't help, try next separator
+        if len(parts) == 1:
+            return self._recursive_split(text, remaining_separators, base_metadata, depth + 1)
+        
+        # Recursively split parts
+        chunks = []
+        for part in parts:
+            if not part.strip():
+                continue
+            
+            sub_chunks = self._recursive_split(
+                part, remaining_separators, base_metadata, depth + 1
             )
-            parent_text = self.token_counter.truncate_to_tokens(
-                text, 
-                self.max_document_parent_tokens
+            chunks.extend(sub_chunks)
+        
+        return chunks
+    
+    # ==================== STRATEGY 6: Semantic Chunking ====================
+    
+    def _chunk_semantic(
+        self,
+        text: str,
+        base_metadata: Dict
+    ) -> List[Dict[str, Any]]:
+        """
+        Strategy 6: Semantic chunking
+        
+        Groups semantically similar sentences together
+        Uses simple heuristics:
+        - Sentence similarity based on keyword overlap
+        - Respects paragraph boundaries
+        - Groups related sentences
+        """
+        chunks = []
+        
+        # Split into sentences
+        sentences = self._split_into_sentences(text)
+        
+        if not sentences:
+            return self._chunk_by_sentence(text, base_metadata)
+        
+        chunk_index = 1
+        current_chunk = []
+        current_tokens = 0
+        
+        for i, sentence in enumerate(sentences):
+            sentence_tokens = self.token_counter.count_tokens(sentence)
+            
+            # First sentence or chunk is empty
+            if not current_chunk:
+                current_chunk.append(sentence)
+                current_tokens = sentence_tokens
+                continue
+            
+            # Check semantic similarity with current chunk
+            is_similar = self._is_semantically_similar(
+                " ".join(current_chunk), sentence
             )
-            doc_tokens = self.max_document_parent_tokens
+            
+            # Decide whether to add to current chunk or start new one
+            would_exceed = (current_tokens + sentence_tokens) > self.target_chunk_tokens
+            
+            if would_exceed or (not is_similar and current_tokens >= self.min_chunk_tokens):
+                # Save current chunk
+                chunk_text = " ".join(current_chunk)
+                chunks.append(self._create_chunk(chunk_text, chunk_index, base_metadata))
+                chunk_index += 1
+                current_chunk = [sentence]
+                current_tokens = sentence_tokens
+            else:
+                # Add to current chunk
+                current_chunk.append(sentence)
+                current_tokens += sentence_tokens
         
-        parent_chunk_id = self._generate_chunk_id(parent_text, chunk_index)
-        
-        # Create parent chunk (full document, limited to 10K tokens)
-        parent_chunk = {
-            'chunk_id': parent_chunk_id,
-            'text': parent_text,
-            'char_count': len(parent_text),
-            'metadata': {
-                'chunk_index': chunk_index,
-                'chunk_type': 'parent',
-                'page_number': 1,
-                'chunking_strategy': ChunkingStrategy.PARENT_CHILD_DOCUMENT.value,
-                'is_parent': True,
-                'is_document_parent': True,
-                'document_tokens': doc_tokens,
-                'truncated': doc_tokens == self.max_document_parent_tokens,
-                **base_metadata
-            }
-        }
-        
-        chunks.append(parent_chunk)
-        chunk_index += 1
-        
-        # Create child chunks from FULL document (not truncated parent)
-        child_chunks = self._create_child_chunks(
-            text,  # Use full text, not truncated parent
-            parent_chunk_id,
-            1,
-            chunk_index,
-            base_metadata
-        )
-        
-        chunks.extend(child_chunks)
+        # Save remaining chunk
+        if current_chunk:
+            chunk_text = " ".join(current_chunk)
+            chunks.append(self._create_chunk(chunk_text, chunk_index, base_metadata))
         
         return chunks
     
     # ==================== Helper Methods ====================
     
-    def _create_child_chunks(
-        self,
-        text: str,
-        parent_chunk_id: str,
-        page_number: int,
-        start_chunk_index: int,
-        base_metadata: Dict
-    ) -> List[Dict[str, Any]]:
-        """
-        Create child chunks from text
+    def _split_into_sentences(self, text: str) -> List[str]:
+        """Split text into sentences"""
+        if NLTK_AVAILABLE:
+            try:
+                sentences = nltk.sent_tokenize(text)
+                return [s.strip() for s in sentences if s.strip()]
+            except Exception as e:
+                logger.warning(f"NLTK sentence tokenization failed: {e}")
         
-        Args:
-            text: Text to chunk
-            parent_chunk_id: ID of parent chunk
-            page_number: Page number
-            start_chunk_index: Starting chunk index
-            base_metadata: Base metadata
-            
-        Returns:
-            List of child chunks
-        """
-        child_chunks = []
-        
-        # Split by delimiter first
-        segments = text.split(self.delimiter)
-        segments = [s.strip() for s in segments if s.strip()]
-        
-        current_child = ""
-        child_index = 0
-        
-        for segment in segments:
-            # Check if adding segment would exceed max
-            potential_child = current_child + self.delimiter + segment if current_child else segment
-            
-            if len(potential_child) <= self.max_child_chunk_chars:
-                current_child = potential_child
-            else:
-                # Save current child
-                if current_child:
-                    child_chunk = self._create_chunk(
-                        current_child,
-                        start_chunk_index + child_index,
-                        base_metadata,
-                        chunk_type='child',
-                        parent_chunk_id=parent_chunk_id,
-                        child_index=child_index,
-                        page_number=page_number
-                    )
-                    child_chunks.append(child_chunk)
-                    child_index += 1
-                
-                # Handle large segment
-                if len(segment) > self.max_child_chunk_chars:
-                    # Split large segment
-                    sub_chunks = self._split_large_segment(
-                        segment,
-                        start_chunk_index + child_index,
-                        base_metadata,
-                        parent_chunk_id=parent_chunk_id,
-                        child_index_start=child_index,
-                        page_number=page_number
-                    )
-                    child_chunks.extend(sub_chunks)
-                    child_index += len(sub_chunks)
-                    current_child = ""
-                else:
-                    current_child = segment
-        
-        # Add final child
-        if current_child:
-            child_chunk = self._create_chunk(
-                current_child,
-                start_chunk_index + child_index,
-                base_metadata,
-                chunk_type='child',
-                parent_chunk_id=parent_chunk_id,
-                child_index=child_index,
-                page_number=page_number
-            )
-            child_chunks.append(child_chunk)
-        
-        return child_chunks
+        # Fallback: regex-based sentence splitting
+        pattern = r'(?<=[.!?])\s+(?=[A-Z])'
+        sentences = re.split(pattern, text)
+        return [s.strip() for s in sentences if s.strip()]
     
-    def _split_large_segment(
-        self,
-        segment: str,
-        start_index: int,
-        base_metadata: Dict,
-        parent_chunk_id: Optional[str] = None,
-        child_index_start: int = 0,
-        page_number: int = 1
-    ) -> List[Dict[str, Any]]:
+    def _is_semantically_similar(self, text1: str, text2: str, threshold: float = 0.3) -> bool:
         """
-        Split a segment that exceeds max chunk size
+        Simple semantic similarity using keyword overlap
         
-        Uses simple character-based splitting
+        Returns True if texts share significant keywords
         """
-        chunks = []
-        max_size = self.max_child_chunk_chars if parent_chunk_id else self.max_chunk_chars
+        # Extract keywords (words longer than 3 chars)
+        words1 = set(re.findall(r'\b\w{4,}\b', text1.lower()))
+        words2 = set(re.findall(r'\b\w{4,}\b', text2.lower()))
         
-        position = 0
-        local_index = 0
+        if not words1 or not words2:
+            return False
         
-        while position < len(segment):
-            chunk_text = segment[position:position + max_size]
-            
-            if not chunk_text.strip():
-                position += max_size
-                continue
-            
-            chunk = self._create_chunk(
-                chunk_text,
-                start_index + local_index,
-                base_metadata,
-                chunk_type='child' if parent_chunk_id else 'text',
-                parent_chunk_id=parent_chunk_id,
-                child_index=child_index_start + local_index if parent_chunk_id else None,
-                page_number=page_number
-            )
-            
-            chunks.append(chunk)
-            position += max_size
-            local_index += 1
+        # Calculate Jaccard similarity
+        intersection = len(words1 & words2)
+        union = len(words1 | words2)
         
-        return chunks
+        similarity = intersection / union if union > 0 else 0
+        
+        return similarity >= threshold
     
     def _create_chunk(
         self,
         text: str,
         chunk_index: int,
         base_metadata: Dict,
-        chunk_type: str = 'text',
-        parent_chunk_id: Optional[str] = None,
-        child_index: Optional[int] = None,
-        page_number: Optional[int] = None
+        position: Optional[int] = None,
+        total_tokens: Optional[int] = None
     ) -> Dict[str, Any]:
         """Create a chunk dictionary"""
         
-        if page_number is None:
-            page_number = self._extract_page_number(text)
+        page_number = self._extract_page_number(text)
+        token_count = self.token_counter.count_tokens(text)
         
         chunk = {
             'chunk_id': self._generate_chunk_id(text, chunk_index),
             'text': text,
             'char_count': len(text),
+            'token_count': token_count,
             'metadata': {
                 'chunk_index': chunk_index,
-                'chunk_type': chunk_type,
+                'chunk_type': 'text',
                 'page_number': page_number,
                 **base_metadata
             }
         }
         
-        # Add parent-child metadata if applicable
-        if parent_chunk_id:
-            chunk['metadata']['parent_chunk_id'] = parent_chunk_id
-            chunk['metadata']['is_parent'] = False
-            if child_index is not None:
-                chunk['metadata']['child_index'] = child_index
-        elif chunk_type == 'parent':
-            chunk['metadata']['is_parent'] = True
+        if position is not None and total_tokens is not None:
+            chunk['metadata']['token_position'] = position
+            chunk['metadata']['total_tokens_in_doc'] = total_tokens
         
         return chunk
-    
-    def _apply_overlap(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Apply overlap to consecutive chunks
-        
-        Takes last overlap_chars from previous chunk and prepends to next chunk
-        """
-        if len(chunks) <= 1 or self.overlap_chars == 0:
-            return chunks
-        
-        overlapped_chunks = [chunks[0]]
-        
-        for i in range(1, len(chunks)):
-            prev_text = chunks[i-1]['text']
-            curr_text = chunks[i]['text']
-            
-            # Get overlap from previous chunk
-            overlap_text = prev_text[-self.overlap_chars:] if len(prev_text) >= self.overlap_chars else prev_text
-            
-            # Prepend overlap to current chunk
-            new_text = overlap_text + curr_text
-            
-            # Update chunk
-            new_chunk = chunks[i].copy()
-            new_chunk['text'] = new_text
-            new_chunk['char_count'] = len(new_text)
-            
-            overlapped_chunks.append(new_chunk)
-        
-        return overlapped_chunks
     
     def _extract_page_number(self, text: str) -> int:
         """Extract page number from chunk text"""
@@ -635,41 +670,70 @@ class CharacterBasedChunkingService:
         hash_input = f"{content_sample}_{chunk_index}"
         return hashlib.sha256(hash_input.encode()).hexdigest()[:16]
     
+    def _chunk_fixed_size_chars(self, text: str, base_metadata: Dict) -> List[Dict[str, Any]]:
+        """Fallback: character-based fixed-size chunking"""
+        chunks = []
+        target_chars = self.target_chunk_tokens * 4
+        
+        chunk_index = 1
+        position = 0
+        
+        while position < len(text):
+            chunk_text = text[position:position + target_chars]
+            
+            if chunk_text.strip():
+                chunks.append(self._create_chunk(chunk_text, chunk_index, base_metadata))
+                chunk_index += 1
+            
+            position += target_chars
+        
+        return chunks
+    
+    def _chunk_sliding_window_chars(self, text: str, base_metadata: Dict) -> List[Dict[str, Any]]:
+        """Fallback: character-based sliding window"""
+        chunks = []
+        target_chars = self.target_chunk_tokens * 4
+        overlap_chars = self.chunk_overlap_tokens * 4
+        stride_chars = target_chars - overlap_chars
+        
+        chunk_index = 1
+        position = 0
+        
+        while position < len(text):
+            chunk_text = text[position:position + target_chars]
+            
+            if chunk_text.strip():
+                chunks.append(self._create_chunk(chunk_text, chunk_index, base_metadata))
+                chunk_index += 1
+            
+            position += stride_chars
+        
+        return chunks
+    
     def get_chunk_stats(self, chunks: List[Dict]) -> Dict[str, Any]:
         """Get statistics about chunks"""
         if not chunks:
             return {
                 'total_chunks': 0,
-                'avg_chars': 0,
-                'min_chars': 0,
-                'max_chars': 0,
-                'total_chars': 0
+                'avg_tokens': 0,
+                'min_tokens': 0,
+                'max_tokens': 0,
+                'total_tokens': 0
             }
         
-        char_counts = [c['char_count'] for c in chunks]
+        token_counts = [c['token_count'] for c in chunks]
         
-        # Count parent/child if applicable
-        parent_chunks = [c for c in chunks if c['metadata'].get('is_parent', False)]
-        child_chunks = [c for c in chunks if not c['metadata'].get('is_parent', False)]
-        
-        stats = {
+        return {
             'total_chunks': len(chunks),
-            'avg_chars': sum(char_counts) / len(char_counts),
-            'min_chars': min(char_counts),
-            'max_chars': max(char_counts),
-            'total_chars': sum(char_counts),
-            'max_chunk_limit': self.max_chunk_chars,
-            'overlap': self.overlap_chars,
-            'delimiter': self.delimiter
+            'avg_tokens': sum(token_counts) / len(token_counts),
+            'min_tokens': min(token_counts),
+            'max_tokens': max(token_counts),
+            'total_tokens': sum(token_counts),
+            'target_tokens': self.target_chunk_tokens,
+            'overlap_tokens': self.chunk_overlap_tokens
         }
-        
-        if parent_chunks:
-            stats['parent_chunks'] = len(parent_chunks)
-            stats['child_chunks'] = len(child_chunks)
-            stats['max_child_limit'] = self.max_child_chunk_chars
-        
-        return stats
 
 
-# Backward compatibility aliases
-SemanticChunkingService = CharacterBasedChunkingService
+# Backward compatibility
+SemanticChunkingService = EnhancedChunkingService
+SimpleChunkingService = EnhancedChunkingService

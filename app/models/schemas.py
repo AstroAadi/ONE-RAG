@@ -1,13 +1,11 @@
 """
-Updated Pydantic Schemas for Character-Based RAG System
-- Chunking strategy selection
-- Character-based limits only (no token limits except document parent)
-- Delimiter selection
-- Embedding model selection
+Pydantic Schemas for RAG System
+Complete type safety with proper validation
+Updated: Added ChunkingStrategy enum and upload with chunking strategy selection
 """
 
-from pydantic import BaseModel, Field, field_validator, ConfigDict
-from typing import List, Optional, Dict, Any
+from pydantic import BaseModel, Field, field_validator, ConfigDict, model_validator
+from typing import List, Optional, Dict, Any, Literal
 from datetime import datetime
 from enum import Enum
 
@@ -22,11 +20,13 @@ class ProcessingStatus(str, Enum):
     FAILED = "failed"
 
 
-class ChunkingStrategy(str, Enum):
-    """Chunking strategy options (character-based only)"""
-    FIXED_CHARACTER = "fixed_character"
-    PARENT_CHILD_PARAGRAPH = "parent_child_paragraph"
-    PARENT_CHILD_DOCUMENT = "parent_child_document"
+class FileCategory(str, Enum):
+    """File category types"""
+    DOCUMENT = "document"
+    PRESENTATION = "presentation"
+    IMAGE = "image"
+    TEXT = "text"
+    OTHER = "other"
 
 
 class SearchType(str, Enum):
@@ -36,74 +36,26 @@ class SearchType(str, Enum):
     HYBRID = "hybrid"
 
 
-class EmbeddingModel(str, Enum):
-    """Available embedding models"""
-    COHERE_ENGLISH_V3 = "cohere.embed-english-v3"
-    COHERE_MULTILINGUAL_V3 = "cohere.embed-multilingual-v3"
-    AMAZON_TITAN_V1 = "amazon.titan-embed-text-v1"
-    AMAZON_TITAN_V2 = "amazon.titan-embed-text-v2"
+class ChunkingStrategy(str, Enum):
+    """
+    Available chunking strategies
+    
+    - FIXED_SIZE: Token-based fixed-size chunks (no overlap)
+    - SENTENCE: Groups sentences up to target size
+    - PARAGRAPH: Groups paragraphs up to target size
+    - SLIDING_WINDOW: Fixed-size with overlapping windows
+    - RECURSIVE: Hierarchical split by separators
+    - SEMANTIC: Groups semantically similar sentences
+    """
+    FIXED_SIZE = "fixed_size"
+    SENTENCE = "sentence"
+    PARAGRAPH = "paragraph"
+    SLIDING_WINDOW = "sliding_window"
+    RECURSIVE = "recursive"
+    SEMANTIC = "semantic"
 
 
 # ==================== Request Models ====================
-
-class DocumentProcessRequest(BaseModel):
-    """
-    Document processing request with character-based chunking configuration
-    """
-    model_config = ConfigDict(str_strip_whitespace=True)
-    
-    # Chunking strategy
-    chunking_strategy: ChunkingStrategy = Field(
-        default=ChunkingStrategy.FIXED_CHARACTER,
-        description="Chunking strategy to use"
-    )
-    
-    # Character-based parameters (NO TOKEN LIMITS)
-    max_chunk_chars: int = Field(
-        default=2000,
-        ge=500,
-        le=10000,
-        description="Maximum chunk size in characters (chunks can be smaller, never larger)"
-    )
-    
-    overlap_chars: int = Field(
-        default=200,
-        ge=0,
-        le=2000,
-        description="Overlap size in characters (for fixed chunking)"
-    )
-    
-    # Delimiter selection
-    delimiter: str = Field(
-        default="\n\n",
-        min_length=1,
-        max_length=10,
-        description="Delimiter for splitting text (e.g., '\\n\\n', '\\n', '.', etc.)"
-    )
-    
-    # Parent-child specific
-    max_child_chunk_chars: int = Field(
-        default=1000,
-        ge=200,
-        le=5000,
-        description="Maximum child chunk size in characters (for parent-child strategies)"
-    )
-    
-    # Embedding model selection
-    embedding_model: EmbeddingModel = Field(
-        default=EmbeddingModel.COHERE_ENGLISH_V3,
-        description="Embedding model to use for generating embeddings"
-    )
-    
-    @field_validator('overlap_chars')
-    @classmethod
-    def validate_overlap(cls, v, info):
-        """Ensure overlap is reasonable compared to chunk size"""
-        max_chars = info.data.get('max_chunk_chars', 2000)
-        if v >= max_chars:
-            raise ValueError(f"overlap_chars ({v}) must be less than max_chunk_chars ({max_chars})")
-        return v
-
 
 class FileUploadRequest(BaseModel):
     """File upload metadata (used internally)"""
@@ -111,6 +63,34 @@ class FileUploadRequest(BaseModel):
     
     user_id: str = Field(..., min_length=1, max_length=100)
     original_filename: str = Field(..., min_length=1, max_length=500)
+
+
+class ProcessDocumentRequest(BaseModel):
+    """
+    Request to process a document with chunking strategy
+    
+    This is used as query parameter during /process/{file_id} call
+    """
+    model_config = ConfigDict(str_strip_whitespace=True)
+    
+    chunking_strategy: ChunkingStrategy = Field(
+        default=ChunkingStrategy.FIXED_SIZE,
+        description="Chunking strategy to use for this document"
+    )
+    
+    target_chunk_tokens: Optional[int] = Field(
+        default=None,
+        ge=100,
+        le=2048,
+        description="Target chunk size in tokens (default: 512)"
+    )
+    
+    chunk_overlap_tokens: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=500,
+        description="Overlap between chunks in tokens (default: 50)"
+    )
 
 
 class QueryRequest(BaseModel):
@@ -144,9 +124,10 @@ class QueryRequest(BaseModel):
         description="LLM temperature (0.0-1.0)"
     )
     
+    # Search type selection
     search_type: SearchType = Field(
         default=SearchType.HYBRID,
-        description="Search type: 'dense', 'sparse', or 'hybrid'"
+        description="Search type: 'dense' (semantic only), 'sparse' (keyword only), or 'hybrid' (RRF fusion)"
     )
 
 
@@ -157,6 +138,47 @@ class ConversationQueryRequest(QueryRequest):
         min_length=1,
         max_length=100,
         description="Unique conversation ID"
+    )
+
+
+# ==================== Chunk Editing Request Models ====================
+
+class ChunkRetrievalRequest(BaseModel):
+    """Request to retrieve a specific chunk"""
+    model_config = ConfigDict(str_strip_whitespace=True)
+    
+    chunk_id: str = Field(..., min_length=1, max_length=200, description="Unique chunk identifier")
+    file_id: Optional[str] = Field(None, description="Optional file ID for validation")
+
+
+class UpdateChunkRequest(BaseModel):
+    """Request to update/edit a chunk"""
+    model_config = ConfigDict(str_strip_whitespace=True)
+    
+    chunk_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description="Unique chunk identifier"
+    )
+    
+    file_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="Parent file ID (for validation)"
+    )
+    
+    new_text: str = Field(
+        ...,
+        min_length=1,
+        max_length=10000,
+        description="New chunk text content"
+    )
+    
+    preserve_metadata: bool = Field(
+        default=True,
+        description="Whether to preserve existing metadata"
     )
 
 
@@ -187,43 +209,50 @@ class DocumentProcessResponse(BaseModel):
     total_pages: int = 0
     processing_time_seconds: Optional[float] = None
     statistics: Optional[Dict[str, int]] = None
-    message: str
-    
-    # Chunking configuration used
-    chunking_strategy: Optional[str] = Field(default=None)
-    chunking_config: Optional[Dict[str, Any]] = Field(
+    chunking_strategy: Optional[str] = Field(
         default=None,
-        description="Chunking configuration used (delimiter, max_chars, etc.)"
+        description="Chunking strategy used"
     )
-    
-    # Embedding model used
-    embedding_model: Optional[str] = Field(default=None)
-    
-    # Chunk breakdown
-    chunk_breakdown: Optional[Dict[str, int]] = Field(default=None)
-    chunk_stats: Optional[Dict[str, Any]] = Field(default=None)
+    message: str
 
 
 class SourceDocument(BaseModel):
-    """Source document chunk in query results"""
+    """
+    Source document chunk in query results with chunk editing support
+    
+    Includes:
+    - chunk_id: For identifying the exact chunk to edit
+    - file_id: For parent file identification
+    - full_text: Complete chunk text (not truncated) for editing
+    """
     model_config = ConfigDict(from_attributes=True)
     
-    content: str = Field(..., description="Chunk content")
-    full_text: Optional[str] = Field(default=None, description="Complete chunk text")
+    # Core content
+    content: str = Field(..., description="Chunk content (may be truncated for display)")
     
-    filename: str
-    chunk_id: str
-    file_id: str = Field(default="unknown")
+    # Full text for editing (not truncated)
+    full_text: Optional[str] = Field(
+        default=None,
+        description="Complete chunk text (for editing purposes)"
+    )
     
-    relevance_score: float
+    # Identifiers
+    filename: str = Field(..., description="Source filename")
+    chunk_id: str = Field(..., description="Unique chunk ID (for editing)")
     
+    # File ID for editing validation
+    file_id: str = Field(
+        default="unknown",
+        description="Parent file ID (for editing validation)"
+    )
+    
+    # Scores
+    relevance_score: float = Field(..., description="Relevance score")
+    
+    # Optional metadata
     page_number: int = Field(default=0, ge=0)
     chunk_type: str = Field(default="text")
     chunk_index: int = Field(default=0, ge=0)
-    
-    # Parent-child metadata
-    is_parent: Optional[bool] = Field(default=None)
-    parent_chunk_id: Optional[str] = Field(default=None)
     
     # Search scores
     semantic_score: Optional[float] = Field(default=None)
@@ -232,12 +261,24 @@ class SourceDocument(BaseModel):
     @field_validator('relevance_score', mode='before')
     @classmethod
     def clamp_relevance_score(cls, v):
-        """Ensure relevance score is within valid range"""
+        """Ensure relevance score is within valid range [0.0, 1.0]"""
         try:
             score = float(v)
             return max(0.0, min(1.0, score))
         except (ValueError, TypeError):
             return 0.0
+    
+    @field_validator('semantic_score', 'keyword_score', mode='before')
+    @classmethod
+    def clamp_optional_scores(cls, v):
+        """Ensure optional scores are within valid range if provided"""
+        if v is None:
+            return None
+        try:
+            score = float(v)
+            return max(0.0, min(1.0, score))
+        except (ValueError, TypeError):
+            return None
 
 
 class QueryResponse(BaseModel):
@@ -248,24 +289,18 @@ class QueryResponse(BaseModel):
     answer: str
     sources: List[SourceDocument]
     
-    processing_time: float
+    # Performance metrics
+    processing_time: float = Field(..., description="Processing time in seconds")
+    
+    # Search metadata
     search_type: SearchType = Field(default=SearchType.HYBRID)
     confidence_score: float = Field(default=1.0, ge=0.0, le=1.0)
     
+    # Optional conversation tracking
     conversation_id: Optional[str] = None
 
 
-# ==================== Chunk Editing Models ====================
-
-class UpdateChunkRequest(BaseModel):
-    """Request to update/edit a chunk"""
-    model_config = ConfigDict(str_strip_whitespace=True)
-    
-    chunk_id: str = Field(..., min_length=1, max_length=200)
-    file_id: str = Field(..., min_length=1, max_length=100)
-    new_text: str = Field(..., min_length=1, max_length=10000)
-    preserve_metadata: bool = Field(default=True)
-
+# ==================== Chunk Editing Response Models ====================
 
 class ChunkDetailResponse(BaseModel):
     """Response with complete chunk details"""
@@ -273,22 +308,24 @@ class ChunkDetailResponse(BaseModel):
     
     chunk_id: str
     file_id: str
-    text: str
+    text: str = Field(..., description="Complete chunk text")
     filename: str
     user_id: str
     
+    # Metadata
     chunk_type: str = Field(default="text")
     page_number: int = Field(default=0, ge=0)
     char_count: int = Field(..., ge=0)
     chunk_index: int = Field(default=0, ge=0)
     
-    is_parent: Optional[bool] = Field(default=None)
-    parent_chunk_id: Optional[str] = Field(default=None)
-    
+    # Timestamps
     created_at: str
     updated_at: Optional[str] = None
+    
+    # Edit tracking
     edited: bool = Field(default=False)
     
+    # Additional metadata
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -300,12 +337,39 @@ class UpdateChunkResponse(BaseModel):
     chunk_id: str
     file_id: str
     user_id: str
+    
+    # Changes
     old_char_count: int = Field(..., ge=0)
     new_char_count: int = Field(..., ge=0)
+    
+    # Timestamp
     updated_at: str
 
 
-# ==================== Knowledge Base Models ====================
+class ChunkListItem(BaseModel):
+    """Individual chunk in file chunk list"""
+    model_config = ConfigDict(from_attributes=True)
+    
+    chunk_id: str
+    chunk_index: int = Field(..., ge=0)
+    chunk_type: str = Field(default="text")
+    char_count: int = Field(..., ge=0)
+    page_number: int = Field(default=0, ge=0)
+    created_at: Optional[str] = None
+    edited: bool = Field(default=False)
+
+
+class FileChunksResponse(BaseModel):
+    """Response with all chunks for a file"""
+    model_config = ConfigDict(from_attributes=True)
+    
+    file_id: str
+    filename: str
+    total_chunks: int = Field(..., ge=0)
+    chunks: List[ChunkListItem]
+
+
+# ==================== Document Info Models ====================
 
 class DocumentInfo(BaseModel):
     """Document information in knowledge base"""
@@ -321,12 +385,16 @@ class DocumentInfo(BaseModel):
     uploaded_at: datetime
     processed_at: Optional[datetime] = None
     
+    # Statistics
     word_count: int = Field(default=0, ge=0)
     image_count: int = Field(default=0, ge=0)
     table_count: int = Field(default=0, ge=0)
     
-    chunking_strategy: Optional[str] = Field(default=None)
-    embedding_model: Optional[str] = Field(default=None)
+    # Chunking info
+    chunking_strategy: Optional[str] = Field(
+        default=None,
+        description="Chunking strategy used"
+    )
 
 
 class KnowledgeBaseStatus(BaseModel):
@@ -335,25 +403,100 @@ class KnowledgeBaseStatus(BaseModel):
     
     total_documents: int = Field(..., ge=0)
     total_chunks: int = Field(..., ge=0)
+    total_users: int = Field(default=0, ge=0)
     documents: List[DocumentInfo]
     
+    # Optional statistics
     total_size_bytes: Optional[int] = None
     avg_chunks_per_document: Optional[float] = None
 
 
-# ==================== Error Response ====================
+class UserDocumentsResponse(BaseModel):
+    """User's documents list"""
+    model_config = ConfigDict(from_attributes=True)
+    
+    user_id: str
+    total_documents: int = Field(..., ge=0)
+    documents: List[DocumentInfo]
+
+
+# ==================== Error Response Models ====================
 
 class ErrorResponse(BaseModel):
     """Standard error response"""
     model_config = ConfigDict(from_attributes=True)
     
-    error: str
-    message: str
-    details: Optional[Dict[str, Any]] = Field(default=None)
+    error: str = Field(..., description="Error code")
+    message: str = Field(..., description="Error message")
+    details: Optional[Dict[str, Any]] = Field(default=None, description="Additional details")
     timestamp: datetime = Field(default_factory=datetime.utcnow)
 
 
-# ==================== Health Check ====================
+# ==================== Statistics Models ====================
+
+class DocumentStatistics(BaseModel):
+    """Detailed document statistics"""
+    model_config = ConfigDict(from_attributes=True)
+    
+    file_id: str
+    filename: str
+    
+    # Content statistics
+    total_pages: int = Field(..., ge=0)
+    total_chunks: int = Field(..., ge=0)
+    word_count: int = Field(default=0, ge=0)
+    char_count: int = Field(default=0, ge=0)
+    
+    # Visual elements
+    image_count: int = Field(default=0, ge=0)
+    table_count: int = Field(default=0, ge=0)
+    chart_count: int = Field(default=0, ge=0)
+    
+    # Processing info
+    processing_time_seconds: Optional[float] = None
+    extraction_method: Optional[str] = None
+    chunking_strategy: Optional[str] = None
+
+
+class SystemMetrics(BaseModel):
+    """System-wide metrics"""
+    model_config = ConfigDict(from_attributes=True)
+    
+    uptime_seconds: float = Field(..., ge=0.0)
+    total_requests: int = Field(..., ge=0)
+    total_errors: int = Field(..., ge=0)
+    error_rate: float = Field(..., ge=0.0, le=1.0)
+    
+    # Per-endpoint metrics
+    endpoints: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    
+    # Optional error details
+    errors: Optional[Dict[str, int]] = None
+
+
+# ==================== Conversation Models ====================
+
+class ConversationMessage(BaseModel):
+    """Single message in conversation"""
+    model_config = ConfigDict(from_attributes=True)
+    
+    role: str = Field(..., pattern='^(user|assistant)$')
+    content: str = Field(..., min_length=1)
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+
+class ConversationHistory(BaseModel):
+    """Conversation history"""
+    model_config = ConfigDict(from_attributes=True)
+    
+    conversation_id: str
+    user_id: str
+    messages: List[ConversationMessage]
+    created_at: datetime
+    updated_at: datetime
+
+
+# ==================== Health Check Models ====================
 
 class HealthCheckResponse(BaseModel):
     """Health check response"""
@@ -362,8 +505,10 @@ class HealthCheckResponse(BaseModel):
     status: str = Field(..., pattern='^(healthy|degraded|unhealthy)$')
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     
-    database: bool
-    vector_store: bool
-    llm_service: bool
+    # Component health
+    database: bool = Field(..., description="Database connectivity")
+    vector_store: bool = Field(..., description="Vector store status")
+    llm_service: bool = Field(..., description="LLM service availability")
     
+    # Optional details
     details: Optional[Dict[str, Any]] = None

@@ -1,13 +1,10 @@
 """
-Updated Upload Route - Character-Based Chunking with User Configuration
-- Character-based limits only (no token limits except document parent: 10K)
-- User selects delimiter
-- User selects embedding model
-- User defines maximum chunk sizes (chunks can be smaller)
+Upload Route - ENHANCED VERSION with Chunking Strategy Selection
+User can select from 6 different chunking strategies when processing documents
 """
 
 from typing import Optional
-from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Body
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Query
 from sqlalchemy.orm import Session
 from pathlib import Path
 import uuid
@@ -15,23 +12,22 @@ import shutil
 from datetime import datetime
 import logging
 import json
+import time
 
 from app.models.schemas import (
-    FileUploadResponse, 
-    DocumentProcessResponse, 
-    DocumentProcessRequest,
-    ProcessingStatus,
-    ChunkingStrategy,
-    EmbeddingModel
+    FileUploadResponse, DocumentProcessResponse, ProcessingStatus, ChunkingStrategy
 )
 from app.utils.file_validator import FileValidator
 from app.services.extraction.extractor_factory import ExtractorFactory
 from app.utils.markdown_converter import MarkdownConverter
-from app.services.chunking_service import CharacterBasedChunkingService
+from app.services.chunking_service import EnhancedChunkingService
 from app.services.vector_store_service import VectorStoreService
 from app.core.config import settings
 from app.core.dependencies import get_user_id, get_database_session
-from app.db.models import FileMetadata, ChunkMetadata, ProcessingStatus as DBProcessingStatus, FileType
+from app.db.models import (
+    FileMetadata, ChunkMetadata, ProcessingStatus as DBProcessingStatus, 
+    FileType, ChunkingStrategyEnum
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,9 +49,10 @@ async def upload_file(
     
     Directory structure:
     - uploads/{user_id}/{filename} - Original file
+    - uploads/{user_id}/extracted_images/{doc_stem}/ - Images (created during extraction)
     - markdown_output/{user_id}/{file_id}.md - Markdown output
     
-    Note: Chunking configuration is selected during processing
+    Note: Chunking strategy is selected during the /process/{file_id} call
     """
     
     # Validate filename
@@ -71,12 +68,15 @@ async def upload_file(
     # Generate unique file ID
     file_id = str(uuid.uuid4())
     file_extension = FileValidator.get_file_extension(file.filename)
+    
+    # Get safe filename
     safe_filename = FileValidator.get_safe_filename(file.filename)
     
     # Create user-specific upload directory
     user_upload_dir = Path(settings.upload_dir) / user_id
     user_upload_dir.mkdir(parents=True, exist_ok=True)
     
+    # Use file_id in filename to ensure uniqueness
     unique_filename = f"{file_id}_{safe_filename}"
     upload_path = user_upload_dir / unique_filename
     
@@ -101,6 +101,7 @@ async def upload_file(
         # Get file category
         file_category = FileValidator.get_file_category(safe_filename)
         
+        # Map category to FileType enum
         file_type_map = {
             'document': FileType.DOCUMENT,
             'presentation': FileType.PRESENTATION,
@@ -138,10 +139,7 @@ async def upload_file(
             file_size_bytes=file_size,
             upload_time=datetime.now(),
             status=ProcessingStatus.UPLOADED,
-            message=(
-                f"File '{safe_filename}' uploaded successfully. "
-                f"Use /process/{file_id} to process with your chosen configuration."
-            )
+            message=f"File '{safe_filename}' uploaded successfully. Use /process/{file_id} to extract and index with your preferred chunking strategy."
         )
     
     except HTTPException:
@@ -158,95 +156,60 @@ async def upload_file(
 @router.post("/process/{file_id}", response_model=DocumentProcessResponse)
 async def process_and_index_document(
     file_id: str,
-    process_request: DocumentProcessRequest = Body(
-        default=DocumentProcessRequest(),
-        description="Processing configuration with chunking and embedding settings"
-    ),
     user_id: str = Depends(get_user_id),
-    db: Session = Depends(get_database_session)
+    db: Session = Depends(get_database_session),
+    chunking_strategy: ChunkingStrategy = Query(
+        default=ChunkingStrategy.FIXED_SIZE,
+        description="Chunking strategy: fixed_size, sentence, paragraph, sliding_window, recursive, or semantic"
+    ),
+    target_chunk_tokens: Optional[int] = Query(
+        default=None,
+        ge=100,
+        le=2048,
+        description="Target chunk size in tokens (default: 512)"
+    ),
+    chunk_overlap_tokens: Optional[int] = Query(
+        default=None,
+        ge=0,
+        le=500,
+        description="Overlap between chunks in tokens (default: 50, only for sliding_window)"
+    )
 ):
     """
-    Process document and index to vector store with user-selected configuration
+    Process document and index to vector store with selected chunking strategy
     
-    CHARACTER-BASED CHUNKING ONLY (No token limits except document parent: 10K tokens)
+    Query Parameters:
+    - chunking_strategy: Choose from 6 strategies
+      * fixed_size: Token-based fixed-size chunks (no overlap)
+      * sentence: Groups sentences up to target size
+      * paragraph: Groups paragraphs up to target size
+      * sliding_window: Fixed-size with overlapping windows
+      * recursive: Hierarchical split by separators
+      * semantic: Groups semantically similar sentences
     
-    Body Parameters:
-        chunking_strategy: Strategy to use
-            - "fixed_character": Fixed character-based chunking with delimiter
-            - "parent_child_paragraph": Paragraph-level parents with child chunks
-            - "parent_child_document": Document-level parent (10K token limit) with children
-        
-        max_chunk_chars: Maximum chunk size in characters (500-10000)
-            - Chunks can be SMALLER but NEVER LARGER than this limit
-        
-        overlap_chars: Overlap size in characters (0-2000)
-            - Only applies to fixed_character strategy
-        
-        delimiter: Text delimiter for splitting (e.g., "\\n\\n", "\\n", ".", etc.)
-            - Default: "\\n\\n" (double newline = paragraphs)
-            - Used by all strategies
-        
-        max_child_chunk_chars: Maximum child chunk size (200-5000)
-            - Only applies to parent-child strategies
-            - Children can be SMALLER but NEVER LARGER
-        
-        embedding_model: Embedding model to use
-            - "cohere.embed-english-v3" (default)
-            - "cohere.embed-multilingual-v3"
-            - "amazon.titan-embed-text-v1"
-            - "amazon.titan-embed-text-v2"
+    - target_chunk_tokens: Target chunk size (default: 512)
+    - chunk_overlap_tokens: Overlap for sliding_window (default: 50)
     
-    Examples:
-        # Default configuration
-        POST /process/{file_id}
-        {}
-        
-        # Fixed chunking with custom delimiter
-        POST /process/{file_id}
-        {
-            "chunking_strategy": "fixed_character",
-            "max_chunk_chars": 2500,
-            "overlap_chars": 250,
-            "delimiter": "\\n",
-            "embedding_model": "cohere.embed-english-v3"
-        }
-        
-        # Parent-child paragraph with custom child size
-        POST /process/{file_id}
-        {
-            "chunking_strategy": "parent_child_paragraph",
-            "max_child_chunk_chars": 1200,
-            "delimiter": "\\n\\n",
-            "embedding_model": "cohere.embed-multilingual-v3"
-        }
-        
-        # Document-level parent (auto-limited to 10K tokens)
-        POST /process/{file_id}
-        {
-            "chunking_strategy": "parent_child_document",
-            "max_child_chunk_chars": 800,
-            "delimiter": "\\n\\n"
-        }
+    Example:
+        POST /process/{file_id}?chunking_strategy=semantic&target_chunk_tokens=600
     """
     
-    # Get file metadata
+    start_time = time.time()
+    
+    # Get file metadata from database
     file_metadata = db.query(FileMetadata).filter(
         FileMetadata.file_id == file_id,
         FileMetadata.user_id == user_id
     ).first()
     
     if not file_metadata:
-        raise HTTPException(status_code=404, detail=f"File not found for ID: {file_id}")
+        raise HTTPException(
+            status_code=404,
+            detail=f"File not found for ID: {file_id}"
+        )
     
     # Check if already processed
     if file_metadata.status == DBProcessingStatus.COMPLETED:
-        processing_meta = {}
-        if file_metadata.processing_metadata:
-            try:
-                processing_meta = json.loads(file_metadata.processing_metadata)
-            except:
-                pass
-        
         return DocumentProcessResponse(
             file_id=file_id,
             filename=file_metadata.safe_filename,
@@ -259,33 +222,39 @@ async def process_and_index_document(
                 'tables': file_metadata.table_count,
                 'words': file_metadata.word_count
             },
-            message=f"Document already processed. {file_metadata.chunks_created} chunks indexed.",
-            chunking_strategy=processing_meta.get('chunking_strategy'),
-            chunking_config=processing_meta.get('chunking_config'),
-            embedding_model=processing_meta.get('embedding_model')
+            chunking_strategy=file_metadata.chunking_strategy.value if file_metadata.chunking_strategy else None,
+            message=f"Document already processed using {file_metadata.chunking_strategy.value if file_metadata.chunking_strategy else 'unknown'} strategy. {file_metadata.chunks_created} chunks indexed."
         )
     
     file_path = Path(file_metadata.storage_path)
     
     if not file_path.exists():
-        raise HTTPException(status_code=404, detail=f"File not found on disk: {file_metadata.safe_filename}")
+        raise HTTPException(
+            status_code=404,
+            detail=f"File not found on disk: {file_metadata.safe_filename}"
+        )
     
     # Update status to processing
     file_metadata.status = DBProcessingStatus.PROCESSING
     db.commit()
     
     try:
-        start_time = datetime.utcnow()
-        
         logger.info(
-            f"📄 Processing: {file_metadata.safe_filename}\n"
-            f"  Strategy: {process_request.chunking_strategy.value}\n"
-            f"  Max chunk: {process_request.max_chunk_chars} chars\n"
-            f"  Delimiter: {repr(process_request.delimiter)}\n"
-            f"  Embedding: {process_request.embedding_model.value}"
+            f"📄 Processing: {file_metadata.safe_filename} "
+            f"(type: {file_metadata.file_extension}, strategy: {chunking_strategy.value})"
         )
         
-        # Extract content
+        # Set chunking parameters
+        chunk_tokens = target_chunk_tokens or settings.chunk_size or 512
+        overlap_tokens = chunk_overlap_tokens or settings.chunk_overlap or 50
+        
+        # Initialize chunking service with parameters
+        chunking_service = EnhancedChunkingService(
+            target_chunk_tokens=chunk_tokens,
+            chunk_overlap_tokens=overlap_tokens
+        )
+        
+        # Get extractor
         extractor = ExtractorFactory.get_extractor(
             file_metadata.file_extension,
             config={
@@ -297,20 +266,28 @@ async def process_and_index_document(
             }
         )
         
-        extracted_text, extraction_metadata = extractor.extract_content(str(file_path))
+        # Extract content
+        logger.info(f"Extracting content from {file_metadata.file_extension}...")
+        extracted_text, success, extraction_metadata = extractor.extract(str(file_path))
         
-        if extraction_metadata.get('success') == False:
+        if not success or extraction_metadata.get('status') == 'error':
             error_msg = extraction_metadata.get('error', 'Unknown extraction error')
             file_metadata.status = DBProcessingStatus.FAILED
             file_metadata.error_message = error_msg
             db.commit()
-            raise HTTPException(status_code=422, detail=f"Failed to extract content: {error_msg}")
+            raise HTTPException(
+                status_code=422,
+                detail=f"Failed to extract content: {error_msg}"
+            )
         
         if not extracted_text or not extracted_text.strip():
             file_metadata.status = DBProcessingStatus.FAILED
             file_metadata.error_message = "No content extracted"
             db.commit()
-            raise HTTPException(status_code=422, detail="No content extracted from document.")
+            raise HTTPException(
+                status_code=422,
+                detail="No content extracted from document."
+            )
         
         logger.info(f"✅ Extracted {len(extracted_text)} characters")
         
@@ -325,12 +302,15 @@ async def process_and_index_document(
         user_markdown_dir.mkdir(parents=True, exist_ok=True)
         
         markdown_path = user_markdown_dir / f"{file_id}.md"
-        markdown_saved = markdown_converter.save_markdown_file(markdown_content, str(markdown_path))
+        markdown_saved = markdown_converter.save_markdown_file(
+            markdown_content,
+            str(markdown_path)
+        )
         
         if markdown_saved:
             logger.info(f"✅ Saved markdown: {markdown_path.name}")
         
-        # Prepare metadata
+        # Prepare metadata for chunking
         chunk_metadata = {
             "file_id": file_id,
             "filename": file_metadata.safe_filename,
@@ -345,6 +325,7 @@ async def process_and_index_document(
         chart_count = extracted_text.count('**[CHART]**') + extracted_text.count('**[FIGURE]**')
         word_count = len(extracted_text.split())
         
+        # Create structure for statistics
         simple_structure = {
             'statistics': {
                 'images': image_count,
@@ -353,61 +334,43 @@ async def process_and_index_document(
             }
         }
         
-        # ========== CREATE CHUNKING SERVICE WITH USER CONFIG ==========
-        
-        chunking_service = CharacterBasedChunkingService(
-            max_chunk_chars=process_request.max_chunk_chars,
-            overlap_chars=process_request.overlap_chars,
-            delimiter=process_request.delimiter,
-            max_child_chunk_chars=process_request.max_child_chunk_chars,
-            max_document_parent_tokens=10000,  # Fixed: 10K token limit for document parent
-            tokenizer_model="cl100k_base"
-        )
-        
-        logger.info(
-            f"Chunking with:\n"
-            f"  Strategy: {process_request.chunking_strategy.value}\n"
-            f"  Max chunk: {process_request.max_chunk_chars} chars\n"
-            f"  Max child: {process_request.max_child_chunk_chars} chars\n"
-            f"  Overlap: {process_request.overlap_chars} chars\n"
-            f"  Delimiter: {repr(process_request.delimiter)}"
-        )
-        
-        # Chunk document
+        # Chunk document with selected strategy
+        logger.info(f"Creating chunks using {chunking_strategy.value} strategy...")
         chunks = chunking_service.split_document_into_chunks(
-            markdown_content,
+            extracted_text,
             simple_structure,
             base_metadata=chunk_metadata,
-            strategy=process_request.chunking_strategy,
-            embedding_model=process_request.embedding_model.value
+            strategy=chunking_strategy
         )
         
         if not chunks:
             file_metadata.status = DBProcessingStatus.FAILED
             file_metadata.error_message = "No chunks created"
             db.commit()
-            raise HTTPException(status_code=422, detail="No chunks created.")
+            raise HTTPException(
+                status_code=422, 
+                detail="No chunks created."
+            )
         
-        logger.info(f"✅ Created {len(chunks)} chunks")
-        
-        # Get statistics
+        # Get chunking statistics
         chunk_stats = chunking_service.get_chunk_stats(chunks)
+        logger.info(
+            f"✅ Created {len(chunks)} chunks | "
+            f"Avg: {chunk_stats['avg_tokens']:.0f} tokens | "
+            f"Min: {chunk_stats['min_tokens']} | "
+            f"Max: {chunk_stats['max_tokens']}"
+        )
         
-        # Count parent/child
-        parent_chunks = [c for c in chunks if c['metadata'].get('is_parent', False)]
-        child_chunks = [c for c in chunks if not c['metadata'].get('is_parent', False)]
-        
-        chunk_breakdown = None
-        if parent_chunks:
-            chunk_breakdown = {
-                'parent_chunks': len(parent_chunks),
-                'child_chunks': len(child_chunks),
-                'total_chunks': len(chunks)
-            }
-            logger.info(f"  Breakdown: {len(parent_chunks)} parents, {len(child_chunks)} children")
+        # Verify page numbers
+        page_numbers = [c['metadata'].get('page_number', 0) for c in chunks]
+        logger.info(
+            f"Page numbers: min={min(page_numbers)}, "
+            f"max={max(page_numbers)}, "
+            f"unique={len(set(page_numbers))}"
+        )
         
         # Index to vector store
-        logger.info(f"Indexing to vector store with embedding model: {process_request.embedding_model.value}")
+        logger.info("Indexing to vector store...")
         chunks_added = vector_store.add_document_chunks(
             chunks,
             file_id,
@@ -426,17 +389,21 @@ async def process_and_index_document(
                 chunk_type=chunk['metadata'].get('chunk_type', 'text'),
                 char_count=chunk['char_count'],
                 page_number=chunk['metadata'].get('page_number', 0),
-                is_parent=chunk['metadata'].get('is_parent'),
-                parent_chunk_id=chunk['metadata'].get('parent_chunk_id'),
-                child_index=chunk['metadata'].get('child_index'),
                 created_at=datetime.utcnow()
             )
             db.add(chunk_db)
         
-        # Calculate processing time
-        processing_time = (datetime.utcnow() - start_time).total_seconds()
+        # Map ChunkingStrategy to ChunkingStrategyEnum
+        strategy_map = {
+            ChunkingStrategy.FIXED_SIZE: ChunkingStrategyEnum.FIXED_SIZE,
+            ChunkingStrategy.SENTENCE: ChunkingStrategyEnum.SENTENCE,
+            ChunkingStrategy.PARAGRAPH: ChunkingStrategyEnum.PARAGRAPH,
+            ChunkingStrategy.SLIDING_WINDOW: ChunkingStrategyEnum.SLIDING_WINDOW,
+            ChunkingStrategy.RECURSIVE: ChunkingStrategyEnum.RECURSIVE,
+            ChunkingStrategy.SEMANTIC: ChunkingStrategyEnum.SEMANTIC
+        }
         
-        # Update file metadata
+        # Update file metadata with results
         file_metadata.status = DBProcessingStatus.COMPLETED
         file_metadata.processed_at = datetime.utcnow()
         file_metadata.chunks_created = chunks_added
@@ -445,51 +412,43 @@ async def process_and_index_document(
         file_metadata.word_count = word_count
         file_metadata.image_count = image_count
         file_metadata.table_count = table_count
+        file_metadata.chunking_strategy = strategy_map.get(chunking_strategy)
+        file_metadata.target_chunk_tokens = chunk_tokens
+        file_metadata.chunk_overlap_tokens = overlap_tokens
         
         # Store processing metadata
         processing_meta = {
             'extraction_method': extractor.__class__.__name__,
             'chunks_created': chunks_added,
-            'extraction_metadata': extraction_metadata,
-            'chunking_strategy': process_request.chunking_strategy.value,
-            'chunking_config': {
-                'max_chunk_chars': process_request.max_chunk_chars,
-                'overlap_chars': process_request.overlap_chars,
-                'delimiter': process_request.delimiter,
-                'max_child_chunk_chars': process_request.max_child_chunk_chars
-            },
-            'embedding_model': process_request.embedding_model.value,
-            'chunk_breakdown': chunk_breakdown,
-            'chunk_stats': {
-                'avg_chars': chunk_stats.get('avg_chars', 0),
-                'min_chars': chunk_stats.get('min_chars', 0),
-                'max_chars': chunk_stats.get('max_chars', 0),
-                'total_chars': chunk_stats.get('total_chars', 0)
-            }
+            'chunking_strategy': chunking_strategy.value,
+            'target_chunk_tokens': chunk_tokens,
+            'chunk_overlap_tokens': overlap_tokens,
+            'chunk_stats': chunk_stats,
+            'extraction_metadata': extraction_metadata
         }
         file_metadata.processing_metadata = json.dumps(processing_meta)
         
         db.commit()
         
-        logger.info(f"✅ Processing complete for file_id: {file_id}")
+        processing_time = time.time() - start_time
+        
+        logger.info(
+            f"✅ Processing complete for file_id: {file_id} "
+            f"({processing_time:.2f}s)"
+        )
         
         # Build response message
         message_parts = [
             f"✅ Document '{file_metadata.safe_filename}' processed successfully:",
             f"  • Format: {file_metadata.file_extension.upper()}",
-            f"  • Chunking: {process_request.chunking_strategy.value}",
-            f"  • Max chunk: {process_request.max_chunk_chars} chars",
-            f"  • Delimiter: {repr(process_request.delimiter)}",
-            f"  • Embedding: {process_request.embedding_model.value}",
-            f"  • Chunks: {chunks_added}",
+            f"  • Chunking strategy: {chunking_strategy.value}",
+            f"  • Chunks indexed: {chunks_added}",
+            f"  • Avg chunk size: {chunk_stats['avg_tokens']:.0f} tokens",
         ]
-        
-        if chunk_breakdown:
-            message_parts.append(f"  • Parents: {chunk_breakdown['parent_chunks']}")
-            message_parts.append(f"  • Children: {chunk_breakdown['child_chunks']}")
         
         if table_count > 0:
             message_parts.append(f"  • Tables: {table_count}")
+        
         if image_count > 0:
             message_parts.append(f"  • Images: {image_count}")
         
@@ -507,11 +466,7 @@ async def process_and_index_document(
                 'charts': chart_count,
                 'words': word_count
             },
-            chunking_strategy=process_request.chunking_strategy.value,
-            chunking_config=processing_meta['chunking_config'],
-            embedding_model=process_request.embedding_model.value,
-            chunk_breakdown=chunk_breakdown,
-            chunk_stats=chunk_stats,
+            chunking_strategy=chunking_strategy.value,
             message="\n".join(message_parts)
         )
     
@@ -526,7 +481,10 @@ async def process_and_index_document(
         import traceback
         traceback.print_exc()
         
-        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Processing error: {str(e)}"
+        )
 
 
 @router.get("/status/{file_id}")
@@ -542,14 +500,10 @@ async def get_processing_status(
     ).first()
     
     if not file_metadata:
-        raise HTTPException(status_code=404, detail=f"File not found for ID: {file_id}")
-    
-    processing_meta = {}
-    if file_metadata.processing_metadata:
-        try:
-            processing_meta = json.loads(file_metadata.processing_metadata)
-        except:
-            pass
+        raise HTTPException(
+            status_code=404,
+            detail=f"File not found for ID: {file_id}"
+        )
     
     return {
         "file_id": file_id,
@@ -559,82 +513,68 @@ async def get_processing_status(
         "processed_at": file_metadata.processed_at,
         "chunks_created": file_metadata.chunks_created,
         "total_pages": file_metadata.total_pages,
-        "error_message": file_metadata.error_message,
-        "chunking_strategy": processing_meta.get('chunking_strategy'),
-        "chunking_config": processing_meta.get('chunking_config'),
-        "embedding_model": processing_meta.get('embedding_model'),
-        "chunk_breakdown": processing_meta.get('chunk_breakdown')
+        "chunking_strategy": file_metadata.chunking_strategy.value if file_metadata.chunking_strategy else None,
+        "target_chunk_tokens": file_metadata.target_chunk_tokens,
+        "chunk_overlap_tokens": file_metadata.chunk_overlap_tokens,
+        "error_message": file_metadata.error_message
     }
 
 
-@router.get("/chunking-options")
-async def get_chunking_options():
+@router.get("/chunking-strategies")
+async def get_available_chunking_strategies():
     """
-    Get available chunking strategies, delimiters, and embedding models
+    Get list of available chunking strategies with descriptions
+    
+    Returns information about all 6 chunking strategies
     """
     return {
         "strategies": [
             {
-                "name": ChunkingStrategy.FIXED_CHARACTER.value,
-                "display_name": "Fixed Character Chunking",
-                "description": "Split by delimiter, combine until max chars, apply overlap",
-                "parameters": ["max_chunk_chars", "overlap_chars", "delimiter"],
-                "note": "Chunks can be smaller than max, never larger",
-                "default": True
+                "name": "fixed_size",
+                "display_name": "Fixed-size (Token-based)",
+                "description": "Creates chunks of exact token size with no overlap. Simple and efficient.",
+                "best_for": "General purpose, consistent chunk sizes",
+                "parameters": ["target_chunk_tokens"]
             },
             {
-                "name": ChunkingStrategy.PARENT_CHILD_PARAGRAPH.value,
-                "display_name": "Paragraph-Level Parent-Child",
-                "description": "Each paragraph is parent, children split by delimiter up to max chars",
-                "parameters": ["max_child_chunk_chars", "delimiter"],
-                "note": "No size limit on parents, children limited to max chars"
+                "name": "sentence",
+                "display_name": "Sentence Chunking",
+                "description": "Groups sentences together until target size is reached. Preserves sentence boundaries.",
+                "best_for": "Documents where sentence context is important",
+                "parameters": ["target_chunk_tokens"]
             },
             {
-                "name": ChunkingStrategy.PARENT_CHILD_DOCUMENT.value,
-                "display_name": "Document-Level Parent-Child",
-                "description": "Full document is parent (10K token limit), children split by delimiter",
-                "parameters": ["max_child_chunk_chars", "delimiter"],
-                "note": "Parent auto-truncated to 10,000 tokens if needed"
+                "name": "paragraph",
+                "display_name": "Paragraph Chunking",
+                "description": "Groups paragraphs together. Preserves paragraph structure and context.",
+                "best_for": "Documents with clear paragraph structure, essays, articles",
+                "parameters": ["target_chunk_tokens"]
+            },
+            {
+                "name": "sliding_window",
+                "display_name": "Sliding Window",
+                "description": "Creates overlapping chunks with specified overlap. Ensures continuity across chunks.",
+                "best_for": "When context across chunks is critical, Q&A systems",
+                "parameters": ["target_chunk_tokens", "chunk_overlap_tokens"]
+            },
+            {
+                "name": "recursive",
+                "display_name": "Recursive Chunking",
+                "description": "Hierarchically splits text by separators (sections, paragraphs, sentences, words). Preserves document structure.",
+                "best_for": "Structured documents, technical documentation",
+                "parameters": ["target_chunk_tokens"]
+            },
+            {
+                "name": "semantic",
+                "display_name": "Semantic Chunking",
+                "description": "Groups semantically similar sentences together using keyword overlap. Creates contextually coherent chunks.",
+                "best_for": "Documents where topic coherence is important, research papers",
+                "parameters": ["target_chunk_tokens"]
             }
         ],
-        "common_delimiters": [
-            {"value": "\\n\\n", "name": "Double newline (paragraphs)", "default": True},
-            {"value": "\\n", "name": "Single newline (lines)"},
-            {"value": ". ", "name": "Period + space (sentences)"},
-            {"value": "\\n---\\n", "name": "Horizontal rule (sections)"},
-            {"value": "\\n# ", "name": "Markdown header"}
-        ],
-        "embedding_models": [
-            {
-                "value": EmbeddingModel.COHERE_ENGLISH_V3.value,
-                "name": "Cohere English v3",
-                "dimensions": 1024,
-                "max_input": 512,
-                "default": True
-            },
-            {
-                "value": EmbeddingModel.COHERE_MULTILINGUAL_V3.value,
-                "name": "Cohere Multilingual v3",
-                "dimensions": 1024,
-                "max_input": 512
-            },
-            {
-                "value": EmbeddingModel.AMAZON_TITAN_V1.value,
-                "name": "Amazon Titan v1",
-                "dimensions": 1536,
-                "max_input": 8192
-            },
-            {
-                "value": EmbeddingModel.AMAZON_TITAN_V2.value,
-                "name": "Amazon Titan v2",
-                "dimensions": 1024,
-                "max_input": 8192
-            }
-        ],
-        "limits": {
-            "max_chunk_chars": {"min": 500, "max": 10000, "default": 2000},
-            "overlap_chars": {"min": 0, "max": 2000, "default": 200},
-            "max_child_chunk_chars": {"min": 200, "max": 5000, "default": 1000},
-            "document_parent_tokens": 10000  # Fixed limit for document-level parent
+        "default_strategy": "fixed_size",
+        "default_parameters": {
+            "target_chunk_tokens": 512,
+            "chunk_overlap_tokens": 50
         }
     }
