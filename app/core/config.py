@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     """Application settings with concurrency optimizations"""
     
     model_config = ConfigDict(
-        env_file=".env",
+        env_file=".env.example",
         case_sensitive=False,
         extra="ignore",
         validate_assignment=True
