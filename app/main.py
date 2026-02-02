@@ -300,10 +300,10 @@ if __name__ == "__main__":
     
     # Run with uvicorn
     uvicorn.run(
-        "main:app",
+        app,
         host="0.0.0.0",
         port=8000,
-        reload=False,  # Disable in production
-        workers=1,  # Single worker (task manager handles concurrency)
-        log_level=settings.log_level.lower()
+        # reload=False,  # Disable in production
+        # workers=1,  # Single worker (task manager handles concurrency)
+        # log_level=settings.log_level.lower()
     )

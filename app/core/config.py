@@ -26,38 +26,135 @@ class Settings(BaseSettings):
         validate_assignment=True
     )
     
-    # ==================== AWS Bedrock Configuration ====================
-    aws_region: str = Field(default="us-east-1")
-    aws_access_key_id: str = Field(default="")
-    aws_secret_access_key: str = Field(default="")
-    aws_profile_name: str = Field(default="")
+    # # ==================== AWS Bedrock Configuration ====================
+    # aws_region: str = Field(default="us-east-1")
+    # aws_access_key_id: str = Field(default="")
+    # aws_secret_access_key: str = Field(default="")
+    # aws_profile_name: str = Field(default="")
+    
+
+    # ==================== HuggingFace Configuration ====================
+    huggingface_api_token: str = Field(
+        default="",
+        description="HuggingFace API token (required)"
+    )
+    
+    # Use HuggingFace Router API (more reliable)
+    huggingface_api_url: str = Field(
+        default="https://router.huggingface.co/v1/chat/completions",
+        description="HuggingFace Router API URL"
+    )
     
     # ==================== Model Configuration ====================
-    bedrock_model_id: str = Field(
-        default="anthropic.claude-3-5-sonnet-20241022"
+    # bedrock_model_id: str = Field(
+    #     default="anthropic.claude-3-5-sonnet-20241022"
+    # )
+
+    llm_model_id: str = Field(
+        default="meta-llama/Meta-Llama-3-8B-Instruct",
+        description="Chat model ID from HuggingFace"
     )
+    
+    available_llm_models: list = Field(
+        default=[
+            "meta-llama/Meta-Llama-3-8B-Instruct",
+            "mistralai/Mistral-7B-Instruct-v0.2",
+            "HuggingFaceH4/zephyr-7b-beta"  # Works better than Gemma with API
+        ],
+        description="Available LLM models"
+    )
+    # # ==================== Embedding Model Configuration ====================
+    # embedding_model_id: str = Field(
+    #     default="cohere.embed-english-v3"
+    # )
+    
+    # embedding_max_length: int = Field(default=2048, ge=512, le=8192)
+    
+    # bedrock_vision_model_id: str = Field(
+    #     default="us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+    # )
+    
+    # temperature: float = Field(default=0.6, ge=0.0, le=1.0)
+    # max_tokens: int = Field(default=4000, ge=100, le=100000)
+    # vision_max_tokens: int = Field(default=2000, ge=100, le=10000)
+    # vision_temperature: float = Field(default=0.6, ge=0.0, le=1.0)
     
     # ==================== Embedding Model Configuration ====================
     embedding_model_id: str = Field(
-        default="cohere.embed-english-v3"
+        default="BAAI/bge-large-en-v1.5",
+        description="Embedding model ID from HuggingFace"
     )
     
-    embedding_max_length: int = Field(default=2048, ge=512, le=8192)
-    
-    bedrock_vision_model_id: str = Field(
-        default="us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+    available_embedding_models: list = Field(
+        default=[
+            "BAAI/bge-large-en-v1.5",
+            "sentence-transformers/all-MiniLM-L6-v2",
+            "sentence-transformers/paraphrase-mpnet-base-v2"
+        ],
+        description="Available embedding models"
     )
     
-    temperature: float = Field(default=0.6, ge=0.0, le=1.0)
-    max_tokens: int = Field(default=4000, ge=100, le=100000)
-    vision_max_tokens: int = Field(default=2000, ge=100, le=10000)
-    vision_temperature: float = Field(default=0.6, ge=0.0, le=1.0)
+    # Embedding model limits
+    embedding_max_length: int = Field(
+        default=512,
+        ge=128,
+        le=8192,
+        description="Max tokens for embedding model"
+    )
+    
+    
+    # ==================== Vision Model Configuration ====================
+    vision_model_id: str = Field(
+        default="Qwen/Qwen2.5-VL-7B-Instruct",
+        description="Vision model for image understanding"
+    )
+    
+    available_vision_models: list = Field(
+        default=[
+            "Qwen/Qwen2.5-VL-7B-Instruct",
+            "meta-llama/Llama-3.2-11B-Vision-Instruct",
+            "microsoft/Phi-3.5-vision-instruct"
+        ],
+        description="Available vision models"
+    )
+    
+    # ==================== Model Parameters ====================
+    temperature: float = Field(
+        default=0.6,
+        ge=0.0,
+        le=1.0,
+        description="LLM temperature"
+    )
+    
+    max_tokens: int = Field(
+        default=2048,
+        ge=100,
+        le=4096,
+        description="Max tokens for LLM response"
+    )
+    
+    vision_max_tokens: int = Field(
+        default=1024,
+        ge=100,
+        le=2048,
+        description="Max tokens for vision model"
+    )
+    
+    vision_temperature: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=1.0,
+        description="Temperature for vision model"
+    )
     
     # ==================== Storage Configuration ====================
     upload_dir: Path = Field(default=Path("./uploads"))
     markdown_dir: Path = Field(default=Path("./markdown_output"))
     database_url: str = Field(default="sqlite:///./rag_system.db")
-    
+    model_cache_dir: Path = Field(
+        default=Path("./model_cache"),
+        description="Directory to cache downloaded models"
+    )
     max_file_size_mb: int = Field(default=50, ge=1, le=500)
     max_filename_length: int = Field(default=255, ge=1, le=500)
     
@@ -246,15 +343,12 @@ class Settings(BaseSettings):
     
     def validate_configuration(self) -> tuple[bool, list[str]]:
         """Validate configuration and return warnings"""
-        """Validate configuration and return warnings"""
         warnings = []
         is_valid = True
         
-        # Check AWS credentials
-        if not self.aws_access_key_id or not self.aws_secret_access_key:
-            if not self.aws_profile_name:
-                warnings.append("AWS credentials not configured")
-                is_valid = False
+        if not self.huggingface_api_token:
+            warnings.append("HUGGINGFACE_API_TOKEN not set")
+            is_valid = False
         
         if not self.llm_model_id:
             warnings.append("LLM_MODEL_ID not set")
@@ -266,24 +360,10 @@ class Settings(BaseSettings):
         
         if not self.qdrant_url:
             warnings.append("QDRANT_URL not set")
-            warnings.append("QDRANT_URL not set")
         
         if not self.qdrant_api_key and self.qdrant_url:
             warnings.append("QDRANT_API_KEY not set but URL provided")
             is_valid = False
-        
-        # Check worker pool settings
-        if self.max_cpu_workers > os.cpu_count():
-            warnings.append(
-                f"max_cpu_workers ({self.max_cpu_workers}) exceeds CPU count ({os.cpu_count()})"
-            )
-        
-        # Check database pool settings
-        total_connections = self.db_pool_size + self.db_max_overflow
-        if total_connections > 100:
-            warnings.append(
-                f"Total database connections ({total_connections}) may be excessive"
-            )
         
         return is_valid, warnings
 
@@ -309,7 +389,7 @@ def print_configuration_summary():
     print(f"\n🤖 Models:")
     print(f"  - Chat/LLM: {settings.llm_model_id}")
     print(f"  - Embedding: {settings.embedding_model_id}")
-    print(f"  - Vision: {settings.bedrock_vision_model_id}")
+    print(f"  - Vision: {settings.vision_model_id}")
     
     print(f"\n⚡ Concurrency Settings:")
     print(f"  - I/O Workers: {settings.max_io_workers} threads")
