@@ -1,10 +1,6 @@
 """
-Query Route with MANDATORY USER AUTH and DATABASE-BACKED CONVERSATION HISTORY
-- All queries require X-User-ID header
-- Full user isolation in vector search
-- Conversation history stored in database (FIFO)
-- Query logging to database
-- UPDATED: Uses search_type (dense/sparse/hybrid) instead of weights
+Query Route - CONCURRENT VERSION with Optimized I/O Operations
+Uses ThreadPoolExecutor for parallel embedding and vector search
 """
 
 from fastapi import APIRouter, HTTPException, Depends
@@ -20,18 +16,20 @@ from app.db.models import QueryLog
 import time
 import logging
 from datetime import datetime
+from typing import Tuple, List, Dict
+from app.core.task_manager import get_task_manager, TaskType
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/query", tags=["Query"])
 
-# Initialize services
+# Initialize services (these are thread-safe)
 vector_store = VectorStoreService()
 llm_service = LLMService()
 
 
 def safe_get_int(metadata: dict, key: str, default: int = 0) -> int:
-    """Safely get integer from metadata (handles both str and int)"""
+    """Safely get integer from metadata"""
     try:
         value = metadata.get(key, default)
         return int(value) if value is not None else default
@@ -56,6 +54,53 @@ def safe_get_score(score: float) -> float:
         return 0.0
 
 
+def _execute_vector_search(
+    query: str,
+    top_k: int,
+    user_id: str,
+    file_id: str,
+    search_type: str
+) -> Tuple[List[str], List[Dict], List[float]]:
+    """
+    Execute vector search (runs in I/O thread pool)
+    
+    This function is designed to be called from ThreadPoolExecutor
+    """
+    return vector_store.search(
+        query=query,
+        top_k=top_k,
+        user_id=user_id,
+        file_id=file_id,
+        search_type=search_type
+    )
+
+
+def _generate_llm_answer(
+    question: str,
+    context: str,
+    user_id: str,
+    conversation_id: str,
+    temperature: float
+) -> str:
+    """
+    Generate LLM answer (runs in I/O thread pool)
+    
+    This function is designed to be called from ThreadPoolExecutor
+    """
+    from app.core.database import get_db_context
+    
+    with get_db_context() as db:
+        return llm_service.generate_answer(
+            question=question,
+            context=context,
+            user_id=user_id,
+            db=db,
+            conversation_id=conversation_id,
+            include_citations=True,
+            temperature=temperature
+        )
+
+
 @router.post("/", response_model=QueryResponse)
 async def query_knowledge_base(
     request: QueryRequest,
@@ -63,35 +108,51 @@ async def query_knowledge_base(
     db: Session = Depends(get_database_session)
 ):
     """
-    ENHANCED Query endpoint with full chunk metadata for editing
+    Query endpoint with concurrent I/O operations
+    
+    This endpoint uses ThreadPoolExecutor to parallelize:
+    - Vector search (embedding + retrieval)
+    - LLM generation (if needed)
     
     Headers:
         X-User-ID: User identifier (REQUIRED)
-    
-    Returns:
-        QueryResponse where each source includes:
-        - chunk_id: Unique chunk identifier (for editing)
-        - file_id: Parent file identifier (for editing)
-        - full_text: Complete chunk text (not truncated)
-        - content: Display text (may be truncated)
-        - All other metadata fields
     """
     start_time = time.time()
     
     try:
-        # Get search type (default to hybrid)
+        # Get search type
         search_type = request.search_type or SearchType.HYBRID
         
-        logger.info(f"Query with search_type={search_type.value}, top_k={request.top_k}")
+        logger.info(f"Query from user {user_id}: search_type={search_type.value}, top_k={request.top_k}")
         
-        # Search with USER ISOLATION - returns full metadata
-        documents, metadatas, scores = vector_store.search(
+        # Get task manager for I/O operations
+        task_manager = get_task_manager()
+        
+        # Submit vector search to I/O thread pool (non-blocking)
+        search_task_id = task_manager.submit_task(
+            func=_execute_vector_search,
+            task_type=TaskType.IO_BOUND,  # Vector search is I/O-bound
+            description=f"Vector search for query",
+            user_id=user_id,
+            file_id=request.file_id,
             query=request.question,
             top_k=request.top_k,
-            user_id=user_id,
-            file_id=getattr(request, 'file_id', None),
+            # user_id=user_id,
+            # file_id=getattr(request, 'file_id', None),
             search_type=search_type.value
         )
+        
+        # Wait for search to complete (with timeout)
+        try:
+            documents, metadatas, scores = task_manager.get_task_result(
+                search_task_id,
+                timeout=30.0  # 30 second timeout
+            )
+        except TimeoutError:
+            raise HTTPException(
+                status_code=504,
+                detail="Vector search timeout. Please try again."
+            )
         
         if not documents:
             raise HTTPException(
@@ -106,51 +167,54 @@ async def query_knowledge_base(
         for i, (doc, metadata, score) in enumerate(zip(documents, metadatas, scores)):
             source_header = f"[Source {i+1}]"
             
-            # Add page number - safe conversion
             page = safe_get_int(metadata, 'page_number', 0)
             if page > 0:
                 source_header += f" [Page {page}]"
             
-            # Add content type - safe conversion
             chunk_type = safe_get_str(metadata, 'chunk_type', 'text')
             if chunk_type != 'text':
                 source_header += f" [{chunk_type.upper()}]"
             
             context_parts.append(f"{source_header}:\n{doc}\n")
             
-            # ENHANCED: Include full chunk metadata for editing
             sources.append(SourceDocument(
-                # Display content (truncated for UI)
                 content=doc[:500] + "..." if len(doc) > 500 else doc,
-                
-                # FULL text for editing (not truncated)
                 full_text=doc,
-                
-                # CRITICAL: chunk_id and file_id for editing
                 chunk_id=safe_get_str(metadata, 'chunk_id', f'chunk_{i}'),
                 file_id=safe_get_str(metadata, 'file_id', 'unknown'),
-                
-                # Other metadata
                 filename=safe_get_str(metadata, 'filename', 'unknown'),
                 relevance_score=safe_get_score(score),
                 page_number=page,
                 chunk_type=chunk_type,
                 chunk_index=safe_get_int(metadata, 'chunk_index', i),
-                
             ))
         
         context = "\n\n".join(context_parts)
         
-        # Generate answer
-        answer = llm_service.generate_answer(
+        # Generate answer (also in I/O thread pool for API calls)
+        answer_task_id = task_manager.submit_task(
+            func=_generate_llm_answer,
+            task_type=TaskType.IO_BOUND,  # LLM API calls are I/O-bound
+            description=f"Generate LLM answer",
+            user_id=user_id,
             question=request.question,
             context=context,
-            user_id=user_id,
-            db=db,
+            # user_id=user_id,
             conversation_id=None,
-            include_citations=True,
-            temperature=request.temperature
+            temperature=request.temperature or 0.7
         )
+        
+        # Wait for answer (with timeout)
+        try:
+            answer = task_manager.get_task_result(
+                answer_task_id,
+                timeout=60.0  # 60 second timeout for LLM
+            )
+        except TimeoutError:
+            raise HTTPException(
+                status_code=504,
+                detail="LLM generation timeout. Please try again."
+            )
         
         # Detect hallucinations
         is_hallucination, confidence = llm_service.detect_hallucination(answer, context)
@@ -161,7 +225,7 @@ async def query_knowledge_base(
         
         processing_time = time.time() - start_time
         
-        # LOG QUERY TO DATABASE
+        # Log query to database (asynchronously)
         try:
             query_log = QueryLog(
                 user_id=user_id,
@@ -182,7 +246,7 @@ async def query_knowledge_base(
         return QueryResponse(
             question=request.question,
             answer=answer,
-            sources=sources,  # Now includes chunk_id, file_id, and full_text
+            sources=sources,
             processing_time=round(processing_time, 2),
             search_type=search_type,
             confidence_score=round(confidence, 3)
@@ -207,45 +271,58 @@ async def query_with_conversation(
     db: Session = Depends(get_database_session)
 ):
     """
-    ENHANCED Conversational query with full chunk metadata
+    Conversational query with concurrent I/O operations
     
-    Headers:
-        X-User-ID: User identifier (REQUIRED)
-    
-    Returns:
-        QueryResponse with sources containing chunk_id, file_id, and full_text
+    Similar to standard query but maintains conversation history
     """
     start_time = time.time()
     
     try:
-        # Get search type (default to hybrid)
         search_type = request.search_type or SearchType.HYBRID
         
-        logger.info(f"Conversation query with search_type={search_type.value}")
+        logger.info(f"Conversation query: search_type={search_type.value}")
         
-        # Retrieve chunks with full metadata
-        documents, metadatas, scores = vector_store.search(
+        task_manager = get_task_manager()
+        
+        # Vector search in background
+        search_task_id = task_manager.submit_task(
+            func=_execute_vector_search,
+            task_type=TaskType.IO_BOUND,
+            description=f"Vector search for conversation",
+            user_id=user_id,
+            file_id=request.file_id,
             query=request.question,
             top_k=request.top_k,
-            user_id=user_id,
-            file_id=getattr(request, 'file_id', None),
+            # user_id=user_id,
+            # file_id=getattr(request, 'file_id', None),
             search_type=search_type.value
         )
+        
+        # Wait for search
+        try:
+            documents, metadatas, scores = task_manager.get_task_result(
+                search_task_id,
+                timeout=30.0
+            )
+        except TimeoutError:
+            raise HTTPException(
+                status_code=504,
+                detail="Vector search timeout"
+            )
         
         if not documents:
             raise HTTPException(
                 status_code=404,
-                detail="No documents found. Please upload and process documents first."
+                detail="No documents found"
             )
         
-        # Build context with safe metadata access
+        # Build context
         context_parts = []
         sources = []
         
         for i, (doc, metadata, score) in enumerate(zip(documents, metadatas, scores)):
             source_header = f"[Source {i+1}]"
             
-            # Safe metadata access
             page = safe_get_int(metadata, 'page_number', 0)
             if page > 0:
                 source_header += f" [Page {page}]"
@@ -256,10 +333,9 @@ async def query_with_conversation(
             
             context_parts.append(f"{source_header}:\n{doc}\n")
             
-            # ENHANCED: Full metadata for editing
             sources.append(SourceDocument(
                 content=doc[:500] + "..." if len(doc) > 500 else doc,
-                full_text=doc,  # Complete text
+                full_text=doc,
                 chunk_id=safe_get_str(metadata, 'chunk_id', f'chunk_{i}'),
                 file_id=safe_get_str(metadata, 'file_id', 'unknown'),
                 filename=safe_get_str(metadata, 'filename', 'unknown'),
@@ -272,15 +348,28 @@ async def query_with_conversation(
         context = "\n\n".join(context_parts)
         
         # Generate answer with conversation history
-        answer = llm_service.generate_answer(
+        answer_task_id = task_manager.submit_task(
+            func=_generate_llm_answer,
+            task_type=TaskType.IO_BOUND,
+            description=f"Generate conversation answer",
+            user_id=user_id,
             question=request.question,
             context=context,
-            user_id=user_id,
-            db=db,
+            # user_id=user_id,
             conversation_id=request.conversation_id,
-            include_citations=True,
-            temperature=request.temperature
+            temperature=request.temperature or 0.7
         )
+        
+        try:
+            answer = task_manager.get_task_result(
+                answer_task_id,
+                timeout=60.0
+            )
+        except TimeoutError:
+            raise HTTPException(
+                status_code=504,
+                detail="LLM generation timeout"
+            )
         
         # Detect hallucinations
         is_hallucination, confidence = llm_service.detect_hallucination(answer, context)
@@ -290,7 +379,7 @@ async def query_with_conversation(
         
         processing_time = time.time() - start_time
         
-        # LOG QUERY TO DATABASE
+        # Log query
         try:
             query_log = QueryLog(
                 user_id=user_id,
@@ -311,7 +400,7 @@ async def query_with_conversation(
         return QueryResponse(
             question=request.question,
             answer=answer,
-            sources=sources,  # Includes chunk_id, file_id, full_text
+            sources=sources,
             processing_time=round(processing_time, 2),
             search_type=search_type,
             confidence_score=round(confidence, 3),
@@ -336,20 +425,8 @@ async def clear_conversation(
     user_id: str = Depends(get_user_id),
     db: Session = Depends(get_database_session)
 ):
-    """
-    Clear conversation history from DATABASE
-    
-    Headers:
-        X-User-ID: User identifier (REQUIRED)
-    
-    Args:
-        conversation_id: Conversation identifier to clear
-        
-    Returns:
-        Success message
-    """
+    """Clear conversation history"""
     try:
-        # Clear from database with user isolation
         llm_service.clear_conversation(conversation_id, user_id, db)
         
         return {
@@ -370,34 +447,19 @@ async def get_conversation_history(
     user_id: str = Depends(get_user_id),
     db: Session = Depends(get_database_session)
 ):
-    """
-    Get conversation history from DATABASE
-    
-    Headers:
-        X-User-ID: User identifier (REQUIRED)
-    
-    Args:
-        conversation_id: Conversation identifier
-        
-    Returns:
-        Conversation history (last 4 Q&A pairs)
-    """
+    """Get conversation history"""
     try:
         from app.db.models import ConversationHistory
         from sqlalchemy import desc
         
-        # Get last 8 messages (4 Q&A pairs) with user isolation
         messages = db.query(ConversationHistory).filter(
             ConversationHistory.conversation_id == conversation_id,
-            ConversationHistory.user_id == user_id  # USER ISOLATION
+            ConversationHistory.user_id == user_id
         ).order_by(
             desc(ConversationHistory.created_at)
         ).limit(8).all()
-        
-        # Reverse to chronological order
         messages.reverse()
         
-        # Format history
         history = []
         for msg in messages:
             history.append({
@@ -427,25 +489,12 @@ async def get_my_queries(
     db: Session = Depends(get_database_session),
     limit: int = 20
 ):
-    """
-    Get recent queries for current user
-    
-    Headers:
-        X-User-ID: User identifier (REQUIRED)
-    
-    Query Parameters:
-        limit: Number of queries to return (default: 20, max: 100)
-        
-    Returns:
-        List of recent queries
-    """
+    """Get recent queries for current user"""
     try:
         from sqlalchemy import desc
         
-        # Limit to reasonable range
         limit = min(max(1, limit), 100)
         
-        # Get recent queries with user isolation
         queries = db.query(QueryLog).filter(
             QueryLog.user_id == user_id
         ).order_by(
