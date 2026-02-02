@@ -1,59 +1,61 @@
 """
-LLM Service - Using LangChain with HuggingFace
-Works with HuggingFace Router API for reliable model access
+LLM Service - Text-Only Version (No Vision)
+All image understanding happens at ingestion time via ImageDescriptionService
+This service handles only text-based RAG queries
 """
 
-from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_aws import ChatBedrock
+from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from app.core.config import settings
+from app.db.models import ConversationHistory
+from sqlalchemy.orm import Session
+from sqlalchemy import desc
 import logging
 from typing import Optional, Tuple
 import re
 from datetime import datetime
-from sqlalchemy.orm import Session
-from sqlalchemy import desc
-
-from app.core.config import settings
-from app.db.models import ConversationHistory
 
 logger = logging.getLogger(__name__)
 
 
 class LLMService:
     """
-    LLM service using LangChain with HuggingFace
+    Text-only LLM service with database-backed conversation history
     
-    Supports seamless model switching via LangChain
+    Key Changes:
+    - Removed all vision-related code
+    - No image path detection or processing
+    - Pure text-based RAG
     """
     
     def __init__(self):
-        self.model_id = settings.llm_model_id
-        self.api_token = settings.huggingface_api_token
-        self.llm = None
-        self._initialize_llm()
+        self.aws_config = {
+            "region_name": settings.aws_region,
+        }
         
-        logger.info(f"✅ LLM Service initialized: {self.model_id}")
+        if settings.aws_access_key_id and settings.aws_secret_access_key:
+            self.aws_config["aws_access_key_id"] = settings.aws_access_key_id
+            self.aws_config["aws_secret_access_key"] = settings.aws_secret_access_key
+        
+        self.model_id = settings.bedrock_model_id
+        self._llm = None
+        
+        logger.info(f"LLM Service initialized (text-only) with model: {self.model_id}")
     
-    def _initialize_llm(self):
-        """Initialize LangChain HuggingFace LLM"""
-        try:
-            # Use HuggingFaceEndpoint with LangChain
-            endpoint = HuggingFaceEndpoint(
-                repo_id=self.model_id,
-                huggingfacehub_api_token=self.api_token,
-                temperature=settings.temperature,
-                max_new_tokens=settings.max_tokens,
-                timeout=120
+    def get_llm(self) -> ChatBedrock:
+        """Get or create LangChain ChatBedrock instance"""
+        if self._llm is None:
+            self._llm = ChatBedrock(
+                model_id=self.model_id,
+                model_kwargs={
+                    "temperature": settings.temperature,
+                    "max_tokens": settings.max_tokens
+                },
+                **self.aws_config
             )
-            
-            # Wrap in ChatHuggingFace for chat-like interface
-            self.llm = ChatHuggingFace(llm=endpoint)
-            
-            logger.info(f"✅ LangChain LLM initialized: {self.model_id}")
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize LLM: {e}")
-            raise RuntimeError(f"LLM initialization failed: {str(e)}")
+            logger.info("Created new ChatBedrock instance")
+        return self._llm
     
     def get_conversation_history(
         self,
@@ -62,8 +64,20 @@ class LLMService:
         db: Session,
         max_turns: int = 4
     ) -> str:
-        """Get conversation history from database"""
+        """
+        Get conversation history from database (last N turns)
+        
+        Args:
+            conversation_id: Conversation identifier
+            user_id: User identifier (for isolation)
+            db: Database session
+            max_turns: Maximum number of Q&A pairs to retrieve (default: 4)
+            
+        Returns:
+            Formatted conversation history string
+        """
         try:
+            # Get last N*2 messages (N questions + N answers)
             messages = db.query(ConversationHistory).filter(
                 ConversationHistory.conversation_id == conversation_id,
                 ConversationHistory.user_id == user_id
@@ -74,8 +88,10 @@ class LLMService:
             if not messages:
                 return ""
             
+            # Reverse to get chronological order
             messages.reverse()
             
+            # Format history
             formatted = "Previous conversation:\n"
             for i in range(0, len(messages), 2):
                 if i + 1 < len(messages):
@@ -83,6 +99,7 @@ class LLMService:
                     answer_msg = messages[i + 1]
                     
                     formatted += f"\nQ: {question_msg.content}\n"
+                    # Truncate long answers
                     answer_text = answer_msg.content[:200] + "..." if len(answer_msg.content) > 200 else answer_msg.content
                     formatted += f"A: {answer_text}\n"
             
@@ -101,13 +118,25 @@ class LLMService:
         db: Session,
         max_turns: int = 4
     ):
-        """Save conversation turn with FIFO deletion"""
+        """
+        Save conversation turn to database with FIFO deletion
+        
+        Args:
+            conversation_id: Conversation identifier
+            user_id: User identifier
+            question: User's question
+            answer: Assistant's answer
+            db: Database session
+            max_turns: Maximum Q&A pairs to keep (default: 4)
+        """
         try:
+            # Count existing messages
             message_count = db.query(ConversationHistory).filter(
                 ConversationHistory.conversation_id == conversation_id,
                 ConversationHistory.user_id == user_id
             ).count()
             
+            # If at limit, delete oldest pair
             if message_count >= (max_turns * 2):
                 oldest_messages = db.query(ConversationHistory).filter(
                     ConversationHistory.conversation_id == conversation_id,
@@ -118,7 +147,10 @@ class LLMService:
                 
                 for msg in oldest_messages:
                     db.delete(msg)
+                
+                logger.debug(f"Deleted oldest Q&A pair from conversation {conversation_id}")
             
+            # Save new question
             question_msg = ConversationHistory(
                 conversation_id=conversation_id,
                 user_id=user_id,
@@ -128,6 +160,7 @@ class LLMService:
             )
             db.add(question_msg)
             
+            # Save new answer
             answer_msg = ConversationHistory(
                 conversation_id=conversation_id,
                 user_id=user_id,
@@ -138,6 +171,8 @@ class LLMService:
             db.add(answer_msg)
             
             db.commit()
+            
+            logger.debug(f"Saved conversation turn for user {user_id}")
             
         except Exception as e:
             logger.error(f"Error saving conversation: {e}")
@@ -153,21 +188,39 @@ class LLMService:
         include_citations: bool = True,
         temperature: Optional[float] = None
     ) -> str:
-        """Generate answer using LangChain"""
+        """
+        Generate answer using text-only LLM (NO VISION)
+        
+        Args:
+            question: User's question
+            context: Retrieved document context (text only)
+            user_id: User identifier
+            db: Database session
+            conversation_id: Optional conversation ID
+            include_citations: Whether to verify citations
+            temperature: Optional temperature override
+        
+        Returns:
+            Generated answer
+        """
         try:
+            # Get conversation history if conversation_id provided
             history = ""
             if conversation_id:
                 history = self.get_conversation_history(
                     conversation_id, user_id, db
                 )
             
-            answer = self._generate_with_langchain(
+            # Generate answer (text-only)
+            answer = self._generate_text_only(
                 question, context, history, temperature
             )
             
+            # Verify citations if requested
             if include_citations:
                 answer = self._verify_citations(answer, context)
             
+            # Save to conversation history if conversation_id provided
             if conversation_id:
                 self.save_conversation_turn(
                     conversation_id, user_id, question, answer, db
@@ -181,79 +234,91 @@ class LLMService:
             traceback.print_exc()
             return f"I apologize, but I encountered an error: {str(e)}"
     
-    def _generate_with_langchain(
+    def _generate_text_only(
         self,
         question: str,
         context: str,
         history: str = "",
         temperature: Optional[float] = None
     ) -> str:
-        """Generate answer using LangChain pipeline"""
+        """
+        Standard text-only generation
+        
+        This is now the ONLY generation method - no vision support
+        """
         try:
-            # Update temperature if provided
-            if temperature is not None and temperature != settings.temperature:
-                # Reinitialize with new temperature
-                endpoint = HuggingFaceEndpoint(
-                    repo_id=self.model_id,
-                    huggingfacehub_api_token=self.api_token,
-                    temperature=temperature,
-                    max_new_tokens=settings.max_tokens,
-                    timeout=120
-                )
-                llm = ChatHuggingFace(llm=endpoint)
-            else:
-                llm = self.llm
+            # Use provided temperature or default
+            temp = temperature if temperature is not None else settings.temperature
+            
+            llm = ChatBedrock(
+                model_id=self.model_id,
+                model_kwargs={
+                    "temperature": temp,
+                    "max_tokens": settings.max_tokens
+                },
+                **self.aws_config
+            )
             
             # Compress context if needed
             compressed_context = self._compress_context(context, question)
             
-            # Build prompt template
-            template_parts = [
-                "You are a helpful AI assistant answering questions based on provided documents."
-            ]
-            
+            # Build prompt
+            prompt_template = """You are a helpful AI assistant answering questions based on provided documents.
+
+"""
             if history:
-                template_parts.append(f"\n{history}")
+                prompt_template += "{history}\n\n"
             
-            template_parts.extend([
-                "\nContext from documents:",
-                "{context}",
-                "\nQuestion: {question}",
-                "\nInstructions:",
-                "- Answer using ONLY information from the context",
-                "- If answer not found, say 'I don't have enough information'",
-                "- Be concise and accurate",
-                "- Reference sources when relevant (e.g., [Source 1])",
-                "- Use proper markdown formatting",
-                "\nAnswer:"
-            ])
+            prompt_template += """Context from documents:
+{context}
+
+Question: {question}
+
+Instructions:
+- Answer using ONLY information from the context
+- If answer not found, say "I don't have enough information to answer this question"
+- Be concise and accurate
+- Reference sources when relevant (e.g., [Source 1])
+- The context may include image descriptions marked as "[Image Description]" - use these descriptions as factual information
+- Use proper markdown formatting (bullet points, **bold**, headings)
+
+Answer:"""
             
-            prompt = ChatPromptTemplate.from_template("\n".join(template_parts))
+            prompt = PromptTemplate(
+                template=prompt_template,
+                input_variables=["context", "question", "history"]
+            )
             
-            # Create chain
             chain = prompt | llm | StrOutputParser()
             
-            # Invoke chain
             answer = chain.invoke({
                 "context": compressed_context,
-                "question": question
+                "question": question,
+                "history": history
             })
             
-            return answer.strip()
+            return answer
             
         except Exception as e:
-            logger.error(f"LangChain generation failed: {e}")
+            logger.error(f"Text generation failed: {e}")
             raise
     
-    def _compress_context(self, context: str, question: str, max_length: int = 4000) -> str:
-        """Compress context to fit API limits"""
+    def _compress_context(
+        self,
+        context: str,
+        question: str,
+        max_length: int = 8000
+    ) -> str:
+        """Compress context by removing less relevant parts"""
         if len(context) <= max_length:
             return context
         
+        # Split by sources
         sources = context.split('[Source')
         if len(sources) <= 1:
             return context[:max_length]
         
+        # Rank sources by relevance to question
         question_lower = question.lower()
         question_keywords = set(re.findall(r'\w+', question_lower))
         
@@ -272,8 +337,10 @@ class LLMService:
                 'length': len(source_text)
             })
         
+        # Sort by relevance
         ranked_sources.sort(key=lambda x: x['relevance'], reverse=True)
         
+        # Build compressed context
         final_context = ""
         current_length = 0
         
@@ -308,12 +375,14 @@ class LLMService:
     def detect_hallucination(self, answer: str, context: str) -> Tuple[bool, float]:
         """Simple hallucination detection"""
         try:
+            # Extract claims with numbers
             claim_pattern = r'[^.!?]*\d+[^.!?]*[.!?]'
             claims = re.findall(claim_pattern, answer)
             
             if not claims:
                 return False, 1.0
             
+            # Check support in context
             supported_claims = 0
             context_lower = context.lower()
             
@@ -327,6 +396,9 @@ class LLMService:
             support_ratio = supported_claims / len(claims) if claims else 1.0
             is_hallucination = support_ratio < 0.6
             
+            if is_hallucination:
+                logger.warning(f"Potential hallucination detected. Support ratio: {support_ratio}")
+            
             return is_hallucination, support_ratio
             
         except Exception as e:
@@ -334,30 +406,25 @@ class LLMService:
             return False, 1.0
     
     def clear_conversation(self, conversation_id: str, user_id: str, db: Session):
-        """Clear conversation history"""
+        """Clear conversation history from database"""
         try:
             db.query(ConversationHistory).filter(
                 ConversationHistory.conversation_id == conversation_id,
                 ConversationHistory.user_id == user_id
             ).delete()
             db.commit()
+            logger.info(f"Cleared conversation {conversation_id} for user {user_id}")
         except Exception as e:
             logger.error(f"Error clearing conversation: {e}")
             db.rollback()
     
     def update_model(self, new_model_id: str) -> bool:
-        """Update model ID and reinitialize"""
+        """Update model ID"""
         try:
-            if new_model_id not in settings.available_llm_models:
-                logger.error(f"Invalid model ID: {new_model_id}")
-                return False
-            
             self.model_id = new_model_id
-            self._initialize_llm()
-            
-            logger.info(f"✅ Model updated to: {new_model_id}")
+            self._llm = None
+            logger.info(f"Model updated to: {new_model_id}")
             return True
-            
         except Exception as e:
             logger.error(f"Error updating model: {str(e)}")
             return False

@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 class TaskType(str, Enum):
     """Task type classification"""
     CPU_BOUND = "cpu_bound"  # PDF extraction, image processing
-    IO_BOUND = "io_bound"    # Embeddings, vector store, database
+    IO_BOUND = "io_bound"    # Embeddings, vector store, database locust ade 
 
 
 class TaskStatus(str, Enum):
