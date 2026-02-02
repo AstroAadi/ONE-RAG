@@ -37,6 +37,7 @@ class Settings(BaseSettings):
         default="anthropic.claude-3-5-sonnet-20241022"
     )
     
+    # ==================== Embedding Model Configuration ====================
     embedding_model_id: str = Field(
         default="cohere.embed-english-v3"
     )
@@ -197,6 +198,9 @@ class Settings(BaseSettings):
     enable_conversation_history: bool = Field(default=True)
     enable_hallucination_detection: bool = Field(default=False)
     hallucination_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
+    enable_conversation_history: bool = Field(default=True)
+    enable_hallucination_detection: bool = Field(default=False)
+    hallucination_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
     
     # ==================== Security ====================
     allowed_file_extensions: set[str] = Field(
@@ -230,6 +234,7 @@ class Settings(BaseSettings):
         directories = [
             self.upload_dir,
             self.markdown_dir,
+            self.model_cache_dir,
             self.log_file_path.parent,
         ]
         for directory in directories:
@@ -237,10 +242,10 @@ class Settings(BaseSettings):
     
     @property
     def max_file_size_bytes(self) -> int:
-        """Get max file size in bytes"""
         return self.max_file_size_mb * 1024 * 1024
     
     def validate_configuration(self) -> tuple[bool, list[str]]:
+        """Validate configuration and return warnings"""
         """Validate configuration and return warnings"""
         warnings = []
         is_valid = True
@@ -251,17 +256,16 @@ class Settings(BaseSettings):
                 warnings.append("AWS credentials not configured")
                 is_valid = False
         
-        # Check model IDs
-        if not self.bedrock_model_id:
-            warnings.append("BEDROCK_MODEL_ID not set")
+        if not self.llm_model_id:
+            warnings.append("LLM_MODEL_ID not set")
             is_valid = False
         
         if not self.embedding_model_id:
             warnings.append("EMBEDDING_MODEL_ID not set")
             is_valid = False
         
-        # Check Qdrant configuration
         if not self.qdrant_url:
+            warnings.append("QDRANT_URL not set")
             warnings.append("QDRANT_URL not set")
         
         if not self.qdrant_api_key and self.qdrant_url:
@@ -285,11 +289,12 @@ class Settings(BaseSettings):
 
 
 # Initialize global settings
+# Initialize global settings
 settings = Settings()
 
 
 def get_settings() -> Settings:
-    """Dependency injection function for FastAPI"""
+    """Dependency injection function"""
     return settings
 
 
@@ -301,8 +306,8 @@ def print_configuration_summary():
     print("RAG SYSTEM CONFIGURATION - CONCURRENT PROCESSING ENABLED")
     print("="*70)
     
-    print(f"\n📊 Models:")
-    print(f"  - LLM: {settings.bedrock_model_id}")
+    print(f"\n🤖 Models:")
+    print(f"  - Chat/LLM: {settings.llm_model_id}")
     print(f"  - Embedding: {settings.embedding_model_id}")
     print(f"  - Vision: {settings.bedrock_vision_model_id}")
     
@@ -336,6 +341,7 @@ def print_configuration_summary():
     if not is_valid:
         print("\n❌ CRITICAL: Configuration is invalid!")
     
+    print("="*70 + "\n")
     print("="*70 + "\n")
 
 
