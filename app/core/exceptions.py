@@ -1,395 +1,276 @@
 """
-Custom Exception Classes for RAG System
-Backward compatible - existing code using HTTPException still works
+Custom Exceptions - STANDARDIZED VERSION
+Provides consistent error handling across the RAG system
 """
 
-from typing import Optional
-from fastapi import HTTPException
+from typing import Optional, Dict, Any
 
 
-class RAGSystemError(Exception):
+class RAGException(Exception):
     """
     Base exception for all RAG system errors
     
-    Can be used standalone or converted to HTTPException for FastAPI
+    All custom exceptions should inherit from this class
+    This allows for consistent error handling at the API level
     """
+    status_code = 500
+    error_code = "INTERNAL_ERROR"
     
     def __init__(
-        self,
-        message: str,
-        error_code: Optional[str] = None,
-        details: Optional[dict] = None,
-        status_code: int = 500
+        self, 
+        message: str, 
+        details: Optional[Dict[str, Any]] = None,
+        status_code: Optional[int] = None
     ):
+        """
+        Initialize exception
+        
+        Args:
+            message: Human-readable error message
+            details: Optional additional error details
+            status_code: Optional HTTP status code override
+        """
         self.message = message
-        self.error_code = error_code or self.__class__.__name__
         self.details = details or {}
-        self.status_code = status_code
+        if status_code:
+            self.status_code = status_code
         super().__init__(self.message)
     
-    def to_dict(self) -> dict:
-        """Convert exception to dictionary for API responses"""
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert exception to dictionary for API response"""
         return {
             "error": self.error_code,
             "message": self.message,
-            "details": self.details
+            "details": self.details,
+            "status_code": self.status_code
         }
-    
-    def to_http_exception(self) -> HTTPException:
-        """Convert to FastAPI HTTPException"""
-        return HTTPException(
-            status_code=self.status_code,
-            detail=self.message
-        )
 
 
-# ==================== File Processing Errors ====================
+# ==================== CLIENT ERRORS (4xx) ====================
 
-class FileProcessingError(RAGSystemError):
-    """Base class for file processing errors"""
-    def __init__(self, message: str, error_code: Optional[str] = None, details: Optional[dict] = None):
-        super().__init__(message, error_code, details, status_code=422)
-
-
-class FileValidationError(FileProcessingError):
-    """File validation failed (invalid format, size, etc.)"""
-    def __init__(self, message: str, error_code: Optional[str] = None, details: Optional[dict] = None):
-        super().__init__(message, error_code, details)
-        self.status_code = 400
+class ValidationError(RAGException):
+    """Invalid input or request parameters"""
+    status_code = 400
+    error_code = "VALIDATION_ERROR"
 
 
-class FileNotFoundError(FileProcessingError):
-    """File not found in storage"""
-    def __init__(self, message: str, error_code: Optional[str] = None, details: Optional[dict] = None):
-        super().__init__(message, error_code, details)
-        self.status_code = 404
+class AuthenticationError(RAGException):
+    """Authentication failed"""
+    status_code = 401
+    error_code = "AUTHENTICATION_ERROR"
 
 
-class FileUploadError(FileProcessingError):
-    """Error during file upload"""
-    pass
+class AuthorizationError(RAGException):
+    """User lacks permission for this resource"""
+    status_code = 403
+    error_code = "AUTHORIZATION_ERROR"
 
 
-class FileSizeExceededError(FileValidationError):
-    """File size exceeds maximum allowed"""
-    pass
+class NotFoundError(RAGException):
+    """Requested resource not found"""
+    status_code = 404
+    error_code = "NOT_FOUND"
 
 
-class UnsupportedFileTypeError(FileValidationError):
-    """File type not supported"""
-    def __init__(self, message: str, error_code: Optional[str] = None, details: Optional[dict] = None):
-        super().__init__(message, error_code, details)
-        self.status_code = 415
+class ConflictError(RAGException):
+    """Resource conflict (e.g., duplicate upload)"""
+    status_code = 409
+    error_code = "CONFLICT"
 
 
-# ==================== Document Extraction Errors ====================
-
-class DocumentExtractionError(RAGSystemError):
-    """Base class for document extraction errors"""
-    def __init__(self, message: str, error_code: Optional[str] = None, details: Optional[dict] = None):
-        super().__init__(message, error_code, details, status_code=422)
+class RateLimitError(RAGException):
+    """Rate limit exceeded"""
+    status_code = 429
+    error_code = "RATE_LIMIT_EXCEEDED"
 
 
-class ExtractionFailedError(DocumentExtractionError):
-    """Content extraction from document failed"""
-    pass
+# ==================== SERVER ERRORS (5xx) ====================
+
+class ServerError(RAGException):
+    """Generic server error"""
+    status_code = 500
+    error_code = "INTERNAL_SERVER_ERROR"
 
 
-class EmptyDocumentError(DocumentExtractionError):
-    """No content extracted from document"""
-    pass
+class ServiceUnavailableError(RAGException):
+    """Service temporarily unavailable"""
+    status_code = 503
+    error_code = "SERVICE_UNAVAILABLE"
 
 
-class CorruptedDocumentError(DocumentExtractionError):
-    """Document is corrupted or unreadable"""
-    pass
+class TimeoutError(RAGException):
+    """Operation timed out"""
+    status_code = 504
+    error_code = "TIMEOUT"
 
 
-# ==================== Chunking Errors ====================
+# ==================== DOMAIN-SPECIFIC ERRORS ====================
 
-class ChunkingError(RAGSystemError):
-    """Base class for chunking errors"""
-    def __init__(self, message: str, error_code: Optional[str] = None, details: Optional[dict] = None):
-        super().__init__(message, error_code, details, status_code=422)
-
-
-class ChunkSizeExceededError(ChunkingError):
-    """Chunk exceeds maximum allowed size"""
-    pass
+# File Upload Errors
+class FileUploadError(ValidationError):
+    """File upload failed"""
+    error_code = "FILE_UPLOAD_ERROR"
 
 
-class NoChunksCreatedError(ChunkingError):
-    """No chunks created from document"""
-    pass
+class FileSizeError(ValidationError):
+    """File size exceeds limit"""
+    error_code = "FILE_SIZE_ERROR"
 
 
-# ==================== Vector Store Errors ====================
-
-class VectorStoreException(RAGSystemError):
-    """Base class for vector store errors"""
-    pass
+class FileTypeError(ValidationError):
+    """Unsupported file type"""
+    error_code = "FILE_TYPE_ERROR"
 
 
-class EmbeddingError(VectorStoreException):
-    """Error generating embeddings"""
-    pass
+# Document Processing Errors
+class DocumentProcessingError(ServerError):
+    """Document processing failed"""
+    error_code = "DOCUMENT_PROCESSING_ERROR"
 
 
-class SearchError(VectorStoreException):
-    """Error during vector search"""
-    pass
+class ExtractionError(DocumentProcessingError):
+    """Content extraction failed"""
+    error_code = "EXTRACTION_ERROR"
 
 
-class IndexingError(VectorStoreException):
-    """Error indexing documents to vector store"""
-    pass
+class ChunkingError(DocumentProcessingError):
+    """Text chunking failed"""
+    error_code = "CHUNKING_ERROR"
 
 
-class NoDocumentsFoundError(VectorStoreException):
-    """No documents found in vector store"""
-    def __init__(self, message: str = "No documents found. Please upload and process documents first.", 
-                 error_code: Optional[str] = None, details: Optional[dict] = None):
-        super().__init__(message, error_code, details, status_code=404)
+# Embedding & Vector Store Errors
+class EmbeddingError(ServerError):
+    """Embedding generation failed"""
+    error_code = "EMBEDDING_ERROR"
 
 
-# ==================== LLM Errors ====================
-
-class LLMError(RAGSystemError):
-    """Base class for LLM errors"""
-    pass
+class VectorStoreException(ServerError):
+    """Vector store operation failed"""
+    error_code = "VECTOR_STORE_ERROR"
 
 
-class LLMResponseError(LLMError):
-    """Error getting response from LLM"""
-    pass
+class NoDocumentsFoundError(NotFoundError):
+    """No documents found in knowledge base"""
+    error_code = "NO_DOCUMENTS_FOUND"
 
 
-class LLMTimeoutError(LLMError):
+# Search Errors
+class SearchError(ServerError):
+    """Search operation failed"""
+    error_code = "SEARCH_ERROR"
+
+
+class QueryError(SearchError):
+    """Query processing failed"""
+    error_code = "QUERY_ERROR"
+
+
+# LLM Errors
+class LLMError(ServerError):
+    """LLM service error"""
+    error_code = "LLM_ERROR"
+
+
+class LLMGenerationError(LLMError):
+    """Answer generation failed"""
+    error_code = "LLM_GENERATION_ERROR"
+
+
+class LLMTimeoutError(TimeoutError):
     """LLM request timed out"""
-    def __init__(self, message: str, error_code: Optional[str] = None, details: Optional[dict] = None):
-        super().__init__(message, error_code, details, status_code=504)
+    error_code = "LLM_TIMEOUT"
 
 
-class LLMQuotaExceededError(LLMError):
-    """LLM quota or rate limit exceeded"""
-    def __init__(self, message: str, error_code: Optional[str] = None, details: Optional[dict] = None):
-        super().__init__(message, error_code, details, status_code=429)
+# Database Errors
+class DatabaseError(ServerError):
+    """Database operation failed"""
+    error_code = "DATABASE_ERROR"
 
 
-# ==================== Query Errors ====================
-
-class QueryError(RAGSystemError):
-    """Base class for query errors"""
-    def __init__(self, message: str, error_code: Optional[str] = None, details: Optional[dict] = None):
-        super().__init__(message, error_code, details, status_code=400)
-
-
-class InvalidQueryError(QueryError):
-    """Query is invalid or malformed"""
-    pass
-
-
-class NoResultsError(QueryError):
-    """No results found for query"""
-    def __init__(self, message: str, error_code: Optional[str] = None, details: Optional[dict] = None):
-        super().__init__(message, error_code, details, status_code=404)
-
-
-# ==================== User/Authorization Errors ====================
-
-class AuthorizationError(RAGSystemError):
-    """Base class for authorization errors"""
-    def __init__(self, message: str, error_code: Optional[str] = None, details: Optional[dict] = None):
-        super().__init__(message, error_code, details, status_code=401)
-
-
-class InvalidUserIDError(AuthorizationError):
-    """User ID is invalid or missing"""
-    def __init__(self, message: str, error_code: Optional[str] = None, details: Optional[dict] = None):
-        super().__init__(message, error_code, details, status_code=400)
-
-
-class UnauthorizedAccessError(AuthorizationError):
-    """User not authorized to access resource"""
-    def __init__(self, message: str, error_code: Optional[str] = None, details: Optional[dict] = None):
-        super().__init__(message, error_code, details, status_code=403)
-
-
-# ==================== Database Errors ====================
-
-class DatabaseError(RAGSystemError):
-    """Base class for database errors"""
-    pass
-
-
-class RecordNotFoundError(DatabaseError):
-    """Database record not found"""
-    def __init__(self, message: str, error_code: Optional[str] = None, details: Optional[dict] = None):
-        super().__init__(message, error_code, details, status_code=404)
-
-
-class DatabaseConnectionError(DatabaseError):
+class DatabaseConnectionError(ServiceUnavailableError):
     """Cannot connect to database"""
-    def __init__(self, message: str, error_code: Optional[str] = None, details: Optional[dict] = None):
-        super().__init__(message, error_code, details, status_code=503)
+    error_code = "DATABASE_CONNECTION_ERROR"
 
 
-# ==================== Configuration Errors ====================
-
-class ConfigurationError(RAGSystemError):
-    """Base class for configuration errors"""
-    pass
-
-
-class MissingConfigurationError(ConfigurationError):
-    """Required configuration is missing"""
-    pass
+# Task Management Errors
+class TaskError(ServerError):
+    """Background task error"""
+    error_code = "TASK_ERROR"
 
 
-class InvalidConfigurationError(ConfigurationError):
-    """Configuration value is invalid"""
-    pass
+class TaskNotFoundError(NotFoundError):
+    """Task not found"""
+    error_code = "TASK_NOT_FOUND"
 
 
-# ==================== External Service Errors ====================
-
-class ExternalServiceError(RAGSystemError):
-    """Base class for external service errors"""
-    def __init__(self, message: str, error_code: Optional[str] = None, details: Optional[dict] = None):
-        super().__init__(message, error_code, details, status_code=502)
+class TaskCancelledError(RAGException):
+    """Task was cancelled"""
+    status_code = 499  # Client Closed Request
+    error_code = "TASK_CANCELLED"
 
 
-class BedrockServiceError(ExternalServiceError):
-    """Error communicating with AWS Bedrock"""
-    pass
+# Configuration Errors
+class ConfigurationError(ServerError):
+    """System configuration error"""
+    error_code = "CONFIGURATION_ERROR"
 
 
-class OCRServiceError(ExternalServiceError):
-    """Error with OCR service"""
-    pass
+class MissingCredentialsError(ConfigurationError):
+    """Required credentials not configured"""
+    error_code = "MISSING_CREDENTIALS"
 
 
-# ==================== Helper Functions ====================
+# ==================== HELPER FUNCTIONS ====================
 
-def get_error_message(error: Exception) -> str:
+def raise_for_status(
+    condition: bool,
+    exception_class: type[RAGException],
+    message: str,
+    **details
+):
     """
-    Get user-friendly error message from exception
+    Raise exception if condition is True
     
-    Args:
-        error: Exception instance
-    
-    Returns:
-        User-friendly error message
-    """
-    if isinstance(error, RAGSystemError):
-        return error.message
-    return "An unexpected error occurred. Please try again."
-
-
-def get_error_details(error: Exception) -> dict:
-    """
-    Get error details for logging
-    
-    Args:
-        error: Exception instance
-    
-    Returns:
-        Dictionary with error details
-    """
-    if isinstance(error, RAGSystemError):
-        return {
-            "error_code": error.error_code,
-            "message": error.message,
-            "details": error.details,
-            "type": type(error).__name__,
-            "status_code": error.status_code
-        }
-    return {
-        "error_code": "UNKNOWN_ERROR",
-        "message": str(error),
-        "type": type(error).__name__,
-        "status_code": 500
-    }
-
-
-def handle_exception(error: Exception) -> HTTPException:
-    """
-    Convert any exception to HTTPException
-    
-    Args:
-        error: Any exception
-    
-    Returns:
-        HTTPException suitable for FastAPI
-    
-    Usage:
-        try:
-            do_something()
-        except Exception as e:
-            raise handle_exception(e)
-    """
-    if isinstance(error, RAGSystemError):
-        return error.to_http_exception()
-    elif isinstance(error, HTTPException):
-        return error
-    else:
-        # Unknown exception - return generic 500
-        return HTTPException(
-            status_code=500,
-            detail="An internal error occurred"
+    Example:
+        raise_for_status(
+            len(text) > MAX_LENGTH,
+            ValidationError,
+            "Text too long",
+            max_length=MAX_LENGTH,
+            actual_length=len(text)
         )
-
-
-# ==================== Decorator for Automatic Exception Handling ====================
-
-from functools import wraps
-from typing import Callable
-import logging
-
-logger = logging.getLogger(__name__)
-
-
-def handle_errors(func: Callable) -> Callable:
     """
-    Decorator to automatically handle exceptions in route handlers
-    
-    Usage:
-        @router.post("/upload")
-        @handle_errors
-        async def upload_file(...):
-            # Your code here
-            # Exceptions automatically converted to HTTPException
+    if condition:
+        raise exception_class(message, details=details)
+
+
+def handle_external_error(error: Exception, context: str = "") -> RAGException:
     """
-    @wraps(func)
-    async def async_wrapper(*args, **kwargs):
-        try:
-            return await func(*args, **kwargs)
-        except HTTPException:
-            # Already an HTTPException, re-raise as-is
-            raise
-        except RAGSystemError as e:
-            # Our custom error - log and convert
-            logger.error(f"{e.error_code}: {e.message}", extra=e.details)
-            raise e.to_http_exception()
-        except Exception as e:
-            # Unexpected error - log and return generic 500
-            logger.exception(f"Unexpected error in {func.__name__}: {e}")
-            raise HTTPException(status_code=500, detail="An internal error occurred")
+    Convert external library errors to RAG exceptions
     
-    @wraps(func)
-    def sync_wrapper(*args, **kwargs):
-        try:
-            return func(*args, **kwargs)
-        except HTTPException:
-            raise
-        except RAGSystemError as e:
-            logger.error(f"{e.error_code}: {e.message}", extra=e.details)
-            raise e.to_http_exception()
-        except Exception as e:
-            logger.exception(f"Unexpected error in {func.__name__}: {e}")
-            raise HTTPException(status_code=500, detail="An internal error occurred")
+    Args:
+        error: Original exception
+        context: Context string (e.g., "embedding generation")
+        
+    Returns:
+        Appropriate RAG exception
     
-    import asyncio
-    if asyncio.iscoroutinefunction(func):
-        return async_wrapper
-    return sync_wrapper
+    Example:
+        try:
+            result = bedrock_client.embed(text)
+        except Exception as e:
+            raise handle_external_error(e, "embedding generation")
+    """
+    error_message = f"{context}: {str(error)}" if context else str(error)
+    
+    # Map common errors
+    if "timeout" in str(error).lower():
+        return TimeoutError(error_message)
+    elif "not found" in str(error).lower():
+        return NotFoundError(error_message)
+    elif "permission" in str(error).lower() or "unauthorized" in str(error).lower():
+        return AuthorizationError(error_message)
+    elif "rate limit" in str(error).lower():
+        return RateLimitError(error_message)
+    else:
+        return ServerError(error_message)

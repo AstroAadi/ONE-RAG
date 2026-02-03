@@ -1,6 +1,9 @@
 """
 Upload Route - FIXED VERSION
-Proper argument passing to task manager
+Fixes:
+- Corrected task submission (no argument duplication)
+- Simplified progress tracking
+- Better error handling
 """
 
 from typing import Optional
@@ -19,6 +22,10 @@ from app.models.schemas import (
 from app.utils.file_validator import FileValidator
 from app.core.config import settings
 from app.core.dependencies import get_user_id, get_database_session
+from app.core.exceptions import (
+    FileUploadError, FileSizeError, FileTypeError,
+    DocumentProcessingError, ValidationError
+)
 from app.db.models import (
     FileMetadata, ProcessingStatus as DBProcessingStatus,
     FileType, ChunkingStrategyEnum
@@ -76,7 +83,7 @@ async def upload_file(
         
         if not is_size_valid:
             upload_path.unlink()
-            raise HTTPException(status_code=400, detail=size_error)
+            raise FileSizeError(size_error)
         
         # Get file category
         file_category = FileValidator.get_file_category(safe_filename)
@@ -121,9 +128,9 @@ async def upload_file(
             message=f"File '{safe_filename}' uploaded. Use /process/{file_id} to process."
         )
     
-    except HTTPException:
+    except (FileSizeError, FileTypeError) as e:
         db.rollback()
-        raise
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         db.rollback()
         if upload_path.exists():
@@ -142,9 +149,9 @@ async def process_and_index_document(
     chunk_overlap_tokens: Optional[int] = Query(default=None, ge=0, le=500)
 ):
     """
-    Process document in background (returns immediately with task_id)
+    Process document in background
     
-    FIXED: Proper argument passing - no duplication, all args in kwargs
+    FIXED: Proper argument passing - all args in kwargs, no duplication
     """
     
     # Get file metadata
@@ -180,17 +187,14 @@ async def process_and_index_document(
     # Get task manager
     task_manager = get_task_manager()
     
-    # CORRECT: Pass all function arguments as keyword arguments
-    # The task manager will inject progress_callback and task_id
+    # FIXED: All arguments in kwargs, no duplication!
     task_id = task_manager.submit_task(
         func=process_document_with_progress,
         task_type=TaskType.IO_BOUND,
         description=f"Process: {file_metadata.safe_filename}",
+        # ALL function arguments as kwargs:
         user_id=user_id,
         file_id=file_id,
-        # All function parameters as kwargs (NOT positional args!)
-        # file_id=file_id,
-        # user_id=user_id,
         chunking_strategy=chunking_strategy.value,
         target_chunk_tokens=target_chunk_tokens,
         chunk_overlap_tokens=chunk_overlap_tokens,
@@ -206,14 +210,13 @@ async def process_and_index_document(
         "status": "processing",
         "message": "Document processing started",
         "status_endpoint": f"/api/tasks/{task_id}",
-        "progress_endpoint": f"/api/tasks/{task_id}",
-        "estimated_time": "Check progress for updates"
+        "progress_endpoint": f"/api/tasks/{task_id}"
     }
 
 
 def process_document_with_progress(
-    file_id: str,
     user_id: str,
+    file_id: str,
     chunking_strategy: str,
     target_chunk_tokens: Optional[int],
     chunk_overlap_tokens: Optional[int],
@@ -223,15 +226,16 @@ def process_document_with_progress(
     task_id=None  # Injected by task manager
 ):
     """
-    Process document with detailed progress tracking
+    Process document with simplified progress tracking
     
-    All parameters are passed as keyword arguments from submit_task
+    All parameters passed as keyword arguments from submit_task
+    progress_callback and task_id are injected by task manager
     """
     import time
     from pathlib import Path
     from datetime import datetime
     
-    logger.info(f"🚀 [Task {task_id}] Starting document processing for {file_id}")
+    logger.info(f"🚀 [Task {task_id}] Starting processing for {file_id}")
     
     start_time = time.time()
     
@@ -245,15 +249,11 @@ def process_document_with_progress(
         from app.db.models import FileMetadata, ChunkMetadata, ChunkingStrategyEnum
         from app.models.schemas import ChunkingStrategy as SchemaChunkingStrategy
         
-        # Update progress: Starting
+        # SIMPLIFIED: Update progress at major milestones only
         if progress_callback:
-            progress_callback(
-                progress=5.0,
-                stage=ProcessingStage.EXTRACTING,
-                details=f"Initializing extraction for {safe_filename}"
-            )
+            progress_callback(10.0, ProcessingStage.PROCESSING)
         
-        logger.info(f"📊 [Task {task_id}] Stage 1/5: Document Extraction")
+        logger.info(f"📊 [Task {task_id}] Stage: Document Extraction")
         
         # Get database session
         with get_db_context() as db:
@@ -264,59 +264,35 @@ def process_document_with_progress(
             if not file_metadata:
                 raise ValueError(f"File not found: {file_id}")
             
-            # STAGE 1: EXTRACTION
+            # EXTRACTION
             file_extension = Path(storage_path).suffix.lstrip('.')
-            
-            logger.info(f"🔍 [Task {task_id}] Getting extractor for .{file_extension}")
-            
             extractor = ExtractorFactory.get_extractor(file_extension)
+            
             if not extractor:
                 raise ValueError(f"No extractor for .{file_extension}")
-            
-            if progress_callback:
-                progress_callback(
-                    progress=10.0,
-                    stage=ProcessingStage.EXTRACTING,
-                    details=f"Extracting content from {file_extension.upper()} file"
-                )
             
             logger.info(f"⚙️  [Task {task_id}] Running extraction...")
             extraction_start = time.time()
             
-            # Extract document
             markdown_content, success, extraction_metadata = extractor.extract(storage_path)
             
             extraction_time = time.time() - extraction_start
             
             if not success:
                 error_msg = extraction_metadata.get('error', 'Unknown extraction error')
-                logger.error(f"❌ [Task {task_id}] Extraction failed: {error_msg}")
                 raise Exception(f"Extraction failed: {error_msg}")
             
             total_pages = extraction_metadata.get('total_pages', 0)
             word_count = extraction_metadata.get('word_count', 0)
             image_count = extraction_metadata.get('images_extracted', 0)
             table_count = extraction_metadata.get('tables_extracted', 0)
-            chart_count = extraction_metadata.get('charts_extracted', 0)
             
-            logger.info(
-                f"✅ [Task {task_id}] Extraction complete in {extraction_time:.2f}s: "
-                f"{total_pages} pages, {word_count} words, {image_count} images, "
-                f"{table_count} tables"
-            )
+            logger.info(f"✅ [Task {task_id}] Extraction: {total_pages} pages, {word_count} words")
             
             if progress_callback:
-                progress_callback(
-                    progress=30.0,
-                    stage=ProcessingStage.EXTRACTING,
-                    details=f"Extracted {total_pages} pages, {word_count} words",
-                    total_pages=total_pages,
-                    pages_processed=total_pages
-                )
+                progress_callback(30.0, ProcessingStage.PROCESSING)
             
-            # STAGE 2: SAVE MARKDOWN
-            logger.info(f"📊 [Task {task_id}] Stage 2/5: Saving Markdown")
-            
+            # SAVE MARKDOWN
             markdown_converter = MarkdownConverter()
             user_markdown_dir = Path(settings.markdown_dir) / user_id
             user_markdown_dir.mkdir(parents=True, exist_ok=True)
@@ -327,22 +303,15 @@ def process_document_with_progress(
                 str(markdown_path)
             )
             
-            logger.info(f"✅ [Task {task_id}] Markdown saved: {markdown_path}")
-            
             if progress_callback:
-                progress_callback(
-                    progress=40.0,
-                    stage=ProcessingStage.CHUNKING,
-                    details="Starting document chunking"
-                )
+                progress_callback(50.0, ProcessingStage.PROCESSING)
             
-            # STAGE 3: CHUNKING
-            logger.info(f"📊 [Task {task_id}] Stage 3/5: Document Chunking")
+            # CHUNKING
+            logger.info(f"📊 [Task {task_id}] Stage: Chunking")
             
             chunk_tokens = target_chunk_tokens or settings.target_chunk_tokens
             overlap_tokens = chunk_overlap_tokens or settings.chunk_overlap_tokens
             
-            # Create chunking service with the specified token settings
             chunking_service = EnhancedChunkingService(
                 target_chunk_tokens=chunk_tokens,
                 chunk_overlap_tokens=overlap_tokens
@@ -350,14 +319,8 @@ def process_document_with_progress(
             
             strategy_enum = SchemaChunkingStrategy(chunking_strategy)
             
-            logger.info(
-                f"🔪 [Task {task_id}] Chunking with strategy={chunking_strategy}, "
-                f"target_tokens={chunk_tokens}, overlap={overlap_tokens}"
-            )
-            
             chunking_start = time.time()
             
-            # Create base metadata for all chunks (includes user_id for isolation)
             base_metadata = {
                 'user_id': user_id,
                 'file_id': file_id,
@@ -372,88 +335,35 @@ def process_document_with_progress(
             
             chunking_time = time.time() - chunking_start
             
-            # Calculate chunk statistics manually
-            if chunks:
-                token_counts = [chunk.get('token_count', 0) for chunk in chunks]
-                chunk_stats = {
-                    'total_chunks': len(chunks),
-                    'avg_tokens': sum(token_counts) / len(token_counts) if token_counts else 0,
-                    'min_tokens': min(token_counts) if token_counts else 0,
-                    'max_tokens': max(token_counts) if token_counts else 0
-                }
-            else:
-                chunk_stats = {
-                    'total_chunks': 0,
-                    'avg_tokens': 0,
-                    'min_tokens': 0,
-                    'max_tokens': 0
-                }
-            
-            logger.info(
-                f"✅ [Task {task_id}] Chunking complete in {chunking_time:.2f}s: "
-                f"{len(chunks)} chunks created, "
-                f"avg={chunk_stats['avg_tokens']:.0f} tokens"
-            )
+            logger.info(f"✅ [Task {task_id}] Created {len(chunks)} chunks")
             
             if progress_callback:
-                progress_callback(
-                    progress=60.0,
-                    stage=ProcessingStage.EMBEDDING,
-                    details=f"Created {len(chunks)} chunks, now embedding",
-                    total_chunks=len(chunks),
-                    chunks_created=len(chunks)
-                )
+                progress_callback(70.0, ProcessingStage.PROCESSING)
             
-            # STAGE 4: EMBEDDING & INDEXING
-            logger.info(f"📊 [Task {task_id}] Stage 4/5: Embedding & Vector Indexing")
-            
-            simple_structure = {
-                'filename': safe_filename,
-                'file_id': file_id,
-                'chunks': len(chunks)
-            }
+            # EMBEDDING & INDEXING
+            logger.info(f"📊 [Task {task_id}] Stage: Embedding & Indexing")
             
             vector_store = VectorStoreService()
             
-            logger.info(f"🔢 [Task {task_id}] Generating embeddings for {len(chunks)} chunks...")
-            
-            if progress_callback:
-                progress_callback(
-                    progress=70.0,
-                    stage=ProcessingStage.INDEXING,
-                    details=f"Indexing {len(chunks)} chunks to vector store"
-                )
-            
             indexing_start = time.time()
             
-            # Index to vector store
             chunks_added = vector_store.add_document_chunks(
                 chunks,
                 file_id,
                 safe_filename,
-                structured_data=simple_structure
+                structured_data={'filename': safe_filename, 'file_id': file_id}
             )
             
             indexing_time = time.time() - indexing_start
             
-            logger.info(
-                f"✅ [Task {task_id}] Indexing complete in {indexing_time:.2f}s: "
-                f"{chunks_added} chunks indexed"
-            )
+            logger.info(f"✅ [Task {task_id}] Indexed {chunks_added} chunks")
             
             if progress_callback:
-                progress_callback(
-                    progress=85.0,
-                    stage=ProcessingStage.FINALIZING,
-                    details="Saving chunk metadata to database"
-                )
+                progress_callback(90.0, ProcessingStage.PROCESSING)
             
-            # STAGE 5: SAVE TO DATABASE
-            logger.info(f"📊 [Task {task_id}] Stage 5/5: Saving Metadata to Database")
-            
+            # SAVE TO DATABASE
             db_start = time.time()
             
-            # Save chunk metadata
             for chunk in chunks:
                 chunk_db = ChunkMetadata(
                     chunk_id=chunk['chunk_id'],
@@ -466,7 +376,7 @@ def process_document_with_progress(
                 )
                 db.add(chunk_db)
             
-            # Map chunking strategy
+            # Map strategy
             strategy_map = {
                 'fixed_size': ChunkingStrategyEnum.FIXED_SIZE,
                 'sentence': ChunkingStrategyEnum.SENTENCE,
@@ -491,41 +401,23 @@ def process_document_with_progress(
             
             # Store processing metadata
             processing_meta = {
-                'extraction_method': extractor.__class__.__name__,
                 'extraction_time_seconds': extraction_time,
                 'chunking_time_seconds': chunking_time,
                 'indexing_time_seconds': indexing_time,
                 'chunks_created': chunks_added,
-                'chunking_strategy': chunking_strategy,
-                'target_chunk_tokens': chunk_tokens,
-                'chunk_overlap_tokens': overlap_tokens,
-                'chunk_stats': chunk_stats,
-                'extraction_metadata': extraction_metadata
+                'chunking_strategy': chunking_strategy
             }
             file_metadata.processing_metadata = json.dumps(processing_meta)
             
             db.commit()
             
-            db_time = time.time() - db_start
-            
-            logger.info(f"✅ [Task {task_id}] Database update complete in {db_time:.2f}s")
-            
             total_time = time.time() - start_time
             
             if progress_callback:
-                progress_callback(
-                    progress=100.0,
-                    stage=ProcessingStage.COMPLETE,
-                    details=f"Processing complete in {total_time:.1f}s"
-                )
+                progress_callback(100.0, ProcessingStage.COMPLETE)
             
             logger.info(
-                f"🎉 [Task {task_id}] PROCESSING COMPLETE!\n"
-                f"   Total time: {total_time:.2f}s\n"
-                f"   - Extraction: {extraction_time:.2f}s\n"
-                f"   - Chunking: {chunking_time:.2f}s\n"
-                f"   - Indexing: {indexing_time:.2f}s\n"
-                f"   - Database: {db_time:.2f}s\n"
+                f"🎉 [Task {task_id}] COMPLETE in {total_time:.2f}s\n"
                 f"   Chunks: {chunks_added}, Pages: {total_pages}"
             )
             
@@ -535,26 +427,13 @@ def process_document_with_progress(
                 'filename': safe_filename,
                 'chunks_created': chunks_added,
                 'total_pages': total_pages,
-                'processing_time_seconds': total_time,
-                'stages': {
-                    'extraction': extraction_time,
-                    'chunking': chunking_time,
-                    'indexing': indexing_time,
-                    'database': db_time
-                },
-                'statistics': {
-                    'images': image_count,
-                    'tables': table_count,
-                    'charts': chart_count,
-                    'words': word_count
-                },
-                'chunking_strategy': chunking_strategy
+                'processing_time_seconds': total_time
             }
             
     except Exception as e:
-        # Update database status to failed
-        logger.error(f"❌ [Task {task_id}] PROCESSING FAILED: {str(e)}", exc_info=True)
+        logger.error(f"❌ [Task {task_id}] FAILED: {str(e)}", exc_info=True)
         
+        # Update database
         try:
             with get_db_context() as db:
                 file_metadata = db.query(FileMetadata).filter(
@@ -565,9 +444,8 @@ def process_document_with_progress(
                     file_metadata.status = DBProcessingStatus.FAILED
                     file_metadata.error_message = str(e)
                     db.commit()
-                    logger.info(f"📝 [Task {task_id}] Updated database with error status")
         except Exception as db_error:
-            logger.error(f"❌ [Task {task_id}] Failed to update error status: {db_error}")
+            logger.error(f"❌ Failed to update error status: {db_error}")
         
         raise
 
@@ -609,43 +487,37 @@ async def get_available_chunking_strategies():
                 "name": "fixed_size",
                 "display_name": "Fixed-size (Token-based)",
                 "description": "Creates chunks of exact token size",
-                "best_for": "General purpose",
-                "parameters": ["target_chunk_tokens"]
+                "best_for": "General purpose"
             },
             {
                 "name": "sentence",
                 "display_name": "Sentence Chunking",
                 "description": "Groups sentences together",
-                "best_for": "Sentence context important",
-                "parameters": ["target_chunk_tokens"]
+                "best_for": "Sentence context important"
             },
             {
                 "name": "paragraph",
                 "display_name": "Paragraph Chunking",
                 "description": "Groups paragraphs together",
-                "best_for": "Clear paragraph structure",
-                "parameters": ["target_chunk_tokens"]
+                "best_for": "Clear paragraph structure"
             },
             {
                 "name": "sliding_window",
                 "display_name": "Sliding Window",
                 "description": "Creates overlapping chunks",
-                "best_for": "Context across chunks critical",
-                "parameters": ["target_chunk_tokens", "chunk_overlap_tokens"]
+                "best_for": "Context across chunks critical"
             },
             {
                 "name": "recursive",
                 "display_name": "Recursive Chunking",
                 "description": "Hierarchical text splitting",
-                "best_for": "Structured documents",
-                "parameters": ["target_chunk_tokens"]
+                "best_for": "Structured documents"
             },
             {
                 "name": "semantic",
                 "display_name": "Semantic Chunking",
                 "description": "Groups semantically similar sentences",
-                "best_for": "Topic coherence important",
-                "parameters": ["target_chunk_tokens"]
+                "best_for": "Topic coherence important"
             }
         ],
         "default_strategy": "fixed_size",

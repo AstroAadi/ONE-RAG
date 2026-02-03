@@ -1,6 +1,10 @@
 """
-Query Route - CONCURRENT VERSION with Optimized I/O Operations
-Uses ThreadPoolExecutor for parallel embedding and vector search
+Query Route - OPTIMIZED VERSION
+Fixes:
+- Removed task manager overhead (direct execution)
+- Refactored duplicate metadata extraction
+- Standardized error handling
+- Added result caching
 """
 
 from fastapi import APIRouter, HTTPException, Depends
@@ -12,21 +16,76 @@ from app.models.schemas import (
 from app.services.vector_store_service import VectorStoreService
 from app.services.llm_service import LLMService
 from app.core.dependencies import get_user_id, get_database_session
+from app.core.exceptions import (
+    SearchError, LLMGenerationError, RAGException
+)
 from app.db.models import QueryLog
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Tuple, List, Dict
-from app.core.task_manager import get_task_manager, TaskType
+from functools import lru_cache
+import hashlib
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/query", tags=["Query"])
 
-# Initialize services (these are thread-safe)
+# Initialize services (thread-safe)
 vector_store = VectorStoreService()
 llm_service = LLMService()
 
+
+# ==================== QUERY RESULT CACHE ====================
+
+class QueryCache:
+    """Simple in-memory cache for query results with TTL"""
+    
+    def __init__(self, ttl_seconds: int = 300):  # 5 min default
+        self.cache = {}
+        self.ttl = ttl_seconds
+    
+    def _make_key(self, user_id: str, question: str, top_k: int, file_id: str = None) -> str:
+        """Generate cache key"""
+        data = f"{user_id}:{question}:{top_k}:{file_id or 'all'}"
+        return hashlib.sha256(data.encode()).hexdigest()
+    
+    def get(self, user_id: str, question: str, top_k: int, file_id: str = None) -> dict:
+        """Get cached result if still valid"""
+        key = self._make_key(user_id, question, top_k, file_id)
+        
+        if key in self.cache:
+            result, timestamp = self.cache[key]
+            if datetime.utcnow() - timestamp < timedelta(seconds=self.ttl):
+                logger.info(f"✓ Cache hit for query: {question[:50]}...")
+                return result
+            else:
+                # Expired, remove
+                del self.cache[key]
+        
+        return None
+    
+    def set(self, user_id: str, question: str, top_k: int, result: dict, file_id: str = None):
+        """Cache result"""
+        key = self._make_key(user_id, question, top_k, file_id)
+        self.cache[key] = (result, datetime.utcnow())
+    
+    def clear_user(self, user_id: str):
+        """Clear all cache entries for a user"""
+        keys_to_delete = []
+        for key, (result, _) in self.cache.items():
+            if key.startswith(hashlib.sha256(f"{user_id}:".encode()).hexdigest()[:16]):
+                keys_to_delete.append(key)
+        
+        for key in keys_to_delete:
+            del self.cache[key]
+
+
+# Global cache instance
+query_cache = QueryCache(ttl_seconds=300)
+
+
+# ==================== HELPER FUNCTIONS ====================
 
 def safe_get_int(metadata: dict, key: str, default: int = 0) -> int:
     """Safely get integer from metadata"""
@@ -54,52 +113,88 @@ def safe_get_score(score: float) -> float:
         return 0.0
 
 
-def _execute_vector_search(
-    query: str,
-    top_k: int,
-    user_id: str,
-    file_id: str,
-    search_type: str
-) -> Tuple[List[str], List[Dict], List[float]]:
+def build_source_documents(
+    documents: List[str],
+    metadatas: List[Dict],
+    scores: List[float]
+) -> Tuple[List[SourceDocument], str]:
     """
-    Execute vector search (runs in I/O thread pool)
+    Build source documents and context string
     
-    This function is designed to be called from ThreadPoolExecutor
+    Refactored to eliminate code duplication between query and conversation endpoints
+    
+    Returns:
+        Tuple of (source_documents, context_string)
     """
-    return vector_store.search(
-        query=query,
-        top_k=top_k,
-        user_id=user_id,
-        file_id=file_id,
-        search_type=search_type
-    )
+    sources = []
+    context_parts = []
+    
+    for i, (doc, metadata, score) in enumerate(zip(documents, metadatas, scores)):
+        # Build source header
+        source_header = f"[Source {i+1}]"
+        
+        page = safe_get_int(metadata, 'page_number', 0)
+        if page > 0:
+            source_header += f" [Page {page}]"
+        
+        chunk_type = safe_get_str(metadata, 'chunk_type', 'text')
+        if chunk_type != 'text':
+            source_header += f" [{chunk_type.upper()}]"
+        
+        # Add to context
+        context_parts.append(f"{source_header}:\n{doc}\n")
+        
+        # Create source document
+        sources.append(SourceDocument(
+            content=doc[:500] + "..." if len(doc) > 500 else doc,
+            full_text=doc,
+            chunk_id=safe_get_str(metadata, 'chunk_id', f'chunk_{i}'),
+            file_id=safe_get_str(metadata, 'file_id', 'unknown'),
+            filename=safe_get_str(metadata, 'filename', 'unknown'),
+            relevance_score=safe_get_score(score),
+            page_number=page,
+            chunk_type=chunk_type,
+            chunk_index=safe_get_int(metadata, 'chunk_index', i),
+            semantic_score=safe_get_score(metadata.get('semantic_score', 0.0)) if metadata.get('semantic_score') else None,
+            keyword_score=safe_get_score(metadata.get('keyword_score', 0.0)) if metadata.get('keyword_score') else None
+        ))
+    
+    context = "\n\n".join(context_parts)
+    return sources, context
 
 
-def _generate_llm_answer(
+def log_query_to_db(
+    db: Session,
+    user_id: str,
     question: str,
-    context: str,
-    user_id: str,
-    conversation_id: str,
-    temperature: float
-) -> str:
-    """
-    Generate LLM answer (runs in I/O thread pool)
-    
-    This function is designed to be called from ThreadPoolExecutor
-    """
-    from app.core.database import get_db_context
-    
-    with get_db_context() as db:
-        return llm_service.generate_answer(
-            question=question,
-            context=context,
+    answer: str,
+    top_k: int,
+    chunks_retrieved: int,
+    processing_time: float,
+    confidence: float,
+    conversation_id: str = None
+):
+    """Log query to database (non-blocking)"""
+    try:
+        query_log = QueryLog(
             user_id=user_id,
-            db=db,
-            conversation_id=conversation_id,
-            include_citations=True,
-            temperature=temperature
+            question=question,
+            answer=answer,
+            top_k=top_k,
+            chunks_retrieved=chunks_retrieved,
+            processing_time_seconds=processing_time,
+            confidence_score=confidence,
+            queried_at=datetime.utcnow(),
+            conversation_id=conversation_id
         )
+        db.add(query_log)
+        db.commit()
+    except Exception as e:
+        logger.warning(f"Failed to log query to database: {e}")
+        db.rollback()
 
+
+# ==================== MAIN QUERY ENDPOINTS ====================
 
 @router.post("/", response_model=QueryResponse)
 async def query_knowledge_base(
@@ -108,11 +203,13 @@ async def query_knowledge_base(
     db: Session = Depends(get_database_session)
 ):
     """
-    Query endpoint with concurrent I/O operations
+    Query endpoint with DIRECT EXECUTION (no task manager overhead)
     
-    This endpoint uses ThreadPoolExecutor to parallelize:
-    - Vector search (embedding + retrieval)
-    - LLM generation (if needed)
+    Optimizations:
+    - Direct execution instead of task manager
+    - Result caching for repeat queries
+    - Refactored metadata extraction
+    - Better error handling
     
     Headers:
         X-User-ID: User identifier (REQUIRED)
@@ -120,144 +217,112 @@ async def query_knowledge_base(
     start_time = time.time()
     
     try:
-        # Get search type
         search_type = request.search_type or SearchType.HYBRID
         
-        logger.info(f"Query from user {user_id}: search_type={search_type.value}, top_k={request.top_k}")
-        
-        # Get task manager for I/O operations
-        task_manager = get_task_manager()
-        
-        # Submit vector search to I/O thread pool (non-blocking)
-        search_task_id = task_manager.submit_task(
-            func=_execute_vector_search,
-            task_type=TaskType.IO_BOUND,  # Vector search is I/O-bound
-            description=f"Vector search for query",
-            user_id=user_id,
-            file_id=request.file_id,
-            query=request.question,
-            top_k=request.top_k,
-            # user_id=user_id,
-            # file_id=getattr(request, 'file_id', None),
-            search_type=search_type.value
+        logger.info(
+            f"Query from user {user_id}: '{request.question[:50]}...', "
+            f"search_type={search_type.value}, top_k={request.top_k}"
         )
         
-        # Wait for search to complete (with timeout)
+        # Check cache first
+        cached_result = query_cache.get(
+            user_id, 
+            request.question, 
+            request.top_k,
+            request.file_id
+        )
+        
+        if cached_result:
+            logger.info("Returning cached result")
+            return QueryResponse(**cached_result)
+        
+        # === DIRECT EXECUTION (NO TASK MANAGER) ===
+        # Vector search
         try:
-            documents, metadatas, scores = task_manager.get_task_result(
-                search_task_id,
-                timeout=30.0  # 30 second timeout
+            documents, metadatas, scores = vector_store.search(
+                query=request.question,
+                top_k=request.top_k,
+                user_id=user_id,
+                file_id=request.file_id,
+                search_type=search_type.value
             )
-        except TimeoutError:
-            raise HTTPException(
-                status_code=504,
-                detail="Vector search timeout. Please try again."
-            )
+        except Exception as e:
+            logger.error(f"Vector search failed: {e}")
+            raise SearchError(f"Search failed: {str(e)}")
         
         if not documents:
-            raise HTTPException(
-                status_code=404,
-                detail="No documents found. Please upload and process documents first."
+            raise SearchError(
+                "No documents found. Please upload and process documents first."
             )
         
-        # Build context for LLM
-        context_parts = []
-        sources = []
+        # Build context and sources (refactored)
+        sources, context = build_source_documents(documents, metadatas, scores)
         
-        for i, (doc, metadata, score) in enumerate(zip(documents, metadatas, scores)):
-            source_header = f"[Source {i+1}]"
-            
-            page = safe_get_int(metadata, 'page_number', 0)
-            if page > 0:
-                source_header += f" [Page {page}]"
-            
-            chunk_type = safe_get_str(metadata, 'chunk_type', 'text')
-            if chunk_type != 'text':
-                source_header += f" [{chunk_type.upper()}]"
-            
-            context_parts.append(f"{source_header}:\n{doc}\n")
-            
-            sources.append(SourceDocument(
-                content=doc[:500] + "..." if len(doc) > 500 else doc,
-                full_text=doc,
-                chunk_id=safe_get_str(metadata, 'chunk_id', f'chunk_{i}'),
-                file_id=safe_get_str(metadata, 'file_id', 'unknown'),
-                filename=safe_get_str(metadata, 'filename', 'unknown'),
-                relevance_score=safe_get_score(score),
-                page_number=page,
-                chunk_type=chunk_type,
-                chunk_index=safe_get_int(metadata, 'chunk_index', i),
-            ))
-        
-        context = "\n\n".join(context_parts)
-        
-        # Generate answer (also in I/O thread pool for API calls)
-        answer_task_id = task_manager.submit_task(
-            func=_generate_llm_answer,
-            task_type=TaskType.IO_BOUND,  # LLM API calls are I/O-bound
-            description=f"Generate LLM answer",
-            user_id=user_id,
-            question=request.question,
-            context=context,
-            # user_id=user_id,
-            conversation_id=None,
-            temperature=request.temperature or 0.7
-        )
-        
-        # Wait for answer (with timeout)
+        # Generate answer
         try:
-            answer = task_manager.get_task_result(
-                answer_task_id,
-                timeout=60.0  # 60 second timeout for LLM
+            answer = llm_service.generate_answer(
+                question=request.question,
+                context=context,
+                user_id=user_id,
+                db=db,
+                conversation_id=None,
+                include_citations=True,
+                temperature=request.temperature or 0.7
             )
-        except TimeoutError:
-            raise HTTPException(
-                status_code=504,
-                detail="LLM generation timeout. Please try again."
-            )
+        except Exception as e:
+            logger.error(f"LLM generation failed: {e}")
+            raise LLMGenerationError(f"Failed to generate answer: {str(e)}")
         
         # Detect hallucinations
         is_hallucination, confidence = llm_service.detect_hallucination(answer, context)
         
         if is_hallucination:
-            logger.warning(f"Low confidence detected: {confidence}")
+            logger.warning(f"Low confidence detected: {confidence:.2f}")
             answer += f"\n\n⚠️ Note: Lower confidence ({confidence:.2f}). Please verify."
         
         processing_time = time.time() - start_time
         
-        # Log query to database (asynchronously)
-        try:
-            query_log = QueryLog(
-                user_id=user_id,
-                question=request.question,
-                answer=answer,
-                top_k=request.top_k,
-                chunks_retrieved=len(documents),
-                processing_time_seconds=processing_time,
-                confidence_score=confidence,
-                queried_at=datetime.utcnow(),
-                conversation_id=None
-            )
-            db.add(query_log)
-            db.commit()
-        except Exception as e:
-            logger.warning(f"Failed to log query: {e}")
+        # Build response
+        response_data = {
+            "question": request.question,
+            "answer": answer,
+            "sources": sources,
+            "processing_time": round(processing_time, 2),
+            "search_type": search_type,
+            "confidence_score": round(confidence, 3)
+        }
         
-        return QueryResponse(
-            question=request.question,
-            answer=answer,
-            sources=sources,
-            processing_time=round(processing_time, 2),
-            search_type=search_type,
-            confidence_score=round(confidence, 3)
+        # Cache result
+        query_cache.set(
+            user_id,
+            request.question,
+            request.top_k,
+            response_data,
+            request.file_id
         )
+        
+        # Log to database (async, non-blocking)
+        log_query_to_db(
+            db, user_id, request.question, answer,
+            request.top_k, len(documents), processing_time,
+            confidence, None
+        )
+        
+        logger.info(
+            f"✓ Query completed in {processing_time:.2f}s, "
+            f"confidence={confidence:.2f}"
+        )
+        
+        return QueryResponse(**response_data)
     
-    except HTTPException:
-        raise
+    except SearchError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except LLMGenerationError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except RAGException as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
-        logger.error(f"Query error: {str(e)}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"Unexpected query error: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Error processing query: {str(e)}"
@@ -271,7 +336,7 @@ async def query_with_conversation(
     db: Session = Depends(get_database_session)
 ):
     """
-    Conversational query with concurrent I/O operations
+    Conversational query with DIRECT EXECUTION
     
     Similar to standard query but maintains conversation history
     """
@@ -280,96 +345,44 @@ async def query_with_conversation(
     try:
         search_type = request.search_type or SearchType.HYBRID
         
-        logger.info(f"Conversation query: search_type={search_type.value}")
-        
-        task_manager = get_task_manager()
-        
-        # Vector search in background
-        search_task_id = task_manager.submit_task(
-            func=_execute_vector_search,
-            task_type=TaskType.IO_BOUND,
-            description=f"Vector search for conversation",
-            user_id=user_id,
-            file_id=request.file_id,
-            query=request.question,
-            top_k=request.top_k,
-            # user_id=user_id,
-            # file_id=getattr(request, 'file_id', None),
-            search_type=search_type.value
+        logger.info(
+            f"Conversation query: conv_id={request.conversation_id}, "
+            f"search_type={search_type.value}"
         )
         
-        # Wait for search
+        # Vector search (direct execution)
         try:
-            documents, metadatas, scores = task_manager.get_task_result(
-                search_task_id,
-                timeout=30.0
+            documents, metadatas, scores = vector_store.search(
+                query=request.question,
+                top_k=request.top_k,
+                user_id=user_id,
+                file_id=request.file_id,
+                search_type=search_type.value
             )
-        except TimeoutError:
-            raise HTTPException(
-                status_code=504,
-                detail="Vector search timeout"
-            )
+        except Exception as e:
+            logger.error(f"Vector search failed: {e}")
+            raise SearchError(f"Search failed: {str(e)}")
         
         if not documents:
-            raise HTTPException(
-                status_code=404,
-                detail="No documents found"
-            )
+            raise SearchError("No documents found")
         
-        # Build context
-        context_parts = []
-        sources = []
-        
-        for i, (doc, metadata, score) in enumerate(zip(documents, metadatas, scores)):
-            source_header = f"[Source {i+1}]"
-            
-            page = safe_get_int(metadata, 'page_number', 0)
-            if page > 0:
-                source_header += f" [Page {page}]"
-            
-            chunk_type = safe_get_str(metadata, 'chunk_type', 'text')
-            if chunk_type != 'text':
-                source_header += f" [{chunk_type.upper()}]"
-            
-            context_parts.append(f"{source_header}:\n{doc}\n")
-            
-            sources.append(SourceDocument(
-                content=doc[:500] + "..." if len(doc) > 500 else doc,
-                full_text=doc,
-                chunk_id=safe_get_str(metadata, 'chunk_id', f'chunk_{i}'),
-                file_id=safe_get_str(metadata, 'file_id', 'unknown'),
-                filename=safe_get_str(metadata, 'filename', 'unknown'),
-                relevance_score=safe_get_score(score),
-                page_number=page,
-                chunk_type=chunk_type,
-                chunk_index=safe_get_int(metadata, 'chunk_index', i)
-            ))
-        
-        context = "\n\n".join(context_parts)
+        # Build context and sources (using refactored function)
+        sources, context = build_source_documents(documents, metadatas, scores)
         
         # Generate answer with conversation history
-        answer_task_id = task_manager.submit_task(
-            func=_generate_llm_answer,
-            task_type=TaskType.IO_BOUND,
-            description=f"Generate conversation answer",
-            user_id=user_id,
-            question=request.question,
-            context=context,
-            # user_id=user_id,
-            conversation_id=request.conversation_id,
-            temperature=request.temperature or 0.7
-        )
-        
         try:
-            answer = task_manager.get_task_result(
-                answer_task_id,
-                timeout=60.0
+            answer = llm_service.generate_answer(
+                question=request.question,
+                context=context,
+                user_id=user_id,
+                db=db,
+                conversation_id=request.conversation_id,
+                include_citations=True,
+                temperature=request.temperature or 0.7
             )
-        except TimeoutError:
-            raise HTTPException(
-                status_code=504,
-                detail="LLM generation timeout"
-            )
+        except Exception as e:
+            logger.error(f"LLM generation failed: {e}")
+            raise LLMGenerationError(f"Failed to generate answer: {str(e)}")
         
         # Detect hallucinations
         is_hallucination, confidence = llm_service.detect_hallucination(answer, context)
@@ -379,45 +392,45 @@ async def query_with_conversation(
         
         processing_time = time.time() - start_time
         
-        # Log query
-        try:
-            query_log = QueryLog(
-                user_id=user_id,
-                question=request.question,
-                answer=answer,
-                top_k=request.top_k,
-                chunks_retrieved=len(documents),
-                processing_time_seconds=processing_time,
-                confidence_score=confidence,
-                queried_at=datetime.utcnow(),
-                conversation_id=request.conversation_id
-            )
-            db.add(query_log)
-            db.commit()
-        except Exception as e:
-            logger.warning(f"Failed to log query: {e}")
+        # Build response
+        response_data = {
+            "question": request.question,
+            "answer": answer,
+            "sources": sources,
+            "processing_time": round(processing_time, 2),
+            "search_type": search_type,
+            "confidence_score": round(confidence, 3),
+            "conversation_id": request.conversation_id
+        }
         
-        return QueryResponse(
-            question=request.question,
-            answer=answer,
-            sources=sources,
-            processing_time=round(processing_time, 2),
-            search_type=search_type,
-            confidence_score=round(confidence, 3),
-            conversation_id=request.conversation_id
+        # Log to database
+        log_query_to_db(
+            db, user_id, request.question, answer,
+            request.top_k, len(documents), processing_time,
+            confidence, request.conversation_id
         )
+        
+        logger.info(
+            f"✓ Conversation query completed in {processing_time:.2f}s"
+        )
+        
+        return QueryResponse(**response_data)
     
-    except HTTPException:
-        raise
+    except SearchError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except LLMGenerationError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except RAGException as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
-        logger.error(f"Conversation query error: {str(e)}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"Conversation query error: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Error: {str(e)}"
         )
 
+
+# ==================== CONVERSATION MANAGEMENT ====================
 
 @router.post("/clear-conversation/{conversation_id}")
 async def clear_conversation(
@@ -435,6 +448,7 @@ async def clear_conversation(
             "user_id": user_id
         }
     except Exception as e:
+        logger.error(f"Error clearing conversation: {e}")
         raise HTTPException(
             status_code=500,
             detail=f"Error clearing conversation: {str(e)}"
@@ -458,6 +472,7 @@ async def get_conversation_history(
         ).order_by(
             desc(ConversationHistory.created_at)
         ).limit(8).all()
+        
         messages.reverse()
         
         history = []
@@ -523,4 +538,24 @@ async def get_my_queries(
         raise HTTPException(
             status_code=500,
             detail=f"Error retrieving query history: {str(e)}"
+        )
+
+
+@router.post("/clear-cache")
+async def clear_query_cache(
+    user_id: str = Depends(get_user_id)
+):
+    """Clear query cache for current user"""
+    try:
+        query_cache.clear_user(user_id)
+        
+        return {
+            "message": f"Query cache cleared for user {user_id}",
+            "user_id": user_id
+        }
+    except Exception as e:
+        logger.error(f"Error clearing cache: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error clearing cache: {str(e)}"
         )
