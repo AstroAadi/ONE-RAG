@@ -1,10 +1,6 @@
 """
-Query Route - OPTIMIZED VERSION
-Fixes:
-- Removed task manager overhead (direct execution)
-- Refactored duplicate metadata extraction
-- Standardized error handling
-- Added result caching
+Query Route - MULTI-TENANT VERSION
+All queries now require knowledge_base_id for strict KB isolation
 """
 
 from fastapi import APIRouter, HTTPException, Depends
@@ -19,7 +15,7 @@ from app.core.dependencies import get_user_id, get_database_session
 from app.core.exceptions import (
     SearchError, LLMGenerationError, RAGException
 )
-from app.db.models import QueryLog
+from app.db.models import QueryLog, KnowledgeBase
 import time
 import logging
 from datetime import datetime, timedelta
@@ -31,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/query", tags=["Query"])
 
-# Initialize services (thread-safe)
+# Initialize services
 vector_store = VectorStoreService()
 llm_service = LLMService()
 
@@ -39,56 +35,50 @@ llm_service = LLMService()
 # ==================== QUERY RESULT CACHE ====================
 
 class QueryCache:
-    """Simple in-memory cache for query results with TTL"""
+    """KB-aware query cache"""
     
-    def __init__(self, ttl_seconds: int = 300):  # 5 min default
+    def __init__(self, ttl_seconds: int = 300):
         self.cache = {}
         self.ttl = ttl_seconds
     
-    def _make_key(self, user_id: str, question: str, top_k: int, file_id: str = None) -> str:
-        """Generate cache key"""
-        data = f"{user_id}:{question}:{top_k}:{file_id or 'all'}"
+    def _make_key(self, user_id: str, kb_id: str, question: str, top_k: int, file_id: str = None) -> str:
+        """Generate cache key with KB isolation"""
+        data = f"{user_id}:{kb_id}:{question}:{top_k}:{file_id or 'all'}"
         return hashlib.sha256(data.encode()).hexdigest()
     
-    def get(self, user_id: str, question: str, top_k: int, file_id: str = None) -> dict:
-        """Get cached result if still valid"""
-        key = self._make_key(user_id, question, top_k, file_id)
+    def get(self, user_id: str, kb_id: str, question: str, top_k: int, file_id: str = None) -> dict:
+        """Get cached result"""
+        key = self._make_key(user_id, kb_id, question, top_k, file_id)
         
         if key in self.cache:
             result, timestamp = self.cache[key]
             if datetime.utcnow() - timestamp < timedelta(seconds=self.ttl):
-                logger.info(f"✓ Cache hit for query: {question[:50]}...")
+                logger.info(f"✓ Cache hit for query in KB {kb_id}")
                 return result
             else:
-                # Expired, remove
                 del self.cache[key]
         
         return None
     
-    def set(self, user_id: str, question: str, top_k: int, result: dict, file_id: str = None):
+    def set(self, user_id: str, kb_id: str, question: str, top_k: int, result: dict, file_id: str = None):
         """Cache result"""
-        key = self._make_key(user_id, question, top_k, file_id)
+        key = self._make_key(user_id, kb_id, question, top_k, file_id)
         self.cache[key] = (result, datetime.utcnow())
     
-    def clear_user(self, user_id: str):
-        """Clear all cache entries for a user"""
-        keys_to_delete = []
-        for key, (result, _) in self.cache.items():
-            if key.startswith(hashlib.sha256(f"{user_id}:".encode()).hexdigest()[:16]):
-                keys_to_delete.append(key)
-        
+    def clear_kb(self, kb_id: str):
+        """Clear cache for specific KB"""
+        keys_to_delete = [k for k in self.cache.keys() if kb_id in k]
         for key in keys_to_delete:
             del self.cache[key]
 
 
-# Global cache instance
+# Global cache
 query_cache = QueryCache(ttl_seconds=300)
 
 
 # ==================== HELPER FUNCTIONS ====================
 
 def safe_get_int(metadata: dict, key: str, default: int = 0) -> int:
-    """Safely get integer from metadata"""
     try:
         value = metadata.get(key, default)
         return int(value) if value is not None else default
@@ -97,7 +87,6 @@ def safe_get_int(metadata: dict, key: str, default: int = 0) -> int:
 
 
 def safe_get_str(metadata: dict, key: str, default: str = '') -> str:
-    """Safely get string from metadata"""
     try:
         value = metadata.get(key, default)
         return str(value) if value is not None else default
@@ -106,7 +95,6 @@ def safe_get_str(metadata: dict, key: str, default: str = '') -> str:
 
 
 def safe_get_score(score: float) -> float:
-    """Safely clamp score to valid range [0.0, 1.0]"""
     try:
         return max(0.0, min(1.0, float(score)))
     except (ValueError, TypeError):
@@ -116,16 +104,10 @@ def safe_get_score(score: float) -> float:
 def build_source_documents(
     documents: List[str],
     metadatas: List[Dict],
-    scores: List[float]
+    scores: List[float],
+    knowledge_base_id: str
 ) -> Tuple[List[SourceDocument], str]:
-    """
-    Build source documents and context string
-    
-    Refactored to eliminate code duplication between query and conversation endpoints
-    
-    Returns:
-        Tuple of (source_documents, context_string)
-    """
+    """Build source documents with KB info"""
     sources = []
     context_parts = []
     
@@ -144,12 +126,13 @@ def build_source_documents(
         # Add to context
         context_parts.append(f"{source_header}:\n{doc}\n")
         
-        # Create source document
+        # Create source document with KB info
         sources.append(SourceDocument(
             content=doc[:500] + "..." if len(doc) > 500 else doc,
             full_text=doc,
             chunk_id=safe_get_str(metadata, 'chunk_id', f'chunk_{i}'),
             file_id=safe_get_str(metadata, 'file_id', 'unknown'),
+            knowledge_base_id=safe_get_str(metadata, 'knowledge_base_id', knowledge_base_id),
             filename=safe_get_str(metadata, 'filename', 'unknown'),
             relevance_score=safe_get_score(score),
             page_number=page,
@@ -166,31 +149,35 @@ def build_source_documents(
 def log_query_to_db(
     db: Session,
     user_id: str,
+    kb_id: str,
     question: str,
     answer: str,
     top_k: int,
     chunks_retrieved: int,
     processing_time: float,
     confidence: float,
+    search_type: str,
     conversation_id: str = None
 ):
-    """Log query to database (non-blocking)"""
+    """Log query with KB tracking"""
     try:
         query_log = QueryLog(
             user_id=user_id,
+            knowledge_base_id=kb_id,
             question=question,
             answer=answer,
             top_k=top_k,
             chunks_retrieved=chunks_retrieved,
             processing_time_seconds=processing_time,
             confidence_score=confidence,
+            search_type=search_type,
             queried_at=datetime.utcnow(),
             conversation_id=conversation_id
         )
         db.add(query_log)
         db.commit()
     except Exception as e:
-        logger.warning(f"Failed to log query to database: {e}")
+        logger.warning(f"Failed to log query: {e}")
         db.rollback()
 
 
@@ -203,30 +190,56 @@ async def query_knowledge_base(
     db: Session = Depends(get_database_session)
 ):
     """
-    Query endpoint with DIRECT EXECUTION (no task manager overhead)
+    Query a specific knowledge base
     
-    Optimizations:
-    - Direct execution instead of task manager
-    - Result caching for repeat queries
-    - Refactored metadata extraction
-    - Better error handling
+    NEW: Requires knowledge_base_id (MANDATORY)
+    Ensures strict KB isolation - no cross-KB queries
     
     Headers:
         X-User-ID: User identifier (REQUIRED)
+    
+    Body:
+        question: Question to ask
+        knowledge_base_id: KB to query (REQUIRED)
+        top_k: Number of results (default: 5)
+        file_id: Optional file filter
+        search_type: dense/sparse/hybrid (default: hybrid)
+        temperature: LLM temperature (optional)
+    
+    Returns:
+        QueryResponse with answer, sources, and KB info
     """
     start_time = time.time()
     
     try:
+        # CRITICAL: Verify KB ownership
+        kb = db.query(KnowledgeBase).filter(
+            KnowledgeBase.knowledge_base_id == request.knowledge_base_id,
+            KnowledgeBase.user_id == user_id
+        ).first()
+        
+        if not kb:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Knowledge base not found or access denied: {request.knowledge_base_id}"
+            )
+        
+        # Update last accessed
+        kb.last_accessed = datetime.utcnow()
+        db.commit()
+        
         search_type = request.search_type or SearchType.HYBRID
         
         logger.info(
-            f"Query from user {user_id}: '{request.question[:50]}...', "
+            f"Query: KB='{kb.knowledge_base_name}' ({kb.knowledge_base_id}), "
+            f"user={user_id}, query='{request.question[:50]}...', "
             f"search_type={search_type.value}, top_k={request.top_k}"
         )
         
-        # Check cache first
+        # Check cache
         cached_result = query_cache.get(
             user_id, 
+            request.knowledge_base_id,
             request.question, 
             request.top_k,
             request.file_id
@@ -236,13 +249,13 @@ async def query_knowledge_base(
             logger.info("Returning cached result")
             return QueryResponse(**cached_result)
         
-        # === DIRECT EXECUTION (NO TASK MANAGER) ===
-        # Vector search
+        # Vector search WITH KB ISOLATION
         try:
             documents, metadatas, scores = vector_store.search(
                 query=request.question,
-                top_k=request.top_k,
                 user_id=user_id,
+                knowledge_base_id=request.knowledge_base_id,  # MANDATORY
+                top_k=request.top_k,
                 file_id=request.file_id,
                 search_type=search_type.value
             )
@@ -252,11 +265,14 @@ async def query_knowledge_base(
         
         if not documents:
             raise SearchError(
-                "No documents found. Please upload and process documents first."
+                f"No documents found in knowledge base '{kb.knowledge_base_name}'. "
+                f"Please upload and process documents first."
             )
         
-        # Build context and sources (refactored)
-        sources, context = build_source_documents(documents, metadatas, scores)
+        # Build context and sources
+        sources, context = build_source_documents(
+            documents, metadatas, scores, request.knowledge_base_id
+        )
         
         # Generate answer
         try:
@@ -289,28 +305,30 @@ async def query_knowledge_base(
             "sources": sources,
             "processing_time": round(processing_time, 2),
             "search_type": search_type,
-            "confidence_score": round(confidence, 3)
+            "confidence_score": round(confidence, 3),
+            "knowledge_base_id": request.knowledge_base_id
         }
         
         # Cache result
         query_cache.set(
             user_id,
+            request.knowledge_base_id,
             request.question,
             request.top_k,
             response_data,
             request.file_id
         )
         
-        # Log to database (async, non-blocking)
+        # Log to database
         log_query_to_db(
-            db, user_id, request.question, answer,
+            db, user_id, request.knowledge_base_id, request.question, answer,
             request.top_k, len(documents), processing_time,
-            confidence, None
+            confidence, search_type.value, None
         )
         
         logger.info(
-            f"✓ Query completed in {processing_time:.2f}s, "
-            f"confidence={confidence:.2f}"
+            f"✓ Query completed: KB='{kb.knowledge_base_name}', "
+            f"time={processing_time:.2f}s, confidence={confidence:.2f}"
         )
         
         return QueryResponse(**response_data)
@@ -336,26 +354,52 @@ async def query_with_conversation(
     db: Session = Depends(get_database_session)
 ):
     """
-    Conversational query with DIRECT EXECUTION
+    Conversational query with KB context
     
-    Similar to standard query but maintains conversation history
+    Maintains conversation history within a KB context
+    
+    Headers:
+        X-User-ID: User identifier (REQUIRED)
+    
+    Body:
+        Same as /query plus:
+        conversation_id: Unique conversation identifier
+    
+    Returns:
+        QueryResponse with conversation context
     """
     start_time = time.time()
     
     try:
+        # Verify KB ownership
+        kb = db.query(KnowledgeBase).filter(
+            KnowledgeBase.knowledge_base_id == request.knowledge_base_id,
+            KnowledgeBase.user_id == user_id
+        ).first()
+        
+        if not kb:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Knowledge base not found or access denied"
+            )
+        
+        kb.last_accessed = datetime.utcnow()
+        db.commit()
+        
         search_type = request.search_type or SearchType.HYBRID
         
         logger.info(
-            f"Conversation query: conv_id={request.conversation_id}, "
-            f"search_type={search_type.value}"
+            f"Conversation query: KB='{kb.knowledge_base_name}', "
+            f"conv_id={request.conversation_id}, search_type={search_type.value}"
         )
         
-        # Vector search (direct execution)
+        # Vector search with KB isolation
         try:
             documents, metadatas, scores = vector_store.search(
                 query=request.question,
-                top_k=request.top_k,
                 user_id=user_id,
+                knowledge_base_id=request.knowledge_base_id,
+                top_k=request.top_k,
                 file_id=request.file_id,
                 search_type=search_type.value
             )
@@ -364,10 +408,12 @@ async def query_with_conversation(
             raise SearchError(f"Search failed: {str(e)}")
         
         if not documents:
-            raise SearchError("No documents found")
+            raise SearchError(f"No documents found in KB '{kb.knowledge_base_name}'")
         
-        # Build context and sources (using refactored function)
-        sources, context = build_source_documents(documents, metadatas, scores)
+        # Build context and sources
+        sources, context = build_source_documents(
+            documents, metadatas, scores, request.knowledge_base_id
+        )
         
         # Generate answer with conversation history
         try:
@@ -400,18 +446,20 @@ async def query_with_conversation(
             "processing_time": round(processing_time, 2),
             "search_type": search_type,
             "confidence_score": round(confidence, 3),
+            "knowledge_base_id": request.knowledge_base_id,
             "conversation_id": request.conversation_id
         }
         
-        # Log to database
+        # Log to database with conversation tracking
         log_query_to_db(
-            db, user_id, request.question, answer,
+            db, user_id, request.knowledge_base_id, request.question, answer,
             request.top_k, len(documents), processing_time,
-            confidence, request.conversation_id
+            confidence, search_type.value, request.conversation_id
         )
         
         logger.info(
-            f"✓ Conversation query completed in {processing_time:.2f}s"
+            f"✓ Conversation query completed: KB='{kb.knowledge_base_name}', "
+            f"conv={request.conversation_id}, time={processing_time:.2f}s"
         )
         
         return QueryResponse(**response_data)
@@ -476,16 +524,32 @@ async def get_conversation_history(
         messages.reverse()
         
         history = []
+        kb_id = None
         for msg in messages:
             history.append({
                 "role": msg.role,
                 "content": msg.content,
                 "timestamp": msg.created_at.isoformat()
             })
+            if not kb_id and msg.knowledge_base_id:
+                kb_id = msg.knowledge_base_id
+        
+        # Get KB info if available
+        kb_info = None
+        if kb_id:
+            kb = db.query(KnowledgeBase).filter(
+                KnowledgeBase.knowledge_base_id == kb_id
+            ).first()
+            if kb:
+                kb_info = {
+                    "knowledge_base_id": kb.knowledge_base_id,
+                    "knowledge_base_name": kb.knowledge_base_name
+                }
         
         return {
             "conversation_id": conversation_id,
             "user_id": user_id,
+            "knowledge_base": kb_info,
             "message_count": len(history),
             "messages": history
         }
@@ -502,37 +566,75 @@ async def get_conversation_history(
 async def get_my_queries(
     user_id: str = Depends(get_user_id),
     db: Session = Depends(get_database_session),
+    knowledge_base_id: str = None,
     limit: int = 20
 ):
-    """Get recent queries for current user"""
+    """
+    Get recent queries for current user
+    
+    Optional KB filter to see queries for specific KB
+    """
     try:
         from sqlalchemy import desc
         
         limit = min(max(1, limit), 100)
         
-        queries = db.query(QueryLog).filter(
+        query = db.query(QueryLog).filter(
             QueryLog.user_id == user_id
-        ).order_by(
+        )
+        
+        # Optional KB filter
+        if knowledge_base_id:
+            query = query.filter(QueryLog.knowledge_base_id == knowledge_base_id)
+            
+            # Verify KB access
+            kb = db.query(KnowledgeBase).filter(
+                KnowledgeBase.knowledge_base_id == knowledge_base_id,
+                KnowledgeBase.user_id == user_id
+            ).first()
+            
+            if not kb:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Knowledge base not found or access denied"
+                )
+        
+        queries = query.order_by(
             desc(QueryLog.queried_at)
         ).limit(limit).all()
         
         query_list = []
-        for query in queries:
+        for q in queries:
+            # Get KB name
+            kb_name = "Unknown"
+            if q.knowledge_base_id:
+                kb = db.query(KnowledgeBase).filter(
+                    KnowledgeBase.knowledge_base_id == q.knowledge_base_id
+                ).first()
+                if kb:
+                    kb_name = kb.knowledge_base_name
+            
             query_list.append({
-                "id": query.id,
-                "question": query.question[:100] + "..." if len(query.question) > 100 else query.question,
-                "queried_at": query.queried_at.isoformat(),
-                "processing_time": query.processing_time_seconds,
-                "confidence_score": query.confidence_score,
-                "conversation_id": query.conversation_id
+                "id": q.id,
+                "question": q.question[:100] + "..." if len(q.question) > 100 else q.question,
+                "knowledge_base_id": q.knowledge_base_id,
+                "knowledge_base_name": kb_name,
+                "queried_at": q.queried_at.isoformat(),
+                "processing_time": q.processing_time_seconds,
+                "confidence_score": q.confidence_score,
+                "search_type": q.search_type,
+                "conversation_id": q.conversation_id
             })
         
         return {
             "user_id": user_id,
+            "knowledge_base_id": knowledge_base_id,
             "total_queries": len(query_list),
             "queries": query_list
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error retrieving queries: {e}")
         raise HTTPException(
@@ -543,16 +645,29 @@ async def get_my_queries(
 
 @router.post("/clear-cache")
 async def clear_query_cache(
-    user_id: str = Depends(get_user_id)
+    user_id: str = Depends(get_user_id),
+    knowledge_base_id: str = None
 ):
-    """Clear query cache for current user"""
+    """
+    Clear query cache
+    
+    If KB ID provided, clears cache for that KB only
+    Otherwise clears all cache for user
+    """
     try:
-        query_cache.clear_user(user_id)
-        
-        return {
-            "message": f"Query cache cleared for user {user_id}",
-            "user_id": user_id
-        }
+        if knowledge_base_id:
+            query_cache.clear_kb(knowledge_base_id)
+            return {
+                "message": f"Cache cleared for KB {knowledge_base_id}",
+                "knowledge_base_id": knowledge_base_id
+            }
+        else:
+            # Clear all - would need to implement user-specific clearing
+            query_cache.cache.clear()
+            return {
+                "message": "All cache cleared",
+                "user_id": user_id
+            }
     except Exception as e:
         logger.error(f"Error clearing cache: {e}")
         raise HTTPException(

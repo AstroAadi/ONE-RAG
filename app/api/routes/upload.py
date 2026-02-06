@@ -1,14 +1,12 @@
 """
-Upload Route - FIXED VERSION
-Fixes:
-- Corrected task submission (no argument duplication)
-- Simplified progress tracking
-- Better error handling
+Upload Route - MULTI-TENANT VERSION
+Added Knowledge Base support for document uploads
 """
 
 from typing import Optional
-from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Query
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Query, Form
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from pathlib import Path
 import uuid
 import shutil
@@ -17,7 +15,7 @@ import logging
 import json
 
 from app.models.schemas import (
-    FileUploadResponse, ProcessingStatus, ChunkingStrategy
+    FileUploadResponse, ProcessingStatus, ChunkingStrategy, DocumentProcessResponse
 )
 from app.utils.file_validator import FileValidator
 from app.core.config import settings
@@ -28,7 +26,7 @@ from app.core.exceptions import (
 )
 from app.db.models import (
     FileMetadata, ProcessingStatus as DBProcessingStatus,
-    FileType, ChunkingStrategyEnum
+    FileType, ChunkingStrategyEnum, KnowledgeBase
 )
 from app.core.task_manager import get_task_manager, TaskType, ProcessingStage
 
@@ -40,10 +38,27 @@ router = APIRouter(prefix="/api/upload", tags=["Upload"])
 @router.post("/", response_model=FileUploadResponse)
 async def upload_file(
     file: UploadFile = File(...),
+    knowledge_base_name: str = Form(...),  # NEW: Required KB name
     user_id: str = Depends(get_user_id),
     db: Session = Depends(get_database_session)
 ):
-    """Upload document file (returns immediately)"""
+    """
+    Upload document file to a knowledge base
+    
+    NEW: Requires knowledge_base_name
+    - If KB exists: adds file to that KB
+    - If KB doesn't exist: creates new KB and adds file
+    
+    Headers:
+        X-User-ID: User identifier (REQUIRED)
+    
+    Form Data:
+        file: Document file
+        knowledge_base_name: Name of the knowledge base (REQUIRED)
+    
+    Returns:
+        File metadata including KB information
+    """
     
     # Validate filename
     is_valid_name, name_error = FileValidator.validate_filename(file.filename)
@@ -54,6 +69,22 @@ async def upload_file(
     is_valid, error_message = FileValidator.validate_file(file)
     if not is_valid:
         raise HTTPException(status_code=400, detail=error_message)
+    
+    # Validate KB name
+    if not knowledge_base_name or not knowledge_base_name.strip():
+        raise HTTPException(status_code=400, detail="Knowledge base name cannot be empty")
+    
+    kb_name_stripped = knowledge_base_name.strip()
+    if len(kb_name_stripped) > 255:
+        raise HTTPException(status_code=400, detail="Knowledge base name too long (max 255 characters)")
+    
+    # Check for invalid characters in KB name
+    invalid_chars = ['/', '\\', '<', '>', ':', '"', '|', '?', '*']
+    if any(char in kb_name_stripped for char in invalid_chars):
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Knowledge base name contains invalid characters: {invalid_chars}"
+        )
     
     # Generate unique file ID
     file_id = str(uuid.uuid4())
@@ -85,6 +116,33 @@ async def upload_file(
             upload_path.unlink()
             raise FileSizeError(size_error)
         
+        # Get or create knowledge base
+        normalized_kb_name = kb_name_stripped.lower()
+        
+        kb = db.query(KnowledgeBase).filter(
+            KnowledgeBase.user_id == user_id,
+            KnowledgeBase.knowledge_base_name_normalized == normalized_kb_name
+        ).first()
+        
+        if not kb:
+            # Create new knowledge base
+            kb_id = str(uuid.uuid4())
+            kb = KnowledgeBase(
+                knowledge_base_id=kb_id,
+                user_id=user_id,
+                knowledge_base_name=kb_name_stripped,
+                knowledge_base_name_normalized=normalized_kb_name,
+                document_count=0,
+                total_chunks=0,
+                total_size_bytes=0,
+                created_at=datetime.utcnow()
+            )
+            db.add(kb)
+            db.flush()  # Get the KB ID before committing
+            logger.info(f"✓ Created new KB: {kb.knowledge_base_id} - '{kb.knowledge_base_name}'")
+        else:
+            logger.info(f"✓ Using existing KB: {kb.knowledge_base_id} - '{kb.knowledge_base_name}'")
+        
         # Get file category
         file_category = FileValidator.get_file_category(safe_filename)
         
@@ -98,10 +156,11 @@ async def upload_file(
         }
         file_type_enum = file_type_map.get(file_category, FileType.OTHER)
         
-        # Save to database
+        # Save file metadata with KB association
         file_metadata = FileMetadata(
             file_id=file_id,
             user_id=user_id,
+            knowledge_base_id=kb.knowledge_base_id,  # NEW: KB association
             original_filename=file.filename,
             safe_filename=unique_filename,
             file_extension=file_extension,
@@ -116,16 +175,21 @@ async def upload_file(
         db.commit()
         db.refresh(file_metadata)
         
-        logger.info(f"✅ Database record created: file_id={file_id}, user_id={user_id}")
+        logger.info(
+            f"✅ File uploaded: file_id={file_id}, kb_id={kb.knowledge_base_id}, "
+            f"kb_name='{kb.knowledge_base_name}', user_id={user_id}"
+        )
         
         return FileUploadResponse(
             file_id=file_id,
+            knowledge_base_id=kb.knowledge_base_id,
+            knowledge_base_name=kb.knowledge_base_name,
             filename=safe_filename,
             file_type=file_extension,
             file_size_bytes=file_size,
             upload_time=datetime.now(),
             status=ProcessingStatus.UPLOADED,
-            message=f"File '{safe_filename}' uploaded. Use /process/{file_id} to process."
+            message=f"File '{safe_filename}' uploaded to KB '{kb.knowledge_base_name}'. Use /process/{file_id} to process."
         )
     
     except (FileSizeError, FileTypeError) as e:
@@ -135,11 +199,11 @@ async def upload_file(
         db.rollback()
         if upload_path.exists():
             upload_path.unlink()
-        logger.error(f"❌ Upload error: {str(e)}")
+        logger.error(f"❌ Upload error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Upload error: {str(e)}")
 
 
-@router.post("/process/{file_id}")
+@router.post("/process/{file_id}", response_model=dict)
 async def process_and_index_document(
     file_id: str,
     user_id: str = Depends(get_user_id),
@@ -149,12 +213,22 @@ async def process_and_index_document(
     chunk_overlap_tokens: Optional[int] = Query(default=None, ge=0, le=500)
 ):
     """
-    Process document in background
+    Process document in background with KB context
     
-    FIXED: Proper argument passing - all args in kwargs, no duplication
+    Headers:
+        X-User-ID: User identifier (REQUIRED)
+    
+    Args:
+        file_id: File to process
+        chunking_strategy: Strategy to use
+        target_chunk_tokens: Target chunk size
+        chunk_overlap_tokens: Overlap size
+    
+    Returns:
+        Task information for tracking progress
     """
     
-    # Get file metadata
+    # Get file metadata with KB info
     file_metadata = db.query(FileMetadata).filter(
         FileMetadata.file_id == file_id,
         FileMetadata.user_id == user_id
@@ -163,10 +237,22 @@ async def process_and_index_document(
     if not file_metadata:
         raise HTTPException(status_code=404, detail=f"File not found: {file_id}")
     
+    # Verify KB exists
+    kb = db.query(KnowledgeBase).filter(
+        KnowledgeBase.knowledge_base_id == file_metadata.knowledge_base_id,
+        KnowledgeBase.user_id == user_id
+    ).first()
+    
+    if not kb:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Knowledge base not found for file: {file_id}"
+        )
+    
     if file_metadata.status == DBProcessingStatus.COMPLETED:
         raise HTTPException(
             status_code=400,
-            detail=f"File already processed. Check /knowledge-base/document/{file_id}"
+            detail=f"File already processed. Check /knowledge-bases/{kb.knowledge_base_id}"
         )
     
     if file_metadata.status == DBProcessingStatus.PROCESSING:
@@ -181,20 +267,23 @@ async def process_and_index_document(
     
     logger.info(
         f"🔄 Starting document processing: file_id={file_id}, "
+        f"kb_id={kb.knowledge_base_id}, kb_name='{kb.knowledge_base_name}', "
         f"user_id={user_id}, strategy={chunking_strategy.value}"
     )
     
     # Get task manager
     task_manager = get_task_manager()
     
-    # FIXED: All arguments in kwargs, no duplication!
+    # Submit task with ALL required parameters
     task_id = task_manager.submit_task(
         func=process_document_with_progress,
         task_type=TaskType.IO_BOUND,
-        description=f"Process: {file_metadata.safe_filename}",
+        description=f"Process: {file_metadata.safe_filename} (KB: {kb.knowledge_base_name})",
         # ALL function arguments as kwargs:
         user_id=user_id,
         file_id=file_id,
+        knowledge_base_id=kb.knowledge_base_id,
+        knowledge_base_name=kb.knowledge_base_name,
         chunking_strategy=chunking_strategy.value,
         target_chunk_tokens=target_chunk_tokens,
         chunk_overlap_tokens=chunk_overlap_tokens,
@@ -202,13 +291,15 @@ async def process_and_index_document(
         safe_filename=file_metadata.safe_filename
     )
     
-    logger.info(f"✅ Task submitted: task_id={task_id}, file_id={file_id}")
+    logger.info(f"✅ Task submitted: task_id={task_id}, file_id={file_id}, kb_id={kb.knowledge_base_id}")
     
     return {
         "task_id": task_id,
         "file_id": file_id,
+        "knowledge_base_id": kb.knowledge_base_id,
+        "knowledge_base_name": kb.knowledge_base_name,
         "status": "processing",
-        "message": "Document processing started",
+        "message": f"Document processing started in KB '{kb.knowledge_base_name}'",
         "status_endpoint": f"/api/tasks/{task_id}",
         "progress_endpoint": f"/api/tasks/{task_id}"
     }
@@ -217,45 +308,46 @@ async def process_and_index_document(
 def process_document_with_progress(
     user_id: str,
     file_id: str,
+    knowledge_base_id: str,
+    knowledge_base_name: str,
     chunking_strategy: str,
     target_chunk_tokens: Optional[int],
     chunk_overlap_tokens: Optional[int],
     storage_path: str,
     safe_filename: str,
-    progress_callback=None,  # Injected by task manager
-    task_id=None  # Injected by task manager
+    progress_callback=None,
+    task_id=None
 ):
     """
-    Process document with simplified progress tracking
+    Process document with KB context
     
-    All parameters passed as keyword arguments from submit_task
-    progress_callback and task_id are injected by task manager
+    NEW: Includes knowledge_base_id and knowledge_base_name
+    Passes KB info to vector store for proper isolation
     """
     import time
     from pathlib import Path
     from datetime import datetime
     
-    logger.info(f"🚀 [Task {task_id}] Starting processing for {file_id}")
+    logger.info(f"🚀 [Task {task_id}] Processing {file_id} in KB {knowledge_base_id}")
     
     start_time = time.time()
     
     try:
-        # Import here to avoid serialization issues
+        # Import services
         from app.services.extraction.extractor_factory import ExtractorFactory
         from app.utils.markdown_converter import MarkdownConverter
         from app.services.chunking_service import EnhancedChunkingService
         from app.services.vector_store_service import VectorStoreService
         from app.core.database import get_db_context
-        from app.db.models import FileMetadata, ChunkMetadata, ChunkingStrategyEnum
+        from app.db.models import FileMetadata, ChunkMetadata, ChunkingStrategyEnum, KnowledgeBase
         from app.models.schemas import ChunkingStrategy as SchemaChunkingStrategy
+        from sqlalchemy import func
         
-        # SIMPLIFIED: Update progress at major milestones only
         if progress_callback:
             progress_callback(10.0, ProcessingStage.PROCESSING)
         
         logger.info(f"📊 [Task {task_id}] Stage: Document Extraction")
         
-        # Get database session
         with get_db_context() as db:
             file_metadata = db.query(FileMetadata).filter(
                 FileMetadata.file_id == file_id
@@ -263,6 +355,14 @@ def process_document_with_progress(
             
             if not file_metadata:
                 raise ValueError(f"File not found: {file_id}")
+            
+            # Verify KB
+            kb = db.query(KnowledgeBase).filter(
+                KnowledgeBase.knowledge_base_id == knowledge_base_id
+            ).first()
+            
+            if not kb:
+                raise ValueError(f"Knowledge base not found: {knowledge_base_id}")
             
             # EXTRACTION
             file_extension = Path(storage_path).suffix.lstrip('.')
@@ -294,7 +394,7 @@ def process_document_with_progress(
             
             # SAVE MARKDOWN
             markdown_converter = MarkdownConverter()
-            user_markdown_dir = Path(settings.markdown_dir) / user_id
+            user_markdown_dir = Path(settings.markdown_dir) / user_id / knowledge_base_id
             user_markdown_dir.mkdir(parents=True, exist_ok=True)
             markdown_path = user_markdown_dir / f"{file_id}.md"
             
@@ -319,13 +419,15 @@ def process_document_with_progress(
             
             strategy_enum = SchemaChunkingStrategy(chunking_strategy)
             
-            chunking_start = time.time()
-            
             base_metadata = {
                 'user_id': user_id,
                 'file_id': file_id,
-                'filename': safe_filename
+                'filename': safe_filename,
+                'knowledge_base_id': knowledge_base_id,
+                'knowledge_base_name': knowledge_base_name
             }
+            
+            chunking_start = time.time()
             
             chunks = chunking_service.split_document_into_chunks(
                 markdown_content,
@@ -340,23 +442,27 @@ def process_document_with_progress(
             if progress_callback:
                 progress_callback(70.0, ProcessingStage.PROCESSING)
             
-            # EMBEDDING & INDEXING
-            logger.info(f"📊 [Task {task_id}] Stage: Embedding & Indexing")
+            # EMBEDDING & INDEXING WITH KB METADATA
+            logger.info(f"📊 [Task {task_id}] Stage: Embedding & Indexing to KB '{knowledge_base_name}'")
             
             vector_store = VectorStoreService()
             
             indexing_start = time.time()
             
+            # NEW: Pass KB info to vector store
             chunks_added = vector_store.add_document_chunks(
                 chunks,
                 file_id,
                 safe_filename,
+                knowledge_base_id=knowledge_base_id,
+                knowledge_base_name=knowledge_base_name,
+                user_id=user_id,
                 structured_data={'filename': safe_filename, 'file_id': file_id}
             )
             
             indexing_time = time.time() - indexing_start
             
-            logger.info(f"✅ [Task {task_id}] Indexed {chunks_added} chunks")
+            logger.info(f"✅ [Task {task_id}] Indexed {chunks_added} chunks to KB '{knowledge_base_name}'")
             
             if progress_callback:
                 progress_callback(90.0, ProcessingStage.PROCESSING)
@@ -409,6 +515,23 @@ def process_document_with_progress(
             }
             file_metadata.processing_metadata = json.dumps(processing_meta)
             
+            # UPDATE KNOWLEDGE BASE STATISTICS
+            kb.document_count = db.query(func.count(FileMetadata.file_id)).filter(
+                FileMetadata.knowledge_base_id == knowledge_base_id,
+                FileMetadata.status == DBProcessingStatus.COMPLETED
+            ).scalar()
+            
+            kb.total_chunks = db.query(func.sum(FileMetadata.chunks_created)).filter(
+                FileMetadata.knowledge_base_id == knowledge_base_id,
+                FileMetadata.status == DBProcessingStatus.COMPLETED
+            ).scalar() or 0
+            
+            kb.total_size_bytes = db.query(func.sum(FileMetadata.file_size_bytes)).filter(
+                FileMetadata.knowledge_base_id == knowledge_base_id
+            ).scalar() or 0
+            
+            kb.updated_at = datetime.utcnow()
+            
             db.commit()
             
             total_time = time.time() - start_time
@@ -418,12 +541,16 @@ def process_document_with_progress(
             
             logger.info(
                 f"🎉 [Task {task_id}] COMPLETE in {total_time:.2f}s\n"
-                f"   Chunks: {chunks_added}, Pages: {total_pages}"
+                f"   KB: {knowledge_base_name} ({knowledge_base_id})\n"
+                f"   Chunks: {chunks_added}, Pages: {total_pages}\n"
+                f"   KB Stats: {kb.document_count} docs, {kb.total_chunks} total chunks"
             )
             
             return {
                 'success': True,
                 'file_id': file_id,
+                'knowledge_base_id': knowledge_base_id,
+                'knowledge_base_name': knowledge_base_name,
                 'filename': safe_filename,
                 'chunks_created': chunks_added,
                 'total_pages': total_pages,
@@ -435,6 +562,7 @@ def process_document_with_progress(
         
         # Update database
         try:
+            from app.core.database import get_db_context
             with get_db_context() as db:
                 file_metadata = db.query(FileMetadata).filter(
                     FileMetadata.file_id == file_id
@@ -456,7 +584,7 @@ async def get_processing_status(
     user_id: str = Depends(get_user_id),
     db: Session = Depends(get_database_session)
 ):
-    """Get processing status for a file"""
+    """Get processing status for a file with KB info"""
     file_metadata = db.query(FileMetadata).filter(
         FileMetadata.file_id == file_id,
         FileMetadata.user_id == user_id
@@ -465,9 +593,16 @@ async def get_processing_status(
     if not file_metadata:
         raise HTTPException(status_code=404, detail=f"File not found: {file_id}")
     
+    # Get KB info
+    kb = db.query(KnowledgeBase).filter(
+        KnowledgeBase.knowledge_base_id == file_metadata.knowledge_base_id
+    ).first()
+    
     return {
         "file_id": file_id,
         "filename": file_metadata.safe_filename,
+        "knowledge_base_id": file_metadata.knowledge_base_id,
+        "knowledge_base_name": kb.knowledge_base_name if kb else "Unknown",
         "status": file_metadata.status.value,
         "uploaded_at": file_metadata.uploaded_at,
         "processed_at": file_metadata.processed_at,

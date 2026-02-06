@@ -432,3 +432,4 @@ Answer:"""
     def get_current_model(self) -> str:
         """Get current model ID"""
         return self.model_id
+    

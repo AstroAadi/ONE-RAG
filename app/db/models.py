@@ -1,11 +1,12 @@
 """
-Database Models for RAG System
-Tracks file metadata, processing status, user ownership, and chunking strategy
-Updated: Added chunking_strategy field to FileMetadata
+Database Models for RAG System - MULTI-TENANT VERSION
+Added KnowledgeBase model for multi-tenant isolation
+Each user can create multiple knowledge bases
 """
 
 from sqlalchemy import (
-    Column, String, Integer, DateTime, Boolean, Float, Text, ForeignKey, Enum
+    Column, String, Integer, DateTime, Boolean, Float, Text, ForeignKey, Enum,
+    Index, UniqueConstraint
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
@@ -42,17 +43,83 @@ class ChunkingStrategyEnum(str, enum.Enum):
     SEMANTIC = "semantic"
 
 
+# ==================== NEW: KNOWLEDGE BASE MODEL ====================
+
+class KnowledgeBase(Base):
+    """
+    Knowledge Base Model - Multi-tenant Isolation
+    
+    Each user can create multiple knowledge bases
+    Knowledge bases are strictly isolated by user_id
+    """
+    __tablename__ = "knowledge_bases"
+    
+    # Primary identifiers
+    knowledge_base_id = Column(String(36), primary_key=True, index=True)
+    user_id = Column(String(100), nullable=False, index=True)
+    
+    # Knowledge base information
+    knowledge_base_name = Column(String(255), nullable=False)
+    knowledge_base_name_normalized = Column(String(255), nullable=False, index=True)
+    description = Column(Text, nullable=True)
+    
+    # Statistics
+    document_count = Column(Integer, default=0)
+    total_chunks = Column(Integer, default=0)
+    total_size_bytes = Column(Integer, default=0)
+    
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_accessed = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    files = relationship("FileMetadata", back_populates="knowledge_base", cascade="all, delete-orphan")
+    
+    # Unique constraint: user can't have duplicate KB names
+    __table_args__ = (
+        UniqueConstraint('user_id', 'knowledge_base_name_normalized', name='uix_user_kb_name'),
+        Index('idx_user_kb', 'user_id', 'knowledge_base_id'),
+    )
+    
+    def __repr__(self) -> str:
+        return f"<KnowledgeBase(id={self.knowledge_base_id}, user={self.user_id}, name={self.knowledge_base_name})>"
+    
+    def to_dict(self) -> dict:
+        """Convert to dictionary"""
+        return {
+            "knowledge_base_id": self.knowledge_base_id,
+            "user_id": self.user_id,
+            "knowledge_base_name": self.knowledge_base_name,
+            "description": self.description,
+            "document_count": self.document_count,
+            "total_chunks": self.total_chunks,
+            "total_size_bytes": self.total_size_bytes,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "last_accessed": self.last_accessed.isoformat() if self.last_accessed else None
+        }
+
+
+# ==================== UPDATED: FILE METADATA MODEL ====================
+
 class FileMetadata(Base):
     """
-    File metadata table with user isolation and chunking strategy
+    File metadata table with KB isolation
     
-    Tracks all uploaded files, their processing status, and chunking method used
+    Each file belongs to exactly one knowledge base
     """
     __tablename__ = "file_metadata"
     
     # Primary identifiers
     file_id = Column(String(36), primary_key=True, index=True)
     user_id = Column(String(100), nullable=False, index=True)
+    knowledge_base_id = Column(
+        String(36), 
+        ForeignKey("knowledge_bases.knowledge_base_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True
+    )
     
     # File information
     original_filename = Column(String(500), nullable=False)
@@ -70,7 +137,7 @@ class FileMetadata(Base):
     chunks_created = Column(Integer, default=0)
     total_pages = Column(Integer, default=0)
     
-    # NEW: Chunking strategy
+    # Chunking strategy
     chunking_strategy = Column(
         Enum(ChunkingStrategyEnum),
         default=ChunkingStrategyEnum.FIXED_SIZE,
@@ -84,8 +151,8 @@ class FileMetadata(Base):
     processed_at = Column(DateTime, nullable=True)
     last_accessed = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
-    # Processing metadata (JSON-like text field)
-    processing_metadata = Column(Text, nullable=True)  # Store JSON string
+    # Processing metadata
+    processing_metadata = Column(Text, nullable=True)
     error_message = Column(Text, nullable=True)
     
     # Statistics
@@ -95,15 +162,24 @@ class FileMetadata(Base):
     
     # Relationships
     chunks = relationship("ChunkMetadata", back_populates="file", cascade="all, delete-orphan")
+    knowledge_base = relationship("KnowledgeBase", back_populates="files")
+    
+    # Indexes for performance
+    __table_args__ = (
+        Index('idx_user_kb_file', 'user_id', 'knowledge_base_id', 'file_id'),
+        Index('idx_kb_status', 'knowledge_base_id', 'status'),
+    )
     
     def __repr__(self) -> str:
-        return f"<FileMetadata(file_id={self.file_id}, user_id={self.user_id}, filename={self.original_filename})>"
+        return f"<FileMetadata(file_id={self.file_id}, kb={self.knowledge_base_id}, filename={self.original_filename})>"
     
     def to_dict(self) -> dict:
         """Convert to dictionary"""
         return {
             "file_id": self.file_id,
             "user_id": self.user_id,
+            "knowledge_base_id": self.knowledge_base_id,
+            "filename": self.original_filename,  # Map to 'filename' for DocumentInfo schema
             "original_filename": self.original_filename,
             "file_extension": self.file_extension,
             "file_type": self.file_type.value if self.file_type else None,
@@ -139,7 +215,7 @@ class ChunkMetadata(Base):
     
     # Chunk information
     chunk_index = Column(Integer, nullable=False)
-    chunk_type = Column(String(20), default="text")  # text, image, table, chart
+    chunk_type = Column(String(20), default="text")
     char_count = Column(Integer, nullable=False)
     page_number = Column(Integer, default=0)
     
@@ -155,15 +231,16 @@ class ChunkMetadata(Base):
 
 class QueryLog(Base):
     """
-    Query logging table for monitoring and analytics
+    Query logging table with KB tracking
     """
     __tablename__ = "query_logs"
     
     # Primary identifier
     id = Column(Integer, primary_key=True, autoincrement=True)
     
-    # User information
+    # User and KB information
     user_id = Column(String(100), nullable=False, index=True)
+    knowledge_base_id = Column(String(36), nullable=True, index=True)
     
     # Query information
     question = Column(Text, nullable=False)
@@ -171,6 +248,7 @@ class QueryLog(Base):
     
     # Search parameters
     top_k = Column(Integer, default=5)
+    search_type = Column(String(20), default="hybrid")
     
     # Results
     chunks_retrieved = Column(Integer, default=0)
@@ -183,14 +261,18 @@ class QueryLog(Base):
     # Optional conversation tracking
     conversation_id = Column(String(100), nullable=True, index=True)
     
+    # Indexes
+    __table_args__ = (
+        Index('idx_user_kb_query', 'user_id', 'knowledge_base_id'),
+    )
+    
     def __repr__(self) -> str:
-        return f"<QueryLog(id={self.id}, user_id={self.user_id}, question={self.question[:50]})>"
+        return f"<QueryLog(id={self.id}, user={self.user_id}, kb={self.knowledge_base_id})>"
 
 
 class ConversationHistory(Base):
     """
-    Conversation history table
-    Stores multi-turn conversations
+    Conversation history table with KB tracking
     """
     __tablename__ = "conversation_history"
     
@@ -200,13 +282,19 @@ class ConversationHistory(Base):
     # Identifiers
     conversation_id = Column(String(100), nullable=False, index=True)
     user_id = Column(String(100), nullable=False, index=True)
+    knowledge_base_id = Column(String(36), nullable=True, index=True)
     
     # Message information
-    role = Column(String(20), nullable=False)  # 'user' or 'assistant'
+    role = Column(String(20), nullable=False)
     content = Column(Text, nullable=False)
     
     # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    
+    # Indexes
+    __table_args__ = (
+        Index('idx_conv_user_kb', 'conversation_id', 'user_id', 'knowledge_base_id'),
+    )
     
     def __repr__(self) -> str:
         return f"<ConversationHistory(conversation_id={self.conversation_id}, role={self.role})>"

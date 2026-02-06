@@ -27,7 +27,7 @@ import shutil
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.datamodel.base_models import InputFormat
-
+from app.core.config import settings 
 from ..base_extractor import BaseExtractor
 
 logger = logging.getLogger(__name__)
@@ -246,9 +246,16 @@ class PDFExtractor(BaseExtractor):
         try:
             # Use minimal options for speed
             pipeline_options = PdfPipelineOptions()
-            pipeline_options.do_ocr = False  # Faster
+            pipeline_options.do_ocr = False  # Faster - don't need OCR for page count
             pipeline_options.do_table_structure = False  # Faster
             pipeline_options.generate_picture_images = False  # Faster
+            
+            # Still configure GPU for consistency (though not used in this minimal mode)
+            if self.is_gpu_available:
+                pipeline_options.ocr_options = {
+                    'use_gpu': True,
+                    'gpu_id': 0
+                }
             
             converter = DocumentConverter(
                 format_options={
@@ -632,12 +639,24 @@ class PDFExtractor(BaseExtractor):
         return image_dir
     
     def _extract_with_docling(self, file_path: str) -> Tuple[any, int]:
-        """Extract content using Docling with full options"""
+        """Extract content using Docling with GPU-enabled OCR"""
         pipeline_options = PdfPipelineOptions()
         pipeline_options.do_ocr = self.config.get('do_ocr', True)
         pipeline_options.do_table_structure = self.config.get('do_table_structure', True)
         pipeline_options.images_scale = self.config.get('images_scale', 2.0)
         pipeline_options.generate_picture_images = True
+        
+        # ⚡ ENABLE GPU FOR OCR
+        if self.is_gpu_available and pipeline_options.do_ocr:
+            try:
+                pipeline_options.ocr_options = {
+                    'use_gpu': True,
+                    'gpu_id': 0,
+                    'verbose': False
+                }
+                logger.info("🎮 Docling OCR configured to use GPU")
+            except Exception as e:
+                logger.warning(f"Could not enable GPU for OCR: {e}")
         
         try:
             pipeline_options.generate_page_images = False
@@ -651,7 +670,7 @@ class PDFExtractor(BaseExtractor):
             }
         )
         
-        logger.debug("🔄 Starting Docling conversion...")
+        logger.debug("🔄 Starting Docling conversion (GPU-enabled)...")
         result = converter.convert(file_path)
         total_pages = len(result.document.pages)
         logger.debug(f"✅ Docling converted {total_pages} pages")

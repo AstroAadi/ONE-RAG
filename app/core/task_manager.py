@@ -55,11 +55,15 @@ class TaskInfo:
         self,
         task_id: str,
         task_type: TaskType,
-        description: str
+        description: str,
+        user_id: str,#Optional[str] = None,
+        file_id: str #Optional[str] = None
     ):
         self.task_id = task_id
         self.task_type = task_type
         self.description = description
+        self.user_id = user_id
+        self.file_id = file_id
         self.status = TaskStatus.PENDING
         self.progress = 0.0  # Simple 0-100 percentage
         self.result = None
@@ -97,6 +101,8 @@ class TaskInfo:
             "task_id": self.task_id,
             "task_type": self.task_type.value,
             "description": self.description,
+            "user_id": self.user_id,
+            "file_id": self.file_id,
             "status": self.status.value,
             "progress": round(self.progress, 1),
             "current_stage": self.current_stage.value,
@@ -187,15 +193,17 @@ class TaskManager:
         """
         task_id = str(uuid.uuid4())
         
-        # Extract user_id and file_id from kwargs (if present) for tracking only
+        # Extract user_id and file_id from kwargs for tracking
         user_id = func_kwargs.get('user_id', 'unknown')
         file_id = func_kwargs.get('file_id')
         
-        # Create task info (no user_id/file_id stored separately - they're in func_kwargs)
+        # Create task info with user_id and file_id for authorization
         task_info = TaskInfo(
             task_id=task_id,
             task_type=task_type,
-            description=description
+            description=description,
+            user_id=user_id,
+            file_id=file_id
         )
         
         # Store task info (thread-safe)
@@ -329,18 +337,24 @@ class TaskManager:
         """
         Get all tasks for a specific user
         
-        Note: Since user_id is now only in func_kwargs, we need to track it differently
-        This is a limitation of the new approach - consider adding back user_id to TaskInfo
-        if user-specific task tracking is important
+        Args:
+            user_id: User identifier to filter tasks
+            limit: Maximum number of tasks to return
+            
+        Returns:
+            List of task dictionaries for the specified user
         """
-        # For now, return all tasks (user filtering would require storing user_id in TaskInfo)
         with self._tasks_lock:
-            all_tasks = [task.to_dict() for task in self.tasks.values()]
+            # Filter tasks by user_id
+            user_tasks = [
+                task.to_dict() for task in self.tasks.values()
+                if task.user_id == user_id
+            ]
         
         # Sort by created_at (most recent first)
-        all_tasks.sort(key=lambda x: x['created_at'], reverse=True)
+        user_tasks.sort(key=lambda x: x['created_at'], reverse=True)
         
-        return all_tasks[:limit]
+        return user_tasks[:limit]
     
     def cleanup_completed_tasks(self, max_age_hours: int = 24):
         """Remove old completed/failed tasks from memory"""
