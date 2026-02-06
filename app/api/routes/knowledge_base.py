@@ -163,9 +163,6 @@ async def reset_user_knowledge_base(
     """
     Reset the knowledge base for CURRENT USER ONLY (not entire database!)
     
-    Headers:
-        X-User-ID: User identifier (REQUIRED)
-    
     Deletes (for current user only):
     - All documents from vector store
     - All files from disk
@@ -183,7 +180,7 @@ async def reset_user_knowledge_base(
             "query_logs": 0
         }
         
-        # 1. Get all user's files
+        # 1. Get all user's files (for vector store & disk deletion)
         files = db.query(FileMetadata).filter(
             FileMetadata.user_id == user_id
         ).all()
@@ -195,7 +192,7 @@ async def reset_user_knowledge_base(
             try:
                 success = vector_store.delete_document_by_file_id(file.file_id, user_id)
                 if success:
-                    deleted_counts["chunks_vector"] += file.chunks_created
+                    deleted_counts["chunks_vector"] += file.chunks_created or 0
             except Exception as e:
                 logger.warning(f"Error deleting {file.file_id} from vector store: {e}")
         
@@ -207,13 +204,13 @@ async def reset_user_knowledge_base(
                 # Delete main file
                 file_path = Path(file.storage_path)
                 if file_path.exists():
-                    file_path.unlink()
+                    file_path.unlink(missing_ok=True)
                 
                 # Delete markdown
                 if file.markdown_path:
                     markdown_path = Path(file.markdown_path)
                     if markdown_path.exists():
-                        markdown_path.unlink()
+                        markdown_path.unlink(missing_ok=True)
                 
                 deleted_counts["files"] += 1
             except Exception as e:
@@ -221,9 +218,11 @@ async def reset_user_knowledge_base(
         
         logger.info(f"✓ Deleted {deleted_counts['files']} files from disk")
         
-        # 4. Delete chunk metadata from database
-        chunk_count = db.query(ChunkMetadata).join(FileMetadata).filter(
-            FileMetadata.user_id == user_id
+        # 4. Delete chunk metadata from database (NO JOIN before delete!)
+        chunk_count = db.query(ChunkMetadata).filter(
+            ChunkMetadata.file_id.in_(
+                db.query(FileMetadata.file_id).filter(FileMetadata.user_id == user_id)
+            )
         ).delete(synchronize_session=False)
         deleted_counts["chunks_db"] = chunk_count
         logger.info(f"✓ Deleted {chunk_count} chunk records from database")
@@ -242,27 +241,27 @@ async def reset_user_knowledge_base(
         deleted_counts["query_logs"] = query_count
         logger.info(f"✓ Deleted {query_count} query logs")
         
-        # 7. Delete file metadata (last, as it has foreign key relationships)
+        # 7. Delete file metadata (last)
         file_count = db.query(FileMetadata).filter(
             FileMetadata.user_id == user_id
         ).delete(synchronize_session=False)
         logger.info(f"✓ Deleted {file_count} file metadata records")
         
-        # Commit all deletions
+        # Commit everything
         db.commit()
         
-        # 8. Try to cleanup user directories
+        # 8. Cleanup user directories
         try:
             user_upload_dir = Path(settings.upload_dir) / user_id
             if user_upload_dir.exists() and user_upload_dir.is_dir():
                 import shutil
-                shutil.rmtree(user_upload_dir)
+                shutil.rmtree(user_upload_dir, ignore_errors=True)
                 logger.info(f"✓ Deleted user upload directory")
             
             user_markdown_dir = Path(settings.markdown_dir) / user_id
             if user_markdown_dir.exists() and user_markdown_dir.is_dir():
                 import shutil
-                shutil.rmtree(user_markdown_dir)
+                shutil.rmtree(user_markdown_dir, ignore_errors=True)
                 logger.info(f"✓ Deleted user markdown directory")
         except Exception as e:
             logger.warning(f"Error cleaning up directories: {e}")

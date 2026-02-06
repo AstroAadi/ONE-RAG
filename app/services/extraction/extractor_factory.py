@@ -38,7 +38,7 @@ class ExtractorFactory:
         """
         # Create temporary instance to get supported formats
         temp_instance = extractor_class()
-        formats = temp_instance.supported_formats
+        formats = temp_instance._get_supported_formats()
         
         for fmt in formats:
             cls._extractors[fmt.lower()] = extractor_class

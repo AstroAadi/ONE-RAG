@@ -281,3 +281,361 @@ class HTMLExtractor(BaseExtractor):
             lines.append("")
         
         return '\n'.join(lines)
+
+# """
+# Improved HTML / HTM Extractor for RAG pipelines
+# - Clean, structured Markdown output
+# - Smart main content detection
+# - Headings, links, images, tables, code blocks handled properly
+# - Robust fallback when BeautifulSoup is missing
+# - No resource leaks, modern pathlib usage
+# - Safe parser selection (no deprecated .features attribute)
+# """
+
+# import re
+# from pathlib import Path
+# from typing import Tuple, Dict, List, Optional
+# from datetime import datetime
+# import logging
+
+# try:
+#     from bs4 import BeautifulSoup, Tag, NavigableString
+#     HAS_BS4 = True
+# except ImportError:
+#     HAS_BS4 = False
+#     logging.warning("BeautifulSoup not installed — using regex fallback")
+
+# logger = logging.getLogger(__name__)
+
+
+# class HTMLExtractor:
+#     """
+#     High-quality HTML extractor optimized for RAG and human readability.
+#     """
+
+#     SUPPORTED_FORMATS = {'html', 'htm'}
+
+#     def validate_file(self, file_path: str) -> Tuple[bool, str]:
+#         path = Path(file_path)
+#         if not path.exists():
+#             return False, "File does not exist"
+#         ext = path.suffix.lower().lstrip('.')
+#         if ext not in self.SUPPORTED_FORMATS:
+#             return False, f"Unsupported extension: .{ext}"
+#         return True, "Valid HTML file"
+
+#     def extract(self, file_path: str) -> Tuple[str, bool, Dict]:
+#         try:
+#             valid, msg = self.validate_file(file_path)
+#             if not valid:
+#                 logger.warning(msg)
+#                 return "", False, {"error": msg}
+
+#             logger.info(f"Extracting HTML: {file_path}")
+
+#             html = self._read_safe(file_path)
+#             if not html.strip():
+#                 return "", False, {"error": "Empty file"}
+
+#             parsed = self._parse_html(html)
+#             markdown = self._build_markdown(Path(file_path).stem, parsed)
+
+#             metadata = {
+#                 "title": parsed.get("title", ""),
+#                 "headings": len(parsed["headings"]),
+#                 "links": len(parsed["links"]),
+#                 "images": len(parsed["images"]),
+#                 "tables": len(parsed["tables"]),
+#                 "code_blocks": len(parsed["code_blocks"]),
+#                 "content_chars": len(parsed["text"]),
+#                 "method": "beautifulsoup" if HAS_BS4 else "regex",
+#                 "extracted_at": datetime.now().isoformat()
+#             }
+
+#             if len(parsed["text"]) < 200:
+#                 logger.warning(f"Low content length: {len(parsed['text'])} chars")
+
+#             logger.info("HTML extraction complete")
+#             return markdown, True, metadata
+
+#         except Exception as e:
+#             logger.exception(f"HTML extraction failed: {file_path}")
+#             return "", False, {"error": str(e)}
+
+#     def _read_safe(self, path_str: str) -> str:
+#         """Read file with encoding fallback – no resource leak"""
+#         path = Path(path_str)
+#         encodings = ["utf-8", "utf-8-sig", "latin-1", "cp1252", "iso-8859-1"]
+
+#         for enc in encodings:
+#             try:
+#                 return path.read_text(encoding=enc)
+#             except UnicodeDecodeError:
+#                 continue
+
+#         # Binary fallback – replace errors
+#         return path.read_bytes().decode("utf-8", errors="replace")
+
+#     def _parse_html(self, html: str) -> Dict:
+#         """Core parsing – prefers BeautifulSoup, falls back to regex"""
+#         if HAS_BS4:
+#             return self._parse_bs4(html)
+#         return self._parse_regex(html)
+
+#     def _parse_bs4(self, html: str) -> Dict:
+#         """Parse using BeautifulSoup – safe parser selection"""
+#         # Use built-in html.parser (no external lxml required)
+#         soup = BeautifulSoup(html, "html.parser")
+
+#         # Remove unwanted tags
+#         for tag in soup(["script", "style", "noscript", "iframe", "form", "footer", "header"]):
+#             tag.decompose()
+
+#         # Title
+#         title = soup.title.string.strip() if soup.title else ""
+
+#         # Headings
+#         headings = []
+#         for lv in range(1, 7):
+#             for h in soup.find_all(f"h{lv}"):
+#                 txt = h.get_text(strip=True)
+#                 if txt:
+#                     headings.append({"level": lv, "text": txt})
+
+#         # Smart main content detection
+#         main = (
+#             soup.find("main")
+#             or soup.find("article")
+#             or soup.find(id=re.compile(r"(content|main|article|post|entry|body)", re.I))
+#             or soup.find(class_=re.compile(r"(content|main|article|post|entry)", re.I))
+#             or soup.body
+#             or soup
+#         )
+
+#         # Extract clean text (paragraph-aware)
+#         text_parts = []
+#         for node in main.descendants:
+#             if isinstance(node, NavigableString) and (node := node.strip()):
+#                 tag = getattr(node.parent, "name", "")
+#                 if tag in ("p", "div", "li", "td", "th", "blockquote", "dd", "dt"):
+#                     text_parts.append(node)
+
+#         text = "\n\n".join(text_parts).strip()
+
+#         # Links – filter junk
+#         links = []
+#         for a in soup.find_all("a", href=True):
+#             href = a["href"].strip()
+#             txt = a.get_text(strip=True)
+#             if href and not href.startswith(("#", "javascript:", "mailto:", "tel:", "data:", "file:")):
+#                 links.append({"text": txt or href, "url": href})
+
+#         # Images
+#         images = []
+#         for img in soup.find_all("img"):
+#             src = img.get("src", "").strip()
+#             alt = img.get("alt", "").strip()
+#             if src:
+#                 images.append({"src": src, "alt": alt or "Image"})
+
+#         # Tables → Markdown
+#         tables = []
+#         for tbl in soup.find_all("table"):
+#             md = self._table_to_markdown(tbl)
+#             if md:
+#                 tables.append(md)
+
+#         # Code blocks
+#         code_blocks = []
+#         for pre in soup.find_all("pre"):
+#             code = pre.get_text(strip=True)
+#             lang = ""
+#             if pre.code and pre.code.get("class"):
+#                 lang = " ".join(pre.code["class"]).replace("language-", "")
+#             code_blocks.append({"lang": lang or "text", "code": code})
+
+#         return {
+#             "title": title,
+#             "headings": headings,
+#             "text": text,
+#             "links": links,
+#             "images": images,
+#             "tables": tables,
+#             "code_blocks": code_blocks,
+#         }
+
+#     def _table_to_markdown(self, table: Tag) -> Optional[str]:
+#         """Convert HTML table to Markdown table"""
+#         rows = []
+#         for tr in table.find_all("tr"):
+#             cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+#             if any(cells):
+#                 rows.append(cells)
+
+#         if len(rows) < 1:
+#             return None
+
+#         header = rows[0]
+#         body = rows[1:]
+
+#         md = ["| " + " | ".join(header) + " |"]
+#         md.append("|" + " --- |" * len(header))
+#         for row in body:
+#             md.append("| " + " | ".join(row) + " |")
+
+#         return "\n".join(md)
+
+#     def _parse_regex(self, html: str) -> Dict:
+#         """Minimal regex fallback when BeautifulSoup is unavailable"""
+#         title = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+#         title = title.group(1).strip() if title else ""
+
+#         text = re.sub(r"<script.*?</script>", "", html, flags=re.I | re.S)
+#         text = re.sub(r"<style.*?</style>", "", text, flags=re.I | re.S)
+#         text = re.sub(r"<[^>]+>", "\n", text)
+#         text = re.sub(r"\s*\n\s*", "\n", text).strip()
+
+#         return {
+#             "title": title,
+#             "headings": [],
+#             "text": text,
+#             "links": [],
+#             "images": [],
+#             "tables": [],
+#             "code_blocks": [],
+#         }
+
+#     def _build_markdown(self, filename_stem: str, parsed: Dict) -> str:
+#         """Generate clean, modern, RAG-friendly Markdown"""
+#         lines = []
+
+#         title = parsed.get("title", filename_stem.replace("_", " ").title())
+
+#         # Frontmatter
+#         lines.extend([
+#             "---",
+#             f"title: {title}",
+#             "source: HTML",
+#             f"extracted: {datetime.now().isoformat()}",
+#             f"headings: {len(parsed.get('headings', []))}",
+#             f"links: {len(parsed.get('links', []))}",
+#             f"images: {len(parsed.get('images', []))}",
+#             f"tables: {len(parsed.get('tables', []))}",
+#             f"code_blocks: {len(parsed.get('code_blocks', []))}",
+#             "---",
+#             ""
+#         ])
+
+#         # Header
+#         lines.extend([
+#             f"# {title}",
+#             f"**File**: {filename_stem}",
+#             f"**Processed**: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+#             ""
+#         ])
+
+#         # Summary
+#         lines.extend([
+#             "## Overview",
+#             f"- Title: {title or '—'}",
+#             f"- Headings: {len(parsed.get('headings', []))}",
+#             f"- Links: {len(parsed.get('links', []))}",
+#             f"- Images: {len(parsed.get('images', []))}",
+#             f"- Tables: {len(parsed.get('tables', []))}",
+#             f"- Code blocks: {len(parsed.get('code_blocks', []))}",
+#             ""
+#         ])
+
+#         # Main Content
+#         lines.append("## Main Content")
+#         lines.append("")
+#         text = parsed.get("text", "").strip()
+#         if text:
+#             paragraphs = [p.strip() for p in re.split(r'\n{2,}', text) if p.strip()]
+#             for p in paragraphs:
+#                 lines.append(p)
+#                 lines.append("")
+#         else:
+#             lines.append("*No readable text content could be extracted.*\n")
+
+#         # Headings Outline
+#         if parsed.get("headings"):
+#             lines.append("## Headings Outline")
+#             lines.append("")
+#             for h in parsed["headings"]:
+#                 prefix = "#" * h["level"]
+#                 lines.append(f"{prefix} {h['text']}")
+#             lines.append("")
+
+#         # Code Blocks
+#         if parsed.get("code_blocks"):
+#             lines.append("## Code Blocks")
+#             lines.append("")
+#             for i, cb in enumerate(parsed["code_blocks"], 1):
+#                 lang = cb["lang"] or "text"
+#                 lines.append(f"**Block {i}** ({lang})")
+#                 lines.append(f"```{lang}")
+#                 lines.append(cb["code"])
+#                 lines.append("```")
+#                 lines.append("")
+
+#         # Tables
+#         if parsed.get("tables"):
+#             lines.append("## Tables")
+#             lines.append("")
+#             for i, tbl in enumerate(parsed["tables"], 1):
+#                 lines.append(f"**Table {i}**")
+#                 lines.append(tbl)
+#                 lines.append("")
+
+#         # Links
+#         links = parsed.get("links", [])
+#         if links:
+#             lines.append("## Links")
+#             lines.append(f"Total: {len(links)}\n")
+
+#             external = [l for l in links if l["url"].startswith(("http://", "https://"))]
+#             internal = [l for l in links if l not in external]
+
+#             if external:
+#                 lines.append("### External Links")
+#                 for l in external[:20]:
+#                     txt = l["text"] or l["url"]
+#                     lines.append(f"- [{txt}]({l['url']})")
+#                 if len(external) > 20:
+#                     lines.append(f"- … and {len(external)-20} more")
+#                 lines.append("")
+
+#             if internal:
+#                 lines.append("### Internal / Anchors")
+#                 for l in internal[:15]:
+#                     txt = l["text"] or l["url"]
+#                     lines.append(f"- [{txt}]({l['url']})")
+#                 if len(internal) > 15:
+#                     lines.append(f"- … and {len(internal)-15} more")
+
+#         # Images
+#         images = parsed.get("images", [])
+#         if images:
+#             lines.append("## Images")
+#             lines.append(f"Found {len(images)}\n")
+#             for i, img in enumerate(images[:10], 1):
+#                 alt = img.get("alt", "Image").strip() or "Unnamed image"
+#                 src = img.get("src", "#")
+#                 lines.extend([
+#                     f"**Image {i}**: {alt}",
+#                     f"![{alt}]({src})",
+#                     f"Source: {src}",
+#                     ""
+#                 ])
+#             if len(images) > 10:
+#                 lines.append(f"… and {len(images)-10} more")
+
+#         # Footer
+#         lines.extend([
+#             "---",
+#             f"*Processed from HTML on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*",
+#             f"*Original file*: {filename_stem}"
+#         ])
+
+#         return "\n".join(lines)
