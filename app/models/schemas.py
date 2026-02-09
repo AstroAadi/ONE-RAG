@@ -41,17 +41,12 @@ class ChunkingStrategy(str, Enum):
     Available chunking strategies
     
     - FIXED_SIZE: Token-based fixed-size chunks (no overlap)
-    - SENTENCE: Groups sentences up to target size
-    - PARAGRAPH: Groups paragraphs up to target size
-    - SLIDING_WINDOW: Fixed-size with overlapping windows
-    - RECURSIVE: Hierarchical split by separators
+    - HIERARCHICAL: Hierarchical split by separators
     - SEMANTIC: Groups semantically similar sentences
     """
+    DEFAULT = "default"
     FIXED_SIZE = "fixed_size"
-    SENTENCE = "sentence"
-    PARAGRAPH = "paragraph"
-    SLIDING_WINDOW = "sliding_window"
-    RECURSIVE = "recursive"
+    HIERARCHICAL = "hierarchical"
     SEMANTIC = "semantic"
 
 
@@ -74,7 +69,7 @@ class ProcessDocumentRequest(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
     
     chunking_strategy: ChunkingStrategy = Field(
-        default=ChunkingStrategy.FIXED_SIZE,
+        default=ChunkingStrategy.DEFAULT,
         description="Chunking strategy to use for this document"
     )
     
