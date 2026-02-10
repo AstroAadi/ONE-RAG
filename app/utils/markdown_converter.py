@@ -26,6 +26,37 @@ class MarkdownConverter:
     """
     
     @staticmethod
+    def remove_urls_and_emails(flag: bool, text: str) -> str:
+        if not flag or not text or not isinstance(text, str):
+            return text
+        
+        # Replace URLs with [URL]
+        url_pattern = r'(?i)\b((?:https?://|ftp://|www\d{0,3}[.]|[a-z0-9.\-]+[.][a-z]{2,4}/)(?:[^\s()<>]+|\(([^\s()<>]+|(\([^\s()<>]+\)))*\))+(?:\(([^\s()<>]+|(\([^\s()<>]+\)))*\)|[^\s`!()\[\]{};:\'".,<>?«»“”‘’]))'
+        text = re.sub(url_pattern, ' ', text)
+        
+        # Replace emails with [EMAIL]
+        email_pattern = r'(?<![\w@.-])[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+(?![a-zA-Z0-9._-])'
+        text = re.sub(email_pattern, ' ', text)
+        
+        return text
+
+
+    def normalize_whitespace(flag: bool, text: str) -> str:
+        if not flag or not text or not isinstance(text, str):
+            return text
+        
+        # Replace all horizontal whitespace (spaces, tabs, etc.) with single space
+        text = re.sub(r'[\t\r\f\v ]+', ' ', text)
+        
+        # Collapse multiple spaces
+        text = re.sub(r' +', ' ', text)
+        
+        # Normalize newlines: max 2 consecutive, strip leading/trailing
+        text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)  # more than 2 → 2
+        text = text.strip()
+        
+        return text
+        
     def convert_text_to_markdown(text: str, filename: str, file_type: str) -> str:
         """
         Light cleanup of extractor output

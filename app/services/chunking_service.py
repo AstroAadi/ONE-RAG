@@ -811,13 +811,13 @@ class EnhancedChunkingService:
         i = 0
         while i < len(chunks):
             current = chunks[i]
-            current_tok = current["metadata"]["token_count"]
+            current_tok = current["token_count"]
 
             # If chunk is too small → try to merge with next
             if current_tok < self.min_chunk_tokens and i + 1 < len(chunks):
                 next_chunk = chunks[i + 1]
                 combined_text = current["text"] + " " + next_chunk["text"]
-                combined_tok = current_tok + next_chunk["metadata"]["token_count"]
+                combined_tok = current_tok + next_chunk["token_count"]
 
                 if combined_tok <= self.target_chunk_tokens:
                     merged = self._create_chunk(
@@ -962,7 +962,8 @@ class EnhancedChunkingService:
         chunk_index: int,
         base_metadata: Dict,
         position: Optional[int] = None,
-        total_tokens: Optional[int] = None
+        total_tokens: Optional[int] = None,
+        chunk_type: str="text"
     ) -> Dict[str, Any]:
         """Create a chunk dictionary"""
         
@@ -976,7 +977,7 @@ class EnhancedChunkingService:
             'token_count': token_count,
             'metadata': {
                 'chunk_index': chunk_index,
-                'chunk_type': 'text',
+                'chunk_type': chunk_type,
                 'page_number': page_number,
                 **base_metadata
             }
