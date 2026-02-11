@@ -208,7 +208,7 @@ async def process_and_index_document(
     file_id: str,
     user_id: str = Depends(get_user_id),
     db: Session = Depends(get_database_session),
-    chunking_strategy: ChunkingStrategy = Query(default=ChunkingStrategy.FIXED_SIZE),
+    chunking_strategy: ChunkingStrategy = Query(default=ChunkingStrategy.DEFAULT),
     target_chunk_tokens: Optional[int] = Query(default=None, ge=100, le=2048),
     chunk_overlap_tokens: Optional[int] = Query(default=None, ge=0, le=500)
 ):
@@ -484,11 +484,9 @@ def process_document_with_progress(
             
             # Map strategy
             strategy_map = {
+                'default': ChunkingStrategyEnum.DEFAULT,
                 'fixed_size': ChunkingStrategyEnum.FIXED_SIZE,
-                'sentence': ChunkingStrategyEnum.SENTENCE,
-                'paragraph': ChunkingStrategyEnum.PARAGRAPH,
-                'sliding_window': ChunkingStrategyEnum.SLIDING_WINDOW,
-                'recursive': ChunkingStrategyEnum.RECURSIVE,
+                'hierarchical': ChunkingStrategyEnum.HIERARCHICAL,
                 'semantic': ChunkingStrategyEnum.SEMANTIC
             }
             
