@@ -24,7 +24,8 @@ from app.api.routes import (
     knowledge_base,
     chunk_edit,
     markdown_output,
-    settings as settings_route
+    settings as settings_route,
+    chunks
 )
 
 # Configure logging
@@ -183,16 +184,17 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 
 # Include routers
+app.include_router(knowledge_base.router)
 app.include_router(upload.router)
+app.include_router(chunks.router)
 app.include_router(query.router)
 app.include_router(task_routes.router)
-app.include_router(knowledge_base.router)
 app.include_router(chunk_edit.router)
 app.include_router(markdown_output.router)
 app.include_router(settings_route.router)
 
 
-# Root endpoint
+# Root endpoint 
 @app.get("/")
 async def root():
     """Root endpoint with system information"""

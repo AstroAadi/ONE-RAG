@@ -1,6 +1,7 @@
 """
-Database Models for RAG System - MULTI-TENANT VERSION
-PostgreSQL and SQLite compatible with proper foreign key constraints
+Database Models for RAG System - SIMPLIFIED VERSION
+Only 4 states: uploaded, processing, completed, failed
+No granular tracking - keeps it simple!
 """
 
 from sqlalchemy import (
@@ -15,8 +16,9 @@ import enum
 Base = declarative_base()
 
 
+# ==================== SIMPLE 4-STATE STATUS ====================
 class ProcessingStatus(str, enum.Enum):
-    """File processing status"""
+    """File processing status - SIMPLE 4 STATES ONLY"""
     UPLOADED = "uploaded"
     PROCESSING = "processing"
     COMPLETED = "completed"
@@ -45,12 +47,7 @@ class ChunkingStrategyEnum(str, enum.Enum):
 # ==================== KNOWLEDGE BASE MODEL ====================
 
 class KnowledgeBase(Base):
-    """
-    Knowledge Base Model - Multi-tenant Isolation
-    
-    Each user can create multiple knowledge bases
-    Knowledge bases are strictly isolated by user_id
-    """
+    """Knowledge Base Model - Multi-tenant Isolation"""
     __tablename__ = "knowledge_bases"
     
     # Primary identifiers
@@ -105,14 +102,13 @@ class KnowledgeBase(Base):
         }
 
 
-# ==================== FILE METADATA MODEL ====================
+# ==================== FILE METADATA MODEL (SIMPLIFIED) ====================
 
 class FileMetadata(Base):
     """
-    File metadata table with knowledge base isolation
+    File metadata table - SIMPLIFIED
     
-    Each file belongs to exactly one knowledge base
-    Foreign key constraint ensures referential integrity
+    Status flow: uploaded → processing → completed
     """
     __tablename__ = "file_metadata"
     
@@ -137,8 +133,10 @@ class FileMetadata(Base):
     storage_path = Column(String(1000), nullable=False)
     markdown_path = Column(String(1000), nullable=True)
     
-    # Processing information
+    # STATUS: Simple 4 states only
     status = Column(Enum(ProcessingStatus), default=ProcessingStatus.UPLOADED, nullable=False, index=True)
+    
+    # Processing information
     chunks_created = Column(Integer, default=0, nullable=False)
     total_pages = Column(Integer, default=0, nullable=False)
     
@@ -211,12 +209,7 @@ class FileMetadata(Base):
 # ==================== CHUNK METADATA MODEL ====================
 
 class ChunkMetadata(Base):
-    """
-    Chunk metadata table
-    
-    Tracks individual chunks created from files
-    Foreign key constraint ensures chunks are deleted when parent file is deleted
-    """
+    """Chunk metadata table"""
     __tablename__ = "chunk_metadata"
     
     # Primary identifier
@@ -254,9 +247,7 @@ class ChunkMetadata(Base):
 # ==================== QUERY LOG MODEL ====================
 
 class QueryLog(Base):
-    """
-    Query logging table with knowledge base tracking
-    """
+    """Query logging table with knowledge base tracking"""
     __tablename__ = "query_logs"
     
     # Primary identifier
@@ -297,9 +288,7 @@ class QueryLog(Base):
 # ==================== CONVERSATION HISTORY MODEL ====================
 
 class ConversationHistory(Base):
-    """
-    Conversation history table with knowledge base tracking
-    """
+    """Conversation history table with knowledge base tracking"""
     __tablename__ = "conversation_history"
     
     # Primary identifier
