@@ -1,6 +1,6 @@
 """
-Database Configuration with Connection Pooling - CORRECTED
-Uses the same Base as models.py to ensure tables are created
+Database Configuration with Connection Pooling
+PostgreSQL and SQLite Support with proper pooling
 """
 
 from sqlalchemy import create_engine, event, text
@@ -13,15 +13,16 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Import Base from models - CRITICAL!
+# Import Base from models
 from app.db.models import Base
 
 
 def get_engine():
     """Create SQLAlchemy engine with optimized connection pooling"""
     
-    # Determine if we're using SQLite or PostgreSQL
-    is_sqlite = settings.database_url.startswith('sqlite')
+    # Determine database type
+    is_sqlite = settings.is_sqlite
+    is_postgresql = settings.is_postgresql
     
     if is_sqlite:
         # SQLite configuration
@@ -31,7 +32,7 @@ def get_engine():
             settings.database_url,
             connect_args={"check_same_thread": False},
             poolclass=NullPool,
-            echo=False
+            echo=settings.db_echo
         )
         
         # Enable foreign keys for SQLite
@@ -41,21 +42,35 @@ def get_engine():
             cursor.execute("PRAGMA foreign_keys=ON")
             cursor.close()
             
-    else:
-        # PostgreSQL/MySQL configuration
+    elif is_postgresql:
+        # PostgreSQL configuration with connection pooling
+        logger.info("Using PostgreSQL with connection pooling")
+        
         engine = create_engine(
             settings.database_url,
             poolclass=QueuePool,
-            pool_size=10,
-            max_overflow=20,
-            pool_timeout=30,
-            pool_recycle=3600,
-            pool_pre_ping=True,
-            echo=False,
+            pool_size=settings.db_pool_size,
+            max_overflow=settings.db_max_overflow,
+            pool_timeout=settings.db_pool_timeout,
+            pool_recycle=settings.db_pool_recycle,
+            pool_pre_ping=True,  # Verify connections before use
+            echo=settings.db_echo,
             connect_args={
                 "connect_timeout": 10,
-                "options": "-c statement_timeout=30000"
+                "options": "-c statement_timeout=30000"  # 30 second query timeout
             }
+        )
+    else:
+        # Fallback for other databases (MySQL, etc.)
+        engine = create_engine(
+            settings.database_url,
+            poolclass=QueuePool,
+            pool_size=settings.db_pool_size,
+            max_overflow=settings.db_max_overflow,
+            pool_timeout=settings.db_pool_timeout,
+            pool_recycle=settings.db_pool_recycle,
+            pool_pre_ping=True,
+            echo=settings.db_echo
         )
     
     logger.info(
@@ -138,7 +153,6 @@ def get_connection_pool_status() -> dict:
     }
 
 
-# Health check function
 def check_database_health() -> tuple[bool, str]:
     """Check if database is accessible and healthy"""
     try:
@@ -150,7 +164,6 @@ def check_database_health() -> tuple[bool, str]:
         return False, f"Database error: {str(e)}"
 
 
-# Cleanup function for application shutdown
 def close_database_connections():
     """Close all database connections and dispose of the engine"""
     engine.dispose()

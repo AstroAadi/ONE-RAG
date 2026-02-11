@@ -1,11 +1,11 @@
 """
 Database Session Management
-Handles SQLite connection and session lifecycle
+Handles PostgreSQL and SQLite connection and session lifecycle
 """
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, Session
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import StaticPool, QueuePool
 from typing import Generator
 import logging
 
@@ -17,21 +17,49 @@ logger = logging.getLogger(__name__)
 # Get settings
 settings = get_settings()
 
-# Create engine with proper SQLite configuration
-engine = create_engine(
-    settings.database_url,
-    connect_args={"check_same_thread": False},  # Needed for SQLite
-    poolclass=StaticPool,  # Use static pool for SQLite
-    echo=False  # Set to True for SQL debugging
-)
-
-# Enable foreign keys for SQLite
-@event.listens_for(engine, "connect")
-def set_sqlite_pragma(dbapi_conn, connection_record):
-    """Enable foreign key constraints in SQLite"""
-    cursor = dbapi_conn.cursor()
-    cursor.execute("PRAGMA foreign_keys=ON")
-    cursor.close()
+# Create engine based on database type
+if settings.is_sqlite:
+    # SQLite configuration
+    engine = create_engine(
+        settings.database_url,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+        echo=settings.db_echo
+    )
+    
+    # Enable foreign keys for SQLite
+    @event.listens_for(engine, "connect")
+    def set_sqlite_pragma(dbapi_conn, connection_record):
+        """Enable foreign key constraints in SQLite"""
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+        
+elif settings.is_postgresql:
+    # PostgreSQL configuration
+    engine = create_engine(
+        settings.database_url,
+        poolclass=QueuePool,
+        pool_size=settings.db_pool_size,
+        max_overflow=settings.db_max_overflow,
+        pool_timeout=settings.db_pool_timeout,
+        pool_recycle=settings.db_pool_recycle,
+        pool_pre_ping=True,
+        echo=settings.db_echo,
+        connect_args={
+            "connect_timeout": 10,
+            "options": "-c statement_timeout=30000"
+        }
+    )
+else:
+    # Generic database configuration
+    engine = create_engine(
+        settings.database_url,
+        poolclass=QueuePool,
+        pool_size=settings.db_pool_size,
+        max_overflow=settings.db_max_overflow,
+        echo=settings.db_echo
+    )
 
 
 # Create session factory

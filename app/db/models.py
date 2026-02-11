@@ -1,7 +1,6 @@
 """
 Database Models for RAG System - MULTI-TENANT VERSION
-Added KnowledgeBase model for multi-tenant isolation
-Each user can create multiple knowledge bases
+PostgreSQL and SQLite compatible with proper foreign key constraints
 """
 
 from sqlalchemy import (
@@ -43,7 +42,7 @@ class ChunkingStrategyEnum(str, enum.Enum):
     SEMANTIC = "semantic"
 
 
-# ==================== NEW: KNOWLEDGE BASE MODEL ====================
+# ==================== KNOWLEDGE BASE MODEL ====================
 
 class KnowledgeBase(Base):
     """
@@ -64,19 +63,24 @@ class KnowledgeBase(Base):
     description = Column(Text, nullable=True)
     
     # Statistics
-    document_count = Column(Integer, default=0)
-    total_chunks = Column(Integer, default=0)
-    total_size_bytes = Column(Integer, default=0)
+    document_count = Column(Integer, default=0, nullable=False)
+    total_chunks = Column(Integer, default=0, nullable=False)
+    total_size_bytes = Column(Integer, default=0, nullable=False)
     
     # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    last_accessed = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    last_accessed = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
     
     # Relationships
-    files = relationship("FileMetadata", back_populates="knowledge_base", cascade="all, delete-orphan")
+    files = relationship(
+        "FileMetadata",
+        back_populates="knowledge_base",
+        cascade="all, delete-orphan",
+        passive_deletes=True
+    )
     
-    # Unique constraint: user can't have duplicate KB names
+    # Indexes and constraints
     __table_args__ = (
         UniqueConstraint('user_id', 'knowledge_base_name_normalized', name='uix_user_kb_name'),
         Index('idx_user_kb', 'user_id', 'knowledge_base_id'),
@@ -101,13 +105,14 @@ class KnowledgeBase(Base):
         }
 
 
-# ==================== UPDATED: FILE METADATA MODEL ====================
+# ==================== FILE METADATA MODEL ====================
 
 class FileMetadata(Base):
     """
-    File metadata table with KB isolation
+    File metadata table with knowledge base isolation
     
     Each file belongs to exactly one knowledge base
+    Foreign key constraint ensures referential integrity
     """
     __tablename__ = "file_metadata"
     
@@ -115,7 +120,7 @@ class FileMetadata(Base):
     file_id = Column(String(36), primary_key=True, index=True)
     user_id = Column(String(100), nullable=False, index=True)
     knowledge_base_id = Column(
-        String(36), 
+        String(36),
         ForeignKey("knowledge_bases.knowledge_base_id", ondelete="CASCADE"),
         nullable=False,
         index=True
@@ -133,9 +138,9 @@ class FileMetadata(Base):
     markdown_path = Column(String(1000), nullable=True)
     
     # Processing information
-    status = Column(Enum(ProcessingStatus), default=ProcessingStatus.UPLOADED, index=True)
-    chunks_created = Column(Integer, default=0)
-    total_pages = Column(Integer, default=0)
+    status = Column(Enum(ProcessingStatus), default=ProcessingStatus.UPLOADED, nullable=False, index=True)
+    chunks_created = Column(Integer, default=0, nullable=False)
+    total_pages = Column(Integer, default=0, nullable=False)
     
     # Chunking strategy
     chunking_strategy = Column(
@@ -143,25 +148,30 @@ class FileMetadata(Base):
         default=ChunkingStrategyEnum.FIXED_SIZE,
         nullable=True
     )
-    target_chunk_tokens = Column(Integer, default=512)
-    chunk_overlap_tokens = Column(Integer, default=50)
+    target_chunk_tokens = Column(Integer, default=512, nullable=False)
+    chunk_overlap_tokens = Column(Integer, default=50, nullable=False)
     
     # Timestamps
     uploaded_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
     processed_at = Column(DateTime, nullable=True)
-    last_accessed = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_accessed = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
     
     # Processing metadata
     processing_metadata = Column(Text, nullable=True)
     error_message = Column(Text, nullable=True)
     
     # Statistics
-    word_count = Column(Integer, default=0)
-    image_count = Column(Integer, default=0)
-    table_count = Column(Integer, default=0)
+    word_count = Column(Integer, default=0, nullable=False)
+    image_count = Column(Integer, default=0, nullable=False)
+    table_count = Column(Integer, default=0, nullable=False)
     
     # Relationships
-    chunks = relationship("ChunkMetadata", back_populates="file", cascade="all, delete-orphan")
+    chunks = relationship(
+        "ChunkMetadata",
+        back_populates="file",
+        cascade="all, delete-orphan",
+        passive_deletes=True
+    )
     knowledge_base = relationship("KnowledgeBase", back_populates="files")
     
     # Indexes for performance
@@ -179,7 +189,7 @@ class FileMetadata(Base):
             "file_id": self.file_id,
             "user_id": self.user_id,
             "knowledge_base_id": self.knowledge_base_id,
-            "filename": self.original_filename,  # Map to 'filename' for DocumentInfo schema
+            "filename": self.original_filename,
             "original_filename": self.original_filename,
             "file_extension": self.file_extension,
             "file_type": self.file_type.value if self.file_type else None,
@@ -198,26 +208,33 @@ class FileMetadata(Base):
         }
 
 
+# ==================== CHUNK METADATA MODEL ====================
+
 class ChunkMetadata(Base):
     """
     Chunk metadata table
     
     Tracks individual chunks created from files
-    Links to vector store chunk IDs
+    Foreign key constraint ensures chunks are deleted when parent file is deleted
     """
     __tablename__ = "chunk_metadata"
     
     # Primary identifier
     chunk_id = Column(String(100), primary_key=True, index=True)
     
-    # Foreign key to file
-    file_id = Column(String(36), ForeignKey("file_metadata.file_id", ondelete="CASCADE"), nullable=False, index=True)
+    # Foreign key to file (CASCADE delete)
+    file_id = Column(
+        String(36),
+        ForeignKey("file_metadata.file_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True
+    )
     
     # Chunk information
     chunk_index = Column(Integer, nullable=False)
-    chunk_type = Column(String(20), default="text")
+    chunk_type = Column(String(20), default="text", nullable=False)
     char_count = Column(Integer, nullable=False)
-    page_number = Column(Integer, default=0)
+    page_number = Column(Integer, default=0, nullable=False)
     
     # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -225,13 +242,20 @@ class ChunkMetadata(Base):
     # Relationship
     file = relationship("FileMetadata", back_populates="chunks")
     
+    # Indexes
+    __table_args__ = (
+        Index('idx_file_chunk', 'file_id', 'chunk_index'),
+    )
+    
     def __repr__(self) -> str:
         return f"<ChunkMetadata(chunk_id={self.chunk_id}, file_id={self.file_id}, index={self.chunk_index})>"
 
 
+# ==================== QUERY LOG MODEL ====================
+
 class QueryLog(Base):
     """
-    Query logging table with KB tracking
+    Query logging table with knowledge base tracking
     """
     __tablename__ = "query_logs"
     
@@ -247,11 +271,11 @@ class QueryLog(Base):
     answer = Column(Text, nullable=True)
     
     # Search parameters
-    top_k = Column(Integer, default=5)
-    search_type = Column(String(20), default="hybrid")
+    top_k = Column(Integer, default=5, nullable=False)
+    search_type = Column(String(20), default="hybrid", nullable=False)
     
     # Results
-    chunks_retrieved = Column(Integer, default=0)
+    chunks_retrieved = Column(Integer, default=0, nullable=False)
     processing_time_seconds = Column(Float, nullable=True)
     confidence_score = Column(Float, nullable=True)
     
@@ -270,9 +294,11 @@ class QueryLog(Base):
         return f"<QueryLog(id={self.id}, user={self.user_id}, kb={self.knowledge_base_id})>"
 
 
+# ==================== CONVERSATION HISTORY MODEL ====================
+
 class ConversationHistory(Base):
     """
-    Conversation history table with KB tracking
+    Conversation history table with knowledge base tracking
     """
     __tablename__ = "conversation_history"
     
@@ -294,6 +320,7 @@ class ConversationHistory(Base):
     # Indexes
     __table_args__ = (
         Index('idx_conv_user_kb', 'conversation_id', 'user_id', 'knowledge_base_id'),
+        Index('idx_conv_created', 'conversation_id', 'created_at'),
     )
     
     def __repr__(self) -> str:

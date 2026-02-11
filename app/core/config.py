@@ -3,6 +3,7 @@ GPU-Enabled Configuration - Pydantic v2 Compatible
 Fixed version with proper model separation:
 - AWS Bedrock: Dense embeddings + LLM
 - HuggingFace: SPLADE sparse vectors ONLY
+- PostgreSQL Database Support
 """
 
 from pydantic import Field, field_validator, ConfigDict
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
-    """Application settings with GPU support"""
+    """Application settings with GPU support and PostgreSQL"""
     
     model_config = ConfigDict(
         env_file=".env",
@@ -101,11 +102,39 @@ class Settings(BaseSettings):
     vision_max_tokens: int = Field(default=2000, ge=100, le=10000)
     vision_temperature: float = Field(default=0.6, ge=0.0, le=1.0)
     
+    # ==================== DATABASE CONFIGURATION ====================
+    
+    # Database URL - supports both SQLite and PostgreSQL
+    database_url: str = Field(
+        default="",
+        description="Database URL (SQLite or PostgreSQL)"
+    )
+    
+    # PostgreSQL-specific settings
+    db_pool_size: int = Field(default=10, ge=5, le=50)
+    db_max_overflow: int = Field(default=20, ge=0, le=100)
+    db_pool_timeout: int = Field(default=30, ge=5, le=120)
+    db_pool_recycle: int = Field(default=3600, ge=300, le=7200)
+    db_echo: bool = Field(default=False, description="Echo SQL queries (debug mode)")
+    
+    @field_validator('database_url')
+    @classmethod
+    def validate_database_url(cls, v: str) -> str:
+        """Validate database URL format"""
+        if not v:
+            raise ValueError("database_url cannot be empty")
+        
+        valid_prefixes = ('sqlite:///', 'postgresql://', 'postgresql+psycopg2://')
+        if not any(v.startswith(prefix) for prefix in valid_prefixes):
+            raise ValueError(
+                f"database_url must start with one of: {', '.join(valid_prefixes)}"
+            )
+        return v
+    
     # ==================== Storage Configuration ====================
     
     upload_dir: Path = Field(default=Path("./uploads"))
     markdown_dir: Path = Field(default=Path("./markdown_output"))
-    database_url: str = Field(default="sqlite:///./rag_system.db")
     
     max_file_size_mb: int = Field(default=50, ge=1, le=500)
     max_filename_length: int = Field(default=255, ge=1, le=500)
@@ -114,11 +143,6 @@ class Settings(BaseSettings):
     
     max_io_workers: int = Field(default=20, ge=4, le=100)
     max_cpu_workers: int = Field(default=4, ge=1, le=16)
-    
-    db_pool_size: int = Field(default=10, ge=5, le=50)
-    db_max_overflow: int = Field(default=20, ge=0, le=100)
-    db_pool_timeout: int = Field(default=30, ge=5, le=120)
-    db_pool_recycle: int = Field(default=3600, ge=300, le=7200)
     
     task_cleanup_interval_hours: int = Field(default=24, ge=1, le=168)
     task_timeout_seconds: int = Field(default=600, ge=60, le=3600)
@@ -252,6 +276,16 @@ class Settings(BaseSettings):
         """Get max file size in bytes"""
         return self.max_file_size_mb * 1024 * 1024
     
+    @property
+    def is_postgresql(self) -> bool:
+        """Check if database is PostgreSQL"""
+        return self.database_url.startswith(('postgresql://', 'postgresql+psycopg2://'))
+    
+    @property
+    def is_sqlite(self) -> bool:
+        """Check if database is SQLite"""
+        return self.database_url.startswith('sqlite:///')
+    
     def get_device_info(self) -> dict:
         """Get current device information"""
         info = {
@@ -278,6 +312,14 @@ class Settings(BaseSettings):
         """Validate configuration and return warnings"""
         warnings = []
         is_valid = True
+        
+        # Database validation
+        if self.is_postgresql:
+            try:
+                import psycopg2
+            except ImportError:
+                warnings.append("PostgreSQL selected but psycopg2 not installed. Run: pip install psycopg2-binary")
+                is_valid = False
         
         # AWS Bedrock validation
         if not self.aws_access_key_id or not self.aws_secret_access_key:
@@ -337,6 +379,16 @@ def print_configuration_summary():
     print("\n" + "="*70)
     print("RAG SYSTEM CONFIGURATION")
     print("="*70)
+    
+    # Database info
+    db_type = "PostgreSQL" if settings.is_postgresql else "SQLite"
+    print(f"\n💾 Database: {db_type}")
+    if settings.is_postgresql:
+        # Extract database name from URL for display
+        db_name = settings.database_url.split('/')[-1].split('?')[0]
+        print(f"  Database: {db_name}")
+        print(f"  Pool Size: {settings.db_pool_size}")
+        print(f"  Max Overflow: {settings.db_max_overflow}")
     
     device_info = settings.get_device_info()
     print(f"\n🖥️  Device: {device_info['device'].upper()}")
