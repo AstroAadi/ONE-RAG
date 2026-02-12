@@ -153,13 +153,11 @@ async def create_chunks(
             db.add(chunk_db)
             chunk_ids.append(chunk['chunk_id'])
         
-        # Map strategy
+        # Map strategy - only 4 valid strategies
         strategy_map = {
+            'default': ChunkingStrategyEnum.DEFAULT,
             'fixed_size': ChunkingStrategyEnum.FIXED_SIZE,
-            'sentence': ChunkingStrategyEnum.SENTENCE,
-            'paragraph': ChunkingStrategyEnum.PARAGRAPH,
-            'sliding_window': ChunkingStrategyEnum.SLIDING_WINDOW,
-            'recursive': ChunkingStrategyEnum.RECURSIVE,
+            'hierarchical': ChunkingStrategyEnum.HIERARCHICAL,
             'semantic': ChunkingStrategyEnum.SEMANTIC
         }
         
