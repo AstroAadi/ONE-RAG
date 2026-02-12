@@ -86,7 +86,8 @@ class Settings(BaseSettings):
     # HuggingFace SPLADE Model (Sparse Vectors ONLY)
     splade_model_name: str = Field(
         default="naver/splade-v3",
-        description="HuggingFace SPLADE model for sparse vectors"
+        description="HuggingFace SPLADE model for sparse vectors",
+        token=os.getenv('HUGGINGFACE_API_TOKEN')
     )
     
     embedding_max_length: int = Field(default=512, ge=128, le=2048)

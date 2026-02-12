@@ -47,11 +47,9 @@ settings = get_settings()
 
 class ChunkingStrategy(str, Enum):
     """Available chunking strategies"""
+    DEFAULT = "default"
     FIXED_SIZE = "fixed_size"
-    SENTENCE = "sentence"
-    PARAGRAPH = "paragraph"
-    SLIDING_WINDOW = "sliding_window"
-    RECURSIVE = "recursive"
+    HIERARCHICAL = "hierarchical"
     SEMANTIC = "semantic"
 
 
@@ -131,8 +129,8 @@ class EnhancedChunkingService:
     
     def __init__(
         self,
-        target_chunk_tokens: int = 512,
-        chunk_overlap_tokens: int = 50,
+        target_chunk_tokens: int = 300,
+        chunk_overlap_tokens: int = 20,
         tokenizer_model: str = "cl100k_base",
         min_chunk_tokens: int = 100,
         max_chunk_tokens: int = 1024
@@ -194,21 +192,25 @@ class EnhancedChunkingService:
         logger.info(f"Chunking document using {strategy.value} strategy ({len(markdown_text)} characters)...")
         
         # Route to appropriate chunking strategy
-        if strategy == ChunkingStrategy.FIXED_SIZE:
+        if strategy == ChunkingStrategy.DEFAULT:
+            chunks = self._chunk_default_size(markdown_text, base_metadata)
+        elif strategy == ChunkingStrategy.FIXED_SIZE:
             chunks = self._chunk_fixed_size(markdown_text, base_metadata)
-        elif strategy == ChunkingStrategy.SENTENCE:
-            chunks = self._chunk_by_sentence(markdown_text, base_metadata)
-        elif strategy == ChunkingStrategy.PARAGRAPH:
-            chunks = self._chunk_by_paragraph(markdown_text, base_metadata)
-        elif strategy == ChunkingStrategy.SLIDING_WINDOW:
-            chunks = self._chunk_sliding_window(markdown_text, base_metadata)
-        elif strategy == ChunkingStrategy.RECURSIVE:
-            chunks = self._chunk_recursive(markdown_text, base_metadata)
+        # elif strategy == ChunkingStrategy.SENTENCE:
+        #     chunks = self._chunk_by_sentence(markdown_text, base_metadata)
+        # elif strategy == ChunkingStrategy.PARAGRAPH:
+        #     chunks = self._chunk_by_paragraph(markdown_text, base_metadata)
+        # elif strategy == ChunkingStrategy.SLIDING_WINDOW:
+        #     chunks = self._chunk_sliding_window(markdown_text, base_metadata)
+        # elif strategy == ChunkingStrategy.RECURSIVE:
+        #     chunks = self._chunk_recursive(markdown_text, base_metadata)
+        elif strategy == ChunkingStrategy.HIERARCHICAL:
+            chunks = self._chunk_hierarchical(markdown_text, base_metadata)
         elif strategy == ChunkingStrategy.SEMANTIC:
             chunks = self._chunk_semantic(markdown_text, base_metadata)
         else:
             logger.warning(f"Unknown strategy {strategy}, falling back to fixed_size")
-            chunks = self._chunk_fixed_size(markdown_text, base_metadata)
+            chunks = self._chunk_default_size(markdown_text, base_metadata)
         
         if not chunks:
             logger.warning("No chunks created")
@@ -217,6 +219,19 @@ class EnhancedChunkingService:
         logger.info(f"✅ Created {len(chunks)} chunks using {strategy.value}")
         
         return chunks
+    
+    def _chunk_default_size(
+        self,
+        text: str,
+        base_metadata: Dict
+    ) -> List[Dict[str, Any]]:
+        """
+        Default chunking strategy (legacy)
+        
+        Creates chunks of approximately target_chunk_tokens size
+        No overlap, simple sequential split
+        """
+        return self._chunk_fixed_size(text, base_metadata)
     
     # ==================== STRATEGY 1: Fixed-size (Token-based) ====================
     
@@ -259,7 +274,7 @@ class EnhancedChunkingService:
         
         return chunks
     
-    # ==================== STRATEGY 2: Sentence Chunking ====================
+    
     
     def _chunk_by_sentence(
         self,
@@ -326,264 +341,584 @@ class EnhancedChunkingService:
         
         return chunks
     
-    # ==================== STRATEGY 3: Paragraph Chunking ====================
+    # # ==================== STRATEGY 3: Paragraph Chunking ====================
     
-    def _chunk_by_paragraph(
-        self,
-        text: str,
-        base_metadata: Dict
-    ) -> List[Dict[str, Any]]:
-        """
-        Strategy 3: Paragraph-based chunking
+    # def _chunk_by_paragraph(
+    #     self,
+    #     text: str,
+    #     base_metadata: Dict
+    # ) -> List[Dict[str, Any]]:
+    #     """
+    #     Strategy 3: Paragraph-based chunking
         
-        Groups paragraphs until target token count is reached
-        Preserves paragraph boundaries
-        """
-        chunks = []
+    #     Groups paragraphs until target token count is reached
+    #     Preserves paragraph boundaries
+    #     """
+    #     chunks = []
         
-        # Split into paragraphs (double newline or more)
-        paragraphs = re.split(r'\n\s*\n+', text)
-        paragraphs = [p.strip() for p in paragraphs if p.strip()]
+    #     # Split into paragraphs (double newline or more)
+    #     paragraphs = re.split(r'\n\s*\n+', text)
+    #     paragraphs = [p.strip() for p in paragraphs if p.strip()]
         
-        if not paragraphs:
-            logger.warning("No paragraphs detected, falling back to sentence chunking")
-            return self._chunk_by_sentence(text, base_metadata)
+    #     if not paragraphs:
+    #         logger.warning("No paragraphs detected, falling back to sentence chunking")
+    #         return self._chunk_by_sentence(text, base_metadata)
         
-        chunk_index = 1
-        current_chunk = []
-        current_tokens = 0
+    #     chunk_index = 1
+    #     current_chunk = []
+    #     current_tokens = 0
         
-        for paragraph in paragraphs:
-            para_tokens = self.token_counter.count_tokens(paragraph)
+    #     for paragraph in paragraphs:
+    #         para_tokens = self.token_counter.count_tokens(paragraph)
             
-            # If single paragraph exceeds max, split it by sentences
-            if para_tokens > self.max_chunk_tokens:
-                # Save current chunk if exists
-                if current_chunk:
-                    chunk_text = "\n\n".join(current_chunk)
-                    chunks.append(self._create_chunk(chunk_text, chunk_index, base_metadata))
-                    chunk_index += 1
-                    current_chunk = []
-                    current_tokens = 0
+    #         # If single paragraph exceeds max, split it by sentences
+    #         if para_tokens > self.max_chunk_tokens:
+    #             # Save current chunk if exists
+    #             if current_chunk:
+    #                 chunk_text = "\n\n".join(current_chunk)
+    #                 chunks.append(self._create_chunk(chunk_text, chunk_index, base_metadata))
+    #                 chunk_index += 1
+    #                 current_chunk = []
+    #                 current_tokens = 0
                 
-                # Split long paragraph by sentences
-                sub_chunks = self._chunk_by_sentence(paragraph, base_metadata)
-                for sub_chunk in sub_chunks:
-                    sub_chunk['metadata']['chunk_index'] = chunk_index
-                    chunks.append(sub_chunk)
-                    chunk_index += 1
-                continue
+    #             # Split long paragraph by sentences
+    #             sub_chunks = self._chunk_by_sentence(paragraph, base_metadata)
+    #             for sub_chunk in sub_chunks:
+    #                 sub_chunk['metadata']['chunk_index'] = chunk_index
+    #                 chunks.append(sub_chunk)
+    #                 chunk_index += 1
+    #             continue
             
-            # Check if adding paragraph exceeds target
-            if current_tokens + para_tokens > self.target_chunk_tokens and current_chunk:
-                # Save current chunk
-                chunk_text = "\n\n".join(current_chunk)
-                chunks.append(self._create_chunk(chunk_text, chunk_index, base_metadata))
-                chunk_index += 1
-                current_chunk = []
-                current_tokens = 0
+    #         # Check if adding paragraph exceeds target
+    #         if current_tokens + para_tokens > self.target_chunk_tokens and current_chunk:
+    #             # Save current chunk
+    #             chunk_text = "\n\n".join(current_chunk)
+    #             chunks.append(self._create_chunk(chunk_text, chunk_index, base_metadata))
+    #             chunk_index += 1
+    #             current_chunk = []
+    #             current_tokens = 0
             
-            # Add paragraph to current chunk
-            current_chunk.append(paragraph)
-            current_tokens += para_tokens
+    #         # Add paragraph to current chunk
+    #         current_chunk.append(paragraph)
+    #         current_tokens += para_tokens
         
-        # Save remaining chunk
-        if current_chunk:
-            chunk_text = "\n\n".join(current_chunk)
-            chunks.append(self._create_chunk(chunk_text, chunk_index, base_metadata))
+    #     # Save remaining chunk
+    #     if current_chunk:
+    #         chunk_text = "\n\n".join(current_chunk)
+    #         chunks.append(self._create_chunk(chunk_text, chunk_index, base_metadata))
         
-        return chunks
+    #     return chunks
     
-    # ==================== STRATEGY 4: Sliding Window ====================
+    # # ==================== STRATEGY 4: Sliding Window ====================
     
-    def _chunk_sliding_window(
-        self,
-        text: str,
-        base_metadata: Dict
-    ) -> List[Dict[str, Any]]:
-        """
-        Strategy 4: Sliding window chunking
+    # def _chunk_sliding_window(
+    #     self,
+    #     text: str,
+    #     base_metadata: Dict
+    # ) -> List[Dict[str, Any]]:
+    #     """
+    #     Strategy 4: Sliding window chunking
         
-        Creates overlapping chunks with specified overlap
-        Ensures continuity across chunks
-        """
-        chunks = []
+    #     Creates overlapping chunks with specified overlap
+    #     Ensures continuity across chunks
+    #     """
+    #     chunks = []
         
-        if self.token_counter.encoding:
-            tokens = self.token_counter.get_tokens(text)
+    #     if self.token_counter.encoding:
+    #         tokens = self.token_counter.get_tokens(text)
             
-            if not tokens:
-                return self._chunk_sliding_window_chars(text, base_metadata)
+    #         if not tokens:
+    #             return self._chunk_sliding_window_chars(text, base_metadata)
             
-            stride = self.target_chunk_tokens - self.chunk_overlap_tokens
+    #         stride = self.target_chunk_tokens - self.chunk_overlap_tokens
             
-            if stride <= 0:
-                stride = max(1, self.target_chunk_tokens // 2)
+    #         if stride <= 0:
+    #             stride = max(1, self.target_chunk_tokens // 2)
             
-            chunk_index = 1
-            position = 0
+    #         chunk_index = 1
+    #         position = 0
             
-            while position < len(tokens):
-                chunk_tokens = tokens[position:position + self.target_chunk_tokens]
-                chunk_text = self.token_counter.decode_tokens(chunk_tokens)
+    #         while position < len(tokens):
+    #             chunk_tokens = tokens[position:position + self.target_chunk_tokens]
+    #             chunk_text = self.token_counter.decode_tokens(chunk_tokens)
                 
-                if chunk_text.strip():
-                    chunks.append(self._create_chunk(
-                        chunk_text, chunk_index, base_metadata,
-                        position=position, total_tokens=len(tokens)
-                    ))
-                    chunk_index += 1
+    #             if chunk_text.strip():
+    #                 chunks.append(self._create_chunk(
+    #                     chunk_text, chunk_index, base_metadata,
+    #                     position=position, total_tokens=len(tokens)
+    #                 ))
+    #                 chunk_index += 1
                 
+    #             position += stride
+    #     else:
+    #         chunks = self._chunk_sliding_window_chars(text, base_metadata)
+        
+    #     return chunks
+    
+    # # ==================== STRATEGY 5: Recursive Chunking ====================
+    
+    # def _chunk_recursive(
+    #     self,
+    #     text: str,
+    #     base_metadata: Dict
+    # ) -> List[Dict[str, Any]]:
+    #     """
+    #     Strategy 5: Recursive chunking
+        
+    #     Hierarchically splits text by separators:
+    #     1. Paragraphs (\\n\\n)
+    #     2. Sentences (. ! ?)
+    #     3. Words
+        
+    #     Tries to keep chunks at target size while preserving structure
+    #     """
+    #     separators = [
+    #         "\n\n\n",  # Section breaks
+    #         "\n\n",    # Paragraph breaks
+    #         "\n",      # Line breaks
+    #         ". ",      # Sentences
+    #         "! ",
+    #         "? ",
+    #         "; ",      # Clauses
+    #         ", ",      # Phrases
+    #         " "        # Words
+    #     ]
+        
+    #     chunks = self._recursive_split(text, separators, base_metadata)
+        
+    #     # Add chunk indices
+    #     for i, chunk in enumerate(chunks, 1):
+    #         chunk['metadata']['chunk_index'] = i
+        
+    #     return chunks
+    
+    # def _recursive_split(
+    #     self,
+    #     text: str,
+    #     separators: List[str],
+    #     base_metadata: Dict,
+    #     depth: int = 0
+    # ) -> List[Dict[str, Any]]:
+    #     """Recursively split text by separators"""
+        
+    #     # Base case: text is small enough
+    #     tokens = self.token_counter.count_tokens(text)
+    #     if tokens <= self.target_chunk_tokens:
+    #         if tokens >= self.min_chunk_tokens or depth > len(separators):
+    #             return [self._create_chunk(text, 0, base_metadata)]
+    #         else:
+    #             return []
+        
+    #     # No more separators, force split
+    #     if not separators:
+    #         return self._chunk_fixed_size(text, base_metadata)
+        
+    #     # Try current separator
+    #     separator = separators[0]
+    #     remaining_separators = separators[1:]
+        
+    #     parts = text.split(separator)
+        
+    #     # If split didn't help, try next separator
+    #     if len(parts) == 1:
+    #         return self._recursive_split(text, remaining_separators, base_metadata, depth + 1)
+        
+    #     # Recursively split parts
+    #     chunks = []
+    #     for part in parts:
+    #         if not part.strip():
+    #             continue
+            
+    #         sub_chunks = self._recursive_split(
+    #             part, remaining_separators, base_metadata, depth + 1
+    #         )
+    #         chunks.extend(sub_chunks)
+        
+    #     return chunks
+
+    #==================== STRATEGY 2: Hierarchical Chunking ====================
+    def _chunk_hierarchical(
+    self,
+    text: str,
+    base_metadata: Dict,
+    max_parent_tokens: Optional[int] = None,
+    max_child_tokens: Optional[int] = None,
+    parent_overlap_tokens: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+        """
+        Hierarchical chunking with configurable parent / child sizes and parent overlap.
+
+        Default behavior (when parameters are None):
+        - max_parent_tokens   = 4 × target_chunk_tokens (default 1200 if target=300)
+        - max_child_tokens    = target_chunk_tokens     (default 300)
+        - parent_overlap_tokens = 20% of max_parent_tokens (default ~240)
+
+        Returns chunks where:
+        - Each chunk is a child chunk
+        - Child chunks have 'parent_chunk_id' in metadata
+        - Parent chunks overlap to preserve context continuity
+        """
+        if not text.strip():
+            return []
+
+        # ── Apply defaults if not provided ─────────────────────────────────────
+        if max_parent_tokens is None:
+            max_parent_tokens = max(600, int(self.target_chunk_tokens * 4))   # 4× child size
+
+        if max_child_tokens is None:
+            max_child_tokens = self.target_chunk_tokens
+
+        if parent_overlap_tokens is None:
+            parent_overlap_tokens = int(max_parent_tokens * 0.20)  # 20% of parent
+
+        # Safety: overlap should not exceed parent size
+        parent_overlap_tokens = min(parent_overlap_tokens, max_parent_tokens // 2)
+
+        # ── Phase 1: Create overlapping parent chunks ───────────────────────────
+        parent_chunks = []
+        parent_index = 1
+
+        tokens = self.token_counter.get_tokens(text)
+        if not tokens:
+            # Fallback to character-based
+            return self._chunk_fixed_size_chars(text, base_metadata)
+
+        stride = max_parent_tokens - parent_overlap_tokens
+        if stride <= 0:
+            stride = max_parent_tokens // 2
+
+        position = 0
+        while position < len(tokens):
+            end = min(position + max_parent_tokens, len(tokens))
+            parent_tokens_slice = tokens[position:end]
+            parent_text = self.token_counter.decode_tokens(parent_tokens_slice)
+
+            if not parent_text.strip():
                 position += stride
-        else:
-            chunks = self._chunk_sliding_window_chars(text, base_metadata)
-        
-        return chunks
-    
-    # ==================== STRATEGY 5: Recursive Chunking ====================
-    
-    def _chunk_recursive(
+                continue
+
+            parent = self._create_chunk(
+                parent_text,
+                parent_index,
+                base_metadata,
+                position=position,
+                total_tokens=len(tokens),
+                chunk_type="parent"
+            )
+            parent["chunk_id"] = f"P{parent_index:03d}"
+            parent_chunks.append(parent)
+
+            position += stride
+            parent_index += 1
+
+        # ── Phase 2: Split each parent into child chunks ───────────────────────
+        final_chunks = []
+
+        child_index = 1
+
+        for parent in parent_chunks:
+            parent_id = parent["chunk_id"]
+            parent_text = parent["text"]
+
+            # Now split this parent into children
+            child_chunks = self._recursive_split_children(
+                parent_text,
+                max_child_tokens,
+                base_metadata,
+                parent_id=parent_id,
+                child_index_start=child_index
+            )
+
+            final_chunks.extend(child_chunks)
+            child_index += len(child_chunks)
+
+        logger.info(
+            f"Hierarchical chunking → "
+            f"{len(parent_chunks)} parents, "
+            f"{len(final_chunks)} child chunks "
+            f"(parent overlap: {parent_overlap_tokens} tokens)"
+        )
+
+        return final_chunks
+
+
+    def _recursive_split_children(
         self,
         text: str,
-        base_metadata: Dict
-    ) -> List[Dict[str, Any]]:
-        """
-        Strategy 5: Recursive chunking
-        
-        Hierarchically splits text by separators:
-        1. Paragraphs (\\n\\n)
-        2. Sentences (. ! ?)
-        3. Words
-        
-        Tries to keep chunks at target size while preserving structure
-        """
-        separators = [
-            "\n\n\n",  # Section breaks
-            "\n\n",    # Paragraph breaks
-            "\n",      # Line breaks
-            ". ",      # Sentences
-            "! ",
-            "? ",
-            "; ",      # Clauses
-            ", ",      # Phrases
-            " "        # Words
-        ]
-        
-        chunks = self._recursive_split(text, separators, base_metadata)
-        
-        # Add chunk indices
-        for i, chunk in enumerate(chunks, 1):
-            chunk['metadata']['chunk_index'] = i
-        
-        return chunks
-    
-    def _recursive_split(
-        self,
-        text: str,
-        separators: List[str],
+        max_tokens: int,
         base_metadata: Dict,
+        parent_id: str,
+        child_index_start: int = 1,
         depth: int = 0
     ) -> List[Dict[str, Any]]:
-        """Recursively split text by separators"""
-        
-        # Base case: text is small enough
-        tokens = self.token_counter.count_tokens(text)
-        if tokens <= self.target_chunk_tokens:
-            if tokens >= self.min_chunk_tokens or depth > len(separators):
-                return [self._create_chunk(text, 0, base_metadata)]
-            else:
-                return []
-        
-        # No more separators, force split
-        if not separators:
+        """
+        Recursively split a parent text block into child chunks.
+        """
+        tokens_count = self.token_counter.count_tokens(text)
+
+        if tokens_count <= max_tokens:
+            if tokens_count >= self.min_chunk_tokens or depth >= 6:
+                child = self._create_chunk(
+                    text,
+                    child_index_start,
+                    base_metadata,
+                    chunk_type="child"
+                )
+                child["metadata"]["parent_chunk_id"] = parent_id
+                return [child]
+            return []
+
+        # Separators — coarse to fine
+        separators = [
+            "\n\n\n",        # sections
+            "\n\n",          # paragraphs
+            ". ", "! ", "? ",  # sentences
+            "; ", ", ",      # clauses/phrases
+            " "              # words
+        ]
+
+        if depth >= len(separators):
+            # Deepest level — force fixed-size
             return self._chunk_fixed_size(text, base_metadata)
-        
-        # Try current separator
-        separator = separators[0]
-        remaining_separators = separators[1:]
-        
-        parts = text.split(separator)
-        
-        # If split didn't help, try next separator
-        if len(parts) == 1:
-            return self._recursive_split(text, remaining_separators, base_metadata, depth + 1)
-        
-        # Recursively split parts
-        chunks = []
-        for part in parts:
-            if not part.strip():
-                continue
-            
-            sub_chunks = self._recursive_split(
-                part, remaining_separators, base_metadata, depth + 1
+
+        sep = separators[depth]
+        parts = [p.strip() for p in text.split(sep) if p.strip()]
+
+        if len(parts) <= 1:
+            # No useful split — go deeper
+            return self._recursive_split_children(
+                text, max_tokens, base_metadata, parent_id,
+                child_index_start, depth + 1
             )
-            chunks.extend(sub_chunks)
+
+        child_chunks = []
+        current_child_index = child_index_start
+
+        for part in parts:
+            sub_chunks = self._recursive_split_children(
+                part, max_tokens, base_metadata, parent_id,
+                current_child_index, depth + 1
+            )
+            child_chunks.extend(sub_chunks)
+            current_child_index += len(sub_chunks)
+
+        return child_chunks
         
-        return chunks
     
-    # ==================== STRATEGY 6: Semantic Chunking ====================
-    
+    # ==================== STRATEGY 3: Semantic Chunking ====================
     def _chunk_semantic(
-        self,
-        text: str,
-        base_metadata: Dict
+    self,
+    text: str,
+    base_metadata: Dict
     ) -> List[Dict[str, Any]]:
         """
-        Strategy 6: Semantic chunking
-        
-        Groups semantically similar sentences together
-        Uses simple heuristics:
-        - Sentence similarity based on keyword overlap
-        - Respects paragraph boundaries
-        - Groups related sentences
+        Improved semantic chunking:
+        - Groups semantically similar sentences (keyword + cosine similarity fallback)
+        - Respects paragraph boundaries, lists, code blocks
+        - Enforces minimum chunk size
+        - Merges very small chunks with neighbors
+        - Preserves structure (headings, code, lists)
         """
+        if not text.strip():
+            return []
+
         chunks = []
-        
-        # Split into sentences
-        sentences = self._split_into_sentences(text)
-        
-        if not sentences:
-            return self._chunk_by_sentence(text, base_metadata)
-        
         chunk_index = 1
-        current_chunk = []
+
+        # ── 1. Split into meaningful units (paragraphs + preserve structure) ─────
+        units = self._split_into_structured_units(text)
+
+        if not units:
+            # Fallback if no structure detected
+            return self._chunk_by_sentence(text, base_metadata)
+
+        current_chunk_sentences = []
+        current_chunk_text = ""
         current_tokens = 0
-        
-        for i, sentence in enumerate(sentences):
-            sentence_tokens = self.token_counter.count_tokens(sentence)
-            
-            # First sentence or chunk is empty
-            if not current_chunk:
-                current_chunk.append(sentence)
-                current_tokens = sentence_tokens
-                continue
-            
-            # Check semantic similarity with current chunk
-            is_similar = self._is_semantically_similar(
-                " ".join(current_chunk), sentence
-            )
-            
-            # Decide whether to add to current chunk or start new one
-            would_exceed = (current_tokens + sentence_tokens) > self.target_chunk_tokens
-            
-            if would_exceed or (not is_similar and current_tokens >= self.min_chunk_tokens):
-                # Save current chunk
-                chunk_text = " ".join(current_chunk)
-                chunks.append(self._create_chunk(chunk_text, chunk_index, base_metadata))
-                chunk_index += 1
-                current_chunk = [sentence]
-                current_tokens = sentence_tokens
+
+        for unit in units:
+            unit_type = unit["type"]
+            unit_text = unit["text"]
+            unit_tokens = self.token_counter.count_tokens(unit_text)
+
+            # Special handling for structural elements
+            if unit_type in ("heading", "code_block", "list_item"):
+                # Structural units often start/force new chunks
+                if current_chunk_sentences:
+                    chunk_text = " ".join(current_chunk_sentences)
+                    chunks.append(self._create_chunk(
+                        chunk_text, chunk_index, base_metadata,
+                        chunk_type="semantic"
+                    ))
+                    chunk_index += 1
+                    current_chunk_sentences = []
+                    current_chunk_text = ""
+                    current_tokens = 0
+
+                # Add the structural unit as its own chunk if large
+                if unit_tokens > self.min_chunk_tokens:
+                    chunks.append(self._create_chunk(
+                        unit_text, chunk_index, base_metadata,
+                        chunk_type=unit_type
+                    ))
+                    chunk_index += 1
+                    continue
+
+            # Normal text unit (paragraph / sentence group)
+            if current_tokens + unit_tokens <= self.target_chunk_tokens:
+                # Try to add to current chunk
+                if not current_chunk_sentences or self._is_semantically_similar(
+                    current_chunk_text, unit_text, threshold=0.25
+                ):
+                    current_chunk_sentences.append(unit_text)
+                    current_chunk_text += " " + unit_text
+                    current_tokens += unit_tokens
+                else:
+                    # Not similar → save current and start new
+                    if current_chunk_sentences:
+                        chunk_text = " ".join(current_chunk_sentences)
+                        chunks.append(self._create_chunk(
+                            chunk_text, chunk_index, base_metadata,
+                            chunk_type="semantic"
+                        ))
+                        chunk_index += 1
+                    current_chunk_sentences = [unit_text]
+                    current_chunk_text = unit_text
+                    current_tokens = unit_tokens
             else:
-                # Add to current chunk
-                current_chunk.append(sentence)
-                current_tokens += sentence_tokens
-        
-        # Save remaining chunk
-        if current_chunk:
-            chunk_text = " ".join(current_chunk)
-            chunks.append(self._create_chunk(chunk_text, chunk_index, base_metadata))
-        
-        return chunks
+                # Would exceed size → save current chunk
+                if current_chunk_sentences:
+                    chunk_text = " ".join(current_chunk_sentences)
+                    chunks.append(self._create_chunk(
+                        chunk_text, chunk_index, base_metadata,
+                        chunk_type="semantic"
+                    ))
+                    chunk_index += 1
+                # Start new chunk with current unit
+                current_chunk_sentences = [unit_text]
+                current_chunk_text = unit_text
+                current_tokens = unit_tokens
+
+        # Save the last chunk
+        if current_chunk_sentences:
+            chunk_text = " ".join(current_chunk_sentences)
+            chunks.append(self._create_chunk(
+                chunk_text, chunk_index, base_metadata,
+                chunk_type="semantic"
+            ))
+
+        # ── Post-processing: merge very small chunks ────────────────────────────
+        merged_chunks = []
+        i = 0
+        while i < len(chunks):
+            current = chunks[i]
+            current_tok = current["token_count"]
+
+            # If chunk is too small → try to merge with next
+            if current_tok < self.min_chunk_tokens and i + 1 < len(chunks):
+                next_chunk = chunks[i + 1]
+                combined_text = current["text"] + " " + next_chunk["text"]
+                combined_tok = current_tok + next_chunk["token_count"]
+
+                if combined_tok <= self.target_chunk_tokens:
+                    merged = self._create_chunk(
+                        combined_text,
+                        len(merged_chunks) + 1,
+                        base_metadata,
+                        chunk_type="semantic_merged"
+                    )
+                    merged_chunks.append(merged)
+                    i += 2  # skip next one
+                    continue
+
+            merged_chunks.append(current)
+            i += 1
+
+        logger.info(f"Semantic chunking created {len(merged_chunks)} chunks "
+                    f"(after merging small fragments)")
+
+        return merged_chunks
+
+
+    def _split_into_structured_units(self, text: str) -> List[Dict]:
+        """
+        Split text into meaningful units while preserving structure:
+        - Headings
+        - Code blocks
+        - Ordered/unordered lists
+        - Normal paragraphs
+        """
+        units = []
+
+        # Regex patterns for structure detection
+        heading_pattern = r'^(#{1,6}\s+.+?)$'
+        code_block_pattern = r'```[\s\S]*?```'
+        list_pattern = r'^\s*([-*+]|\d+\.)\s+.+'
+
+        lines = text.split('\n')
+        current_unit = ""
+        current_type = "paragraph"
+
+        i = 0
+        while i < len(lines):
+            line = lines[i].rstrip()
+
+            # Heading
+            if re.match(heading_pattern, line):
+                if current_unit:
+                    units.append({"type": current_type, "text": current_unit.strip()})
+                units.append({"type": "heading", "text": line})
+                current_unit = ""
+                current_type = "paragraph"
+                i += 1
+                continue
+
+            # Code block
+            if line.strip().startswith("```"):
+                if current_unit:
+                    units.append({"type": current_type, "text": current_unit.strip()})
+                code_start = i
+                i += 1
+                while i < len(lines) and not lines[i].strip().startswith("```"):
+                    i += 1
+                if i < len(lines):
+                    i += 1
+                code_text = "\n".join(lines[code_start:i])
+                units.append({"type": "code_block", "text": code_text})
+                current_unit = ""
+                continue
+
+            # List item
+            if re.match(list_pattern, line):
+                if current_unit and current_type != "list":
+                    units.append({"type": current_type, "text": current_unit.strip()})
+                current_type = "list"
+                current_unit += line + "\n"
+                i += 1
+                continue
+
+            # Normal paragraph line
+            if line.strip():
+                if current_type != "paragraph":
+                    if current_unit:
+                        units.append({"type": current_type, "text": current_unit.strip()})
+                    current_type = "paragraph"
+                    current_unit = ""
+                current_unit += line + " "
+            else:
+                # Blank line — end current paragraph
+                if current_unit.strip():
+                    units.append({"type": current_type, "text": current_unit.strip()})
+                    current_unit = ""
+                    current_type = "paragraph"
+
+            i += 1
+
+        # Don't forget last unit
+        if current_unit.strip():
+            units.append({"type": current_type, "text": current_unit.strip()})
+
+        return units
     
     # ==================== Helper Methods ====================
     
@@ -628,7 +963,8 @@ class EnhancedChunkingService:
         chunk_index: int,
         base_metadata: Dict,
         position: Optional[int] = None,
-        total_tokens: Optional[int] = None
+        total_tokens: Optional[int] = None,
+        chunk_type: str = "text"
     ) -> Dict[str, Any]:
         """Create a chunk dictionary"""
         
@@ -642,7 +978,7 @@ class EnhancedChunkingService:
             'token_count': token_count,
             'metadata': {
                 'chunk_index': chunk_index,
-                'chunk_type': 'text',
+                'chunk_type': chunk_type,
                 'page_number': page_number,
                 **base_metadata
             }

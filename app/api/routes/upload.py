@@ -289,7 +289,91 @@ def extract_document_background(
             if progress_callback:
                 progress_callback(90.0)
             
-            # ✅ Mark as COMPLETED after extraction
+            # CHUNKING
+            logger.info(f"📊 [Task {task_id}] Stage: Chunking")
+            
+            chunk_tokens = target_chunk_tokens or settings.target_chunk_tokens
+            overlap_tokens = chunk_overlap_tokens or settings.chunk_overlap_tokens
+            
+            chunking_service = EnhancedChunkingService(
+                target_chunk_tokens=chunk_tokens,
+                chunk_overlap_tokens=overlap_tokens
+            )
+            
+            strategy_enum = SchemaChunkingStrategy(chunking_strategy)
+            
+            base_metadata = {
+                'user_id': user_id,
+                'file_id': file_id,
+                'filename': safe_filename,
+                'knowledge_base_id': knowledge_base_id,
+                'knowledge_base_name': knowledge_base_name
+            }
+            
+            chunking_start = time.time()
+            
+            chunks = chunking_service.split_document_into_chunks(
+                markdown_content,
+                base_metadata=base_metadata,
+                strategy=strategy_enum
+            )
+            
+            chunking_time = time.time() - chunking_start
+            
+            logger.info(f"✅ [Task {task_id}] Created {len(chunks)} chunks")
+            
+            if progress_callback:
+                progress_callback(70.0, ProcessingStage.PROCESSING)
+            
+            # EMBEDDING & INDEXING WITH KB METADATA
+            logger.info(f"📊 [Task {task_id}] Stage: Embedding & Indexing to KB '{knowledge_base_name}'")
+            
+            vector_store = VectorStoreService()
+            
+            indexing_start = time.time()
+            
+            # NEW: Pass KB info to vector store
+            chunks_added = vector_store.add_document_chunks(
+                chunks,
+                file_id,
+                safe_filename,
+                knowledge_base_id=knowledge_base_id,
+                knowledge_base_name=knowledge_base_name,
+                user_id=user_id,
+                structured_data={'filename': safe_filename, 'file_id': file_id}
+            )
+            
+            indexing_time = time.time() - indexing_start
+            
+            logger.info(f"✅ [Task {task_id}] Indexed {chunks_added} chunks to KB '{knowledge_base_name}'")
+            
+            if progress_callback:
+                progress_callback(90.0, ProcessingStage.PROCESSING)
+            
+            # SAVE TO DATABASE
+            db_start = time.time()
+            
+            for chunk in chunks:
+                chunk_db = ChunkMetadata(
+                    chunk_id=chunk['chunk_id'],
+                    file_id=file_id,
+                    chunk_index=chunk['metadata']['chunk_index'],
+                    chunk_type=chunk['metadata'].get('chunk_type', 'text'),
+                    char_count=chunk['char_count'],
+                    page_number=chunk['metadata'].get('page_number', 0),
+                    created_at=datetime.utcnow()
+                )
+                db.add(chunk_db)
+            
+            # Map strategy
+            strategy_map = {
+                'default': ChunkingStrategyEnum.DEFAULT,
+                'fixed_size': ChunkingStrategyEnum.FIXED_SIZE,
+                'hierarchical': ChunkingStrategyEnum.HIERARCHICAL,
+                'semantic': ChunkingStrategyEnum.SEMANTIC
+            }
+            
+            # Update file metadata
             file_metadata.status = DBProcessingStatus.COMPLETED
             file_metadata.processed_at = datetime.utcnow()
             file_metadata.markdown_path = str(markdown_path) if markdown_saved else None

@@ -37,11 +37,9 @@ class SearchType(str, Enum):
 
 class ChunkingStrategy(str, Enum):
     """Available chunking strategies"""
+    DEFAULT = "default"
     FIXED_SIZE = "fixed_size"
-    SENTENCE = "sentence"
-    PARAGRAPH = "paragraph"
-    SLIDING_WINDOW = "sliding_window"
-    RECURSIVE = "recursive"
+    HIERARCHICAL = "hierarchical"
     SEMANTIC = "semantic"
 
 
@@ -143,7 +141,7 @@ class ProcessDocumentRequest(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
     
     chunking_strategy: ChunkingStrategy = Field(
-        default=ChunkingStrategy.FIXED_SIZE,
+        default=ChunkingStrategy.DEFAULT,
         description="Chunking strategy to use"
     )
     

@@ -36,11 +36,9 @@ class FileType(str, enum.Enum):
 
 class ChunkingStrategyEnum(str, enum.Enum):
     """Chunking strategies"""
+    DEFAULT = "default"
     FIXED_SIZE = "fixed_size"
-    SENTENCE = "sentence"
-    PARAGRAPH = "paragraph"
-    SLIDING_WINDOW = "sliding_window"
-    RECURSIVE = "recursive"
+    HIERARCHICAL = "hierarchical"
     SEMANTIC = "semantic"
 
 
@@ -143,7 +141,7 @@ class FileMetadata(Base):
     # Chunking strategy
     chunking_strategy = Column(
         Enum(ChunkingStrategyEnum),
-        default=ChunkingStrategyEnum.FIXED_SIZE,
+        default=ChunkingStrategyEnum.DEFAULT,
         nullable=True
     )
     target_chunk_tokens = Column(Integer, default=512, nullable=False)
