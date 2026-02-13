@@ -707,17 +707,23 @@ class EnhancedChunkingService:
     
     # ==================== STRATEGY 3: Semantic Chunking ====================
     def _chunk_semantic(
-    self,
-    text: str,
-    base_metadata: Dict
+        self,
+        text: str,
+        max_buffer_size: int,
+        max_chunk_tokens: int,
+        threshold: float,
+        base_metadata: Dict[str, Any]
     ) -> List[Dict[str, Any]]:
         """
-        Improved semantic chunking:
-        - Groups semantically similar sentences (keyword + cosine similarity fallback)
-        - Respects paragraph boundaries, lists, code blocks
-        - Enforces minimum chunk size
-        - Merges very small chunks with neighbors
-        - Preserves structure (headings, code, lists)
+        Semantic chunking with configurable parameters passed from caller/UI.
+
+        Args:
+            text: Input document text
+            max_buffer_size: Max number of previous sentences/units to compare for similarity
+            max_chunk_tokens: Hard maximum tokens per chunk
+            threshold: Similarity threshold (higher = more similar → larger chunks)
+                    (0.0–1.0 range, e.g. 0.25–0.4 is common for Jaccard/keyword)
+            base_metadata: Metadata applied to all chunks
         """
         if not text.strip():
             return []
@@ -732,7 +738,9 @@ class EnhancedChunkingService:
             # Fallback if no structure detected
             return self._chunk_by_sentence(text, base_metadata)
 
-        current_chunk_sentences = []
+        # We'll keep a short history buffer for similarity comparison
+        history: List[str] = []           # last max_buffer_size texts
+        current_chunk_sentences: List[str] = []
         current_chunk_text = ""
         current_tokens = 0
 
@@ -741,9 +749,9 @@ class EnhancedChunkingService:
             unit_text = unit["text"]
             unit_tokens = self.token_counter.count_tokens(unit_text)
 
-            # Special handling for structural elements
+            # ── Special handling for structural/important elements ───────────────
             if unit_type in ("heading", "code_block", "list_item"):
-                # Structural units often start/force new chunks
+                # Force save current chunk if any
                 if current_chunk_sentences:
                     chunk_text = " ".join(current_chunk_sentences)
                     chunks.append(self._create_chunk(
@@ -754,39 +762,54 @@ class EnhancedChunkingService:
                     current_chunk_sentences = []
                     current_chunk_text = ""
                     current_tokens = 0
+                    history = []  # reset history after structural break
 
-                # Add the structural unit as its own chunk if large
-                if unit_tokens > self.min_chunk_tokens:
+                # Add structural unit as its own chunk if large enough
+                if unit_tokens >= self.min_chunk_tokens:
                     chunks.append(self._create_chunk(
                         unit_text, chunk_index, base_metadata,
                         chunk_type=unit_type
                     ))
                     chunk_index += 1
-                    continue
 
-            # Normal text unit (paragraph / sentence group)
-            if current_tokens + unit_tokens <= self.target_chunk_tokens:
-                # Try to add to current chunk
-                if not current_chunk_sentences or self._is_semantically_similar(
-                    current_chunk_text, unit_text, threshold=0.25
-                ):
-                    current_chunk_sentences.append(unit_text)
-                    current_chunk_text += " " + unit_text
-                    current_tokens += unit_tokens
-                else:
-                    # Not similar → save current and start new
-                    if current_chunk_sentences:
-                        chunk_text = " ".join(current_chunk_sentences)
-                        chunks.append(self._create_chunk(
-                            chunk_text, chunk_index, base_metadata,
-                            chunk_type="semantic"
-                        ))
-                        chunk_index += 1
-                    current_chunk_sentences = [unit_text]
-                    current_chunk_text = unit_text
-                    current_tokens = unit_tokens
+                # Add to history (for future similarity checks)
+                if len(history) >= max_buffer_size:
+                    history.pop(0)
+                history.append(unit_text)
+
+                continue
+
+            # ── Normal content unit ───────────────────────────────────────────────
+            can_add = True
+
+            # 1. Token limit check
+            if current_tokens + unit_tokens > max_chunk_tokens:
+                can_add = False
+
+            # 2. Semantic similarity check (only if we have history)
+            if can_add and history and current_chunk_sentences:
+                # Average similarity to recent history
+                similarities = [
+                    self._is_semantically_similar(h, unit_text, threshold=threshold)
+                    for h in history[-max_buffer_size:]
+                ]
+                avg_sim = sum(similarities) / len(similarities)
+
+                if not avg_sim:  # below threshold
+                    can_add = False
+
+            if can_add:
+                current_chunk_sentences.append(unit_text)
+                current_chunk_text += (" " if current_chunk_text else "") + unit_text
+                current_tokens += unit_tokens
+
+                # Add current unit to history
+                if len(history) >= max_buffer_size:
+                    history.pop(0)
+                history.append(unit_text)
+
             else:
-                # Would exceed size → save current chunk
+                # Cannot add → save current chunk and start new
                 if current_chunk_sentences:
                     chunk_text = " ".join(current_chunk_sentences)
                     chunks.append(self._create_chunk(
@@ -794,12 +817,16 @@ class EnhancedChunkingService:
                         chunk_type="semantic"
                     ))
                     chunk_index += 1
+
                 # Start new chunk with current unit
                 current_chunk_sentences = [unit_text]
                 current_chunk_text = unit_text
                 current_tokens = unit_tokens
 
-        # Save the last chunk
+                # Reset history on chunk boundary
+                history = [unit_text]
+
+        # ── Don't forget the last chunk ─────────────────────────────────────────
         if current_chunk_sentences:
             chunk_text = " ".join(current_chunk_sentences)
             chunks.append(self._create_chunk(
@@ -807,20 +834,20 @@ class EnhancedChunkingService:
                 chunk_type="semantic"
             ))
 
-        # ── Post-processing: merge very small chunks ────────────────────────────
+        # ── Post-processing: merge very small chunks ─────────────────────────────
         merged_chunks = []
         i = 0
         while i < len(chunks):
             current = chunks[i]
             current_tok = current["token_count"]
 
-            # If chunk is too small → try to merge with next
             if current_tok < self.min_chunk_tokens and i + 1 < len(chunks):
                 next_chunk = chunks[i + 1]
                 combined_text = current["text"] + " " + next_chunk["text"]
                 combined_tok = current_tok + next_chunk["token_count"]
 
-                if combined_tok <= self.target_chunk_tokens:
+                # Respect max_chunk_tokens when merging
+                if combined_tok <= max_chunk_tokens:
                     merged = self._create_chunk(
                         combined_text,
                         len(merged_chunks) + 1,
@@ -828,14 +855,17 @@ class EnhancedChunkingService:
                         chunk_type="semantic_merged"
                     )
                     merged_chunks.append(merged)
-                    i += 2  # skip next one
+                    i += 2
                     continue
 
             merged_chunks.append(current)
             i += 1
 
-        logger.info(f"Semantic chunking created {len(merged_chunks)} chunks "
-                    f"(after merging small fragments)")
+        logger.info(
+            f"Semantic chunking created {len(merged_chunks)} chunks "
+            f"(max_buffer={max_buffer_size}, threshold={threshold}, "
+            f"max_tokens={max_chunk_tokens})"
+        )
 
         return merged_chunks
 

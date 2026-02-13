@@ -243,11 +243,26 @@ async def finalize_chunks(
         
         chunks_to_index = query.all()
         
+        # Debug logging
+        logger.info(f"🔍 Query for file_id={file_id}: Found {len(chunks_to_index)} chunks in DB")
+        logger.info(f"📊 File metadata shows chunks_created={file_metadata.chunks_created}")
+        
         if not chunks_to_index:
-            raise HTTPException(
-                status_code=400,
-                detail="No chunks to index"
-            )
+            # Count all chunks in DB to debug
+            total_chunks_in_db = db.query(ChunkMetadata).count()
+            logger.error(f"❌ No chunks found for file_id={file_id}. Total chunks in DB: {total_chunks_in_db}")
+            
+            # Try to refresh session and query again
+            db.refresh(file_metadata)
+            chunks_to_index = db.query(ChunkMetadata).filter(
+                ChunkMetadata.file_id == file_id
+            ).all()
+            
+            if not chunks_to_index:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"No chunks to index. File shows chunks_created={file_metadata.chunks_created} but DB is empty. This indicates chunks were not properly committed. Try recreating chunks with force_recreate=true"
+                )
         
         logger.info(f"📊 Indexing {len(chunks_to_index)} chunks to vector DB")
         

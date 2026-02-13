@@ -250,12 +250,7 @@ class PDFExtractor(BaseExtractor):
             pipeline_options.do_table_structure = False  # Faster
             pipeline_options.generate_picture_images = False  # Faster
             
-            # Still configure GPU for consistency (though not used in this minimal mode)
-            if self.is_gpu_available:
-                pipeline_options.ocr_options = {
-                    'use_gpu': True,
-                    'gpu_id': 0
-                }
+            # OCR disabled for page count - no need to configure GPU
             
             converter = DocumentConverter(
                 format_options={
@@ -408,7 +403,6 @@ class PDFExtractor(BaseExtractor):
                 extract_images_in_pdf=True,  # Extract images
                 infer_table_structure=True,  # Infer tables
                 strategy="hi_res",  # High resolution
-                languages=["eng"],
                 extract_image_block_output_dir=str(temp_image_dir)
             )
             
@@ -647,16 +641,8 @@ class PDFExtractor(BaseExtractor):
         pipeline_options.generate_picture_images = True
         
         # ⚡ ENABLE GPU FOR OCR
-        if self.is_gpu_available and pipeline_options.do_ocr:
-            try:
-                pipeline_options.ocr_options = {
-                    'use_gpu': True,
-                    'gpu_id': 0,
-                    'verbose': False
-                }
-                logger.info("🎮 Docling OCR configured to use GPU")
-            except Exception as e:
-                logger.warning(f"Could not enable GPU for OCR: {e}")
+        # OCR configuration removed - use Docling defaults
+        # Custom ocr_options can cause compatibility issues with different Docling versions
         
         try:
             pipeline_options.generate_page_images = False
