@@ -85,7 +85,7 @@ class Settings(BaseSettings):
     
     # HuggingFace SPLADE Model (Sparse Vectors ONLY)
     splade_model_name: str = Field(
-        default="naver/splade-v3",
+        default="naver/splade-cocondenser-selfdistil",
         description="HuggingFace SPLADE model for sparse vectors",
         token=os.getenv('HUGGINGFACE_API_TOKEN')
     )
@@ -107,7 +107,7 @@ class Settings(BaseSettings):
     
     # Database URL - supports both SQLite and PostgreSQL
     database_url: str = Field(
-        default="postgresql+psycopg2://postgres:aadi@localhost:5432/oneragdb",
+        default="postgresql+psycopg2://postgres:root@localhost:5432/one-rag-db",
         description="Database URL (SQLite or PostgreSQL)"
     )
     
