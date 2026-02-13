@@ -33,8 +33,15 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/knowledge-bases", tags=["Knowledge Bases"])
 
-# Initialize services
-vector_store = VectorStoreService()
+# Initialize services with lazy loading
+_vector_store = None
+
+def get_vector_store():
+    """Get or initialize vector store (lazy loading)"""
+    global _vector_store
+    if _vector_store is None:
+        _vector_store = VectorStoreService()
+    return _vector_store
 
 
 @router.post("/", response_model=KnowledgeBaseInfo)
@@ -212,7 +219,7 @@ async def get_knowledge_base_status(
         documents = [DocumentInfo(**f.to_dict()) for f in files]
         
         # Get vector store stats
-        vector_stats = vector_store.get_collection_stats(
+        vector_stats = get_vector_store().get_collection_stats(
             user_id=user_id,
             knowledge_base_id=kb_id
         )
@@ -402,7 +409,7 @@ async def delete_knowledge_base(
         
         # 3. Delete from vector store
         try:
-            chunks_deleted = vector_store.delete_knowledge_base(kb_id, user_id)
+            chunks_deleted = get_vector_store().delete_knowledge_base(kb_id, user_id)
             deletion_stats["chunks_deleted_vector"] = chunks_deleted
             logger.info(f"  ✓ Deleted {chunks_deleted} chunks from vector store")
         except Exception as e:
@@ -552,7 +559,7 @@ async def delete_document_from_kb(
         file_size = file_metadata.file_size_bytes
         
         # Delete from vector store
-        success = vector_store.delete_document_by_file_id(file_id, user_id, kb_id)
+        success = get_vector_store().delete_document_by_file_id(file_id, user_id, kb_id)
         if not success:
             logger.warning(f"Document {file_id} not found in vector store")
         

@@ -78,6 +78,9 @@ class PDFExtractor(BaseExtractor):
         self.image_service = get_image_description_service()
         # self.caption_detector = CaptionDetector
         
+        # Initialize GPU availability from settings
+        self.is_gpu_available = settings.is_gpu_available
+        
         # Statistics tracking
         self.extraction_stats = {
             'total_extractions': 0,
@@ -250,7 +253,12 @@ class PDFExtractor(BaseExtractor):
             pipeline_options.do_table_structure = False  # Faster
             pipeline_options.generate_picture_images = False  # Faster
             
-            # OCR disabled for page count - no need to configure GPU
+            # Still configure GPU for consistency (though not used in this minimal mode)
+            if self.is_gpu_available:
+                pipeline_options.ocr_options = {
+                    'use_gpu': True,
+                    'gpu_id': 0
+                }
             
             converter = DocumentConverter(
                 format_options={
@@ -258,21 +266,24 @@ class PDFExtractor(BaseExtractor):
                 }
             )
             
+            logger.debug(f"Converting PDF with Docling: {Path(file_path).name}")
             result = converter.convert(file_path)
             page_count = len(result.document.pages)
             logger.debug(f"✓ Docling page count: {page_count}")
             return page_count
             
         except Exception as e:
-            logger.warning(f"Docling page count failed: {e}")
+            logger.error(f"❌ Docling page count failed: {e}", exc_info=True)
             return 0
     
     def _get_unstructured_page_count(self, file_path: str) -> int:
         """Get Unstructured page count (quick check - fast strategy)"""
         if not UNSTRUCTURED_AVAILABLE:
+            logger.debug("Unstructured not available, skipping page count")
             return 0
         
         try:
+            logger.debug(f"Running Unstructured partition_pdf (fast strategy): {Path(file_path).name}")
             # Use fast strategy for quick page count
             elements = partition_pdf(
                 filename=file_path,
@@ -281,19 +292,25 @@ class PDFExtractor(BaseExtractor):
                 strategy="fast",  # Fastest strategy
             )
             
+            if not elements:
+                logger.debug("❌ Unstructured returned no elements")
+                return 0
+            
+            logger.debug(f"Unstructured returned {len(elements)} elements")
+            
             # Get unique page numbers
-            page_numbers = {
-                elem.metadata.page_number 
-                for elem in elements 
-                if elem.metadata.page_number
-            }
+            page_numbers = set()
+            for elem in elements:
+                if hasattr(elem, 'metadata') and elem.metadata:
+                    if hasattr(elem.metadata, 'page_number') and elem.metadata.page_number:
+                        page_numbers.add(elem.metadata.page_number)
             
             page_count = max(page_numbers) if page_numbers else 0
-            logger.debug(f"✓ Unstructured page count: {page_count}")
+            logger.debug(f"✓ Unstructured page count: {page_count} (from {len(page_numbers)} unique pages, {len(elements)} total elements)")
             return page_count
             
         except Exception as e:
-            logger.warning(f"Unstructured page count failed: {e}")
+            logger.error(f"❌ Unstructured page count failed: {e}", exc_info=True)
             return 0
     
     # ============================================================================
