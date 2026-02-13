@@ -147,7 +147,7 @@ class VectorStoreService:
                 )
                 logger.info("✓ SPLADE sparse embeddings initialized")
             except Exception as e:
-                logger.warning(f"SPLADE initialization failed: {e}")
+                logger.error(f"SPLADE initialization failed: {str(e)}", exc_info=True)
                 logger.warning("Continuing with dense-only search")
                 self.sparse_embeddings = None
             
@@ -187,36 +187,55 @@ class VectorStoreService:
     def _initialize_collection(self):
         """Create collection with dense + sparse vectors"""
         try:
-            collections = self.client.get_collections().collections
-            collection_names = [col.name for col in collections]
+            dense_dim = self.dense_embeddings.get_embedding_dimension()
             
-            if self.collection_name not in collection_names:
-                dense_dim = self.dense_embeddings.get_embedding_dimension()
-                
-                vectors_config = {
-                    "dense": VectorParams(size=dense_dim, distance=Distance.COSINE)
+            vectors_config = {
+                "dense": VectorParams(size=dense_dim, distance=Distance.COSINE)
+            }
+            
+            sparse_config = None
+            if self.sparse_embeddings:
+                sparse_config = {
+                    "sparse": SparseVectorParams(index=SparseIndexParams())
                 }
+            
+            try:
+                # Try to get existing collection
+                col = self.client.get_collection(self.collection_name)
                 
-                sparse_config = None
-                if self.sparse_embeddings:
-                    sparse_config = {
-                        "sparse": SparseVectorParams(index=SparseIndexParams())
-                    }
+                # Check if it has sparse when we need it
+                has_sparse_field = col.config.sparse_vectors_config is not None and 'sparse' in col.config.sparse_vectors_config
+                needs_sparse = self.sparse_embeddings is not None
                 
+                if needs_sparse and not has_sparse_field:
+                    logger.warning(f"⚠️  Collection '{self.collection_name}' exists but lacks sparse vectors")
+                    logger.info(f"Deleting collection to recreate with both dense + sparse...")
+                    self.client.delete_collection(self.collection_name)
+                    
+                    # Create fresh collection with sparse
+                    self.client.create_collection(
+                        collection_name=self.collection_name,
+                        vectors_config=vectors_config,
+                        sparse_vectors_config=sparse_config
+                    )
+                    self._create_payload_indexes()
+                    logger.info(f"✅ Recreated collection '{self.collection_name}' with sparse support")
+                else:
+                    logger.info(f"✓ Collection '{self.collection_name}' has correct schema")
+                    
+            except Exception as col_error:
+                # Collection doesn't exist, create it
+                logger.debug(f"Collection doesn't exist ({str(col_error)}), creating new")
                 self.client.create_collection(
                     collection_name=self.collection_name,
                     vectors_config=vectors_config,
                     sparse_vectors_config=sparse_config
                 )
-                
                 self._create_payload_indexes()
-                
-                logger.info(f"✓ Created collection: {self.collection_name}")
-            else:
-                logger.info(f"✓ Using existing collection: {self.collection_name}")
+                logger.info(f"✅ Created collection '{self.collection_name}' with dense + sparse vectors")
                 
         except Exception as e:
-            logger.error(f"Error initializing collection: {e}", exc_info=True)
+            logger.error(f"Failed to initialize collection: {e}", exc_info=True)
             raise VectorStoreException(f"Failed to initialize collection: {str(e)}")
     
     def _create_payload_indexes(self):
@@ -356,21 +375,25 @@ class VectorStoreService:
             # Dense: AWS Bedrock
             dense_embeddings = self.dense_embeddings.embed_documents(truncated_texts)
             
-            # Sparse: HuggingFace SPLADE
-            if self.sparse_embeddings:
-                sparse_embeddings = self.sparse_embeddings.embed_documents(truncated_texts)
-            else:
-                sparse_embeddings = [SparseVector(indices=[0], values=[0.0]) for _ in truncated_texts]
+            # Sparse: HuggingFace SPLADE (REQUIRED)
+            if not self.sparse_embeddings:
+                raise VectorStoreException(
+                    "SPLADE (sparse embeddings) is not available. "
+                    "Cannot proceed with hybrid search. "
+                    "Please fix SPLADE initialization or disable sparse requirement."
+                )
             
-            # Create points
+            sparse_embeddings = self.sparse_embeddings.embed_documents(truncated_texts)
+            
+            # Create points with BOTH dense and sparse
             qdrant_points = []
-            for point, dense_emb, sparse_emb in zip(points, dense_embeddings, sparse_embeddings):
+            for i, point in enumerate(points):
                 point_uuid = string_to_uuid(point['id'])
                 
                 qdrant_points.append(
                     PointStruct(
                         id=point_uuid,
-                        vector={"dense": dense_emb, "sparse": sparse_emb},
+                        vector={"dense": dense_embeddings[i], "sparse": sparse_embeddings[i]},
                         payload=point['payload']
                     )
                 )
@@ -699,10 +722,12 @@ class VectorStoreService:
             # Generate new embeddings
             dense_vector = self._get_cached_embedding(truncated_text, 'dense')
             
-            if self.sparse_embeddings:
-                sparse_vector = self._get_cached_embedding(truncated_text, 'sparse')
-            else:
-                sparse_vector = SparseVector(indices=[0], values=[0.0])
+            if not self.sparse_embeddings:
+                raise VectorStoreException(
+                    "SPLADE (sparse embeddings) is not available for chunk updates."
+                )
+            
+            sparse_vector = self._get_cached_embedding(truncated_text, 'sparse')
             
             # Prepare payload
             if preserve_metadata:
