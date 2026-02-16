@@ -40,6 +40,7 @@ class ChunkingStrategyEnum(str, enum.Enum):
     FIXED_SIZE = "fixed_size"
     HIERARCHICAL = "hierarchical"
     SEMANTIC = "semantic"
+    NO_CHUNKING = "no_chunking"
 
 
 # ==================== KNOWLEDGE BASE MODEL ====================
@@ -312,3 +313,6 @@ class ConversationHistory(Base):
     
     def __repr__(self) -> str:
         return f"<ConversationHistory(conversation_id={self.conversation_id}, role={self.role})>"
+    
+
+    
