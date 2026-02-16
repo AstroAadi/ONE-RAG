@@ -14,6 +14,7 @@ BUG FIXES (vs original):
 """
 
 from fastapi import APIRouter, HTTPException, Depends, Body
+from app.models.schemas import ChunkingRequest
 from sqlalchemy.orm import Session
 from typing import Any, Optional, List, Dict
 from datetime import datetime
@@ -26,154 +27,96 @@ from app.db.models import (
     FileMetadata, ChunkMetadata, KnowledgeBase,
     ProcessingStatus, ChunkingStrategyEnum
 )
-from typing import Dict, List
-# FIX A: import request/response schemas (their ChunkingStrategy enum is only
-#         used for request validation inside the schema classes, not here).
-from app.models.schemas import (
-    DefaultChunkingRequest,
-    FixedSizeChunkingRequest,
-    SemanticChunkingRequest,
-    HierarchicalChunkingRequest,
-    NoChunkingRequest,
-    ChunkCreationResponse,
-    # Import schemas.ChunkingStrategy ONLY for type annotations where needed:
-    ChunkingStrategy as SchemaChunkingStrategy,
-)
-# The service's ChunkingStrategy enum is the one used at runtime.
 from app.services.chunking_service import EnhancedChunkingService, ChunkingStrategy
 from app.services.vector_store_service import VectorStoreService
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/chunks")
+router = APIRouter()
 
+# ==================== SINGLE UNIFIED ENDPOINT ====================
 
-# ==================== STRATEGY-SPECIFIC ENDPOINTS ====================
-
-@router.post("/create/default", response_model=ChunkCreationResponse, tags=["Chunks - Default"])
-async def create_chunks_default(
-    request: DefaultChunkingRequest,
+@router.post("/create", tags=["Chunks"])
+async def create_chunks(
+    request: ChunkingRequest = Body(...),
     user_id: str = Depends(get_user_id),
     db: Session = Depends(get_database_session)
 ):
     """
-    Create chunks using DEFAULT strategy.
-    Fixed configuration: chunk size 300 tokens, overlap 30 tokens.
+    Unified chunk creation endpoint. Accepts all chunking strategies.
     """
-    return await _create_chunks_internal(
-        file_id=request.file_id,
-        chunking_strategy="default",
-        chunk_size=None,
-        chunk_overlap=None,
-        max_buffer_size=None,
-        breakpoint_threshold=None,
-        parent_chunk_size=None,
-        child_chunk_size=None,
-        child_chunk_overlap=None,
-        user_id=user_id,
-        db=db,
-    )
-
-
-@router.post("/create/fixed-size", response_model=ChunkCreationResponse, tags=["Chunks - Fixed Size"])
-async def create_chunks_fixed_size(
-    request: FixedSizeChunkingRequest,
-    user_id: str = Depends(get_user_id),
-    db: Session = Depends(get_database_session)
-):
-    """
-    Create chunks using FIXED_SIZE strategy.
-    Required: chunk_size (100-2048), chunk_overlap (0-500).
-    """
-    return await _create_chunks_internal(
-        file_id=request.file_id,
-        chunking_strategy="fixed_size",
-        chunk_size=request.chunk_size,
-        chunk_overlap=request.chunk_overlap,
-        max_buffer_size=None,
-        breakpoint_threshold=None,
-        parent_chunk_size=None,
-        child_chunk_size=None,
-        child_chunk_overlap=None,
-        user_id=user_id,
-        db=db,
-    )
-
-
-@router.post("/create/semantic", response_model=ChunkCreationResponse, tags=["Chunks - Semantic"])
-async def create_chunks_semantic(
-    request: SemanticChunkingRequest,
-    user_id: str = Depends(get_user_id),
-    db: Session = Depends(get_database_session)
-):
-    """
-    Create chunks using SEMANTIC strategy.
-    Required: chunk_size, chunk_overlap, max_buffer_size, breakpoint_threshold.
-    """
-    return await _create_chunks_internal(
-        file_id=request.file_id,
-        chunking_strategy="semantic",
-        chunk_size=request.chunk_size,
-        chunk_overlap=request.chunk_overlap,
-        max_buffer_size=request.max_buffer_size,
-        breakpoint_threshold=request.breakpoint_threshold,
-        parent_chunk_size=None,
-        child_chunk_size=None,
-        child_chunk_overlap=None,
-        user_id=user_id,
-        db=db,
-    )
-
-
-@router.post("/create/hierarchical", response_model=ChunkCreationResponse, tags=["Chunks - Hierarchical"])
-async def create_chunks_hierarchical(
-    request: HierarchicalChunkingRequest,
-    user_id: str = Depends(get_user_id),
-    db: Session = Depends(get_database_session)
-):
-    """
-    Create chunks using HIERARCHICAL strategy.
-    Required: parent_chunk_size (500-4096), child_chunk_size (100-1024),
-              child_chunk_overlap (0-200).
-    Parent should be 3-5x larger than child.
-    """
-    return await _create_chunks_internal(
-        file_id=request.file_id,
-        chunking_strategy="hierarchical",
-        chunk_size=None,
-        chunk_overlap=None,
-        max_buffer_size=None,
-        breakpoint_threshold=None,
-        parent_chunk_size=request.parent_chunk_size,
-        child_chunk_size=request.child_chunk_size,
-        child_chunk_overlap=request.child_chunk_overlap,
-        user_id=user_id,
-        db=db,
-    )
-
-
-@router.post("/create/no-chunking", response_model=ChunkCreationResponse, tags=["Chunks - No Chunking"])
-async def create_chunks_no_chunking(
-    request: NoChunkingRequest,
-    user_id: str = Depends(get_user_id),
-    db: Session = Depends(get_database_session)
-):
-    """
-    Create a single chunk from entire document (NO_CHUNKING strategy).
-    Best for short docs < 2000 tokens or when full context is needed.
-    """
-    return await _create_chunks_internal(
-        file_id=request.file_id,
-        chunking_strategy="no_chunking",
-        chunk_size=None,
-        chunk_overlap=None,
-        max_buffer_size=None,
-        breakpoint_threshold=None,
-        parent_chunk_size=None,
-        child_chunk_size=None,
-        child_chunk_overlap=None,
-        user_id=user_id,
-        db=db,
-    )
+    strategy = getattr(request, "chunking_strategy", "default")
+    if strategy == "default":
+        return await _create_chunks_internal(
+            file_id=request.file_id,
+            chunking_strategy="default",
+            chunk_size=None,
+            chunk_overlap=None,
+            max_buffer_size=None,
+            breakpoint_threshold=None,
+            parent_chunk_size=None,
+            child_chunk_size=None,
+            child_chunk_overlap=None,
+            user_id=user_id,
+            db=db,
+        )
+    elif strategy == "fixed_size":
+        return await _create_chunks_internal(
+            file_id=request.file_id,
+            chunking_strategy="fixed_size",
+            chunk_size=getattr(request, "chunk_size", None),
+            chunk_overlap=getattr(request, "chunk_overlap", None),
+            max_buffer_size=None,
+            breakpoint_threshold=None,
+            parent_chunk_size=None,
+            child_chunk_size=None,
+            child_chunk_overlap=None,
+            user_id=user_id,
+            db=db,
+        )
+    elif strategy == "semantic":
+        return await _create_chunks_internal(
+            file_id=request.file_id,
+            chunking_strategy="semantic",
+            chunk_size=getattr(request, "chunk_size", None),
+            chunk_overlap=getattr(request, "chunk_overlap", None),
+            max_buffer_size=getattr(request, "max_buffer_size", None),
+            breakpoint_threshold=getattr(request, "breakpoint_threshold", None),
+            parent_chunk_size=None,
+            child_chunk_size=None,
+            child_chunk_overlap=None,
+            user_id=user_id,
+            db=db,
+        )
+    elif strategy == "hierarchical":
+        return await _create_chunks_internal(
+            file_id=request.file_id,
+            chunking_strategy="hierarchical",
+            chunk_size=None,
+            chunk_overlap=None,
+            max_buffer_size=None,
+            breakpoint_threshold=None,
+            parent_chunk_size=getattr(request, "parent_chunk_size", None),
+            child_chunk_size=getattr(request, "child_chunk_size", None),
+            child_chunk_overlap=getattr(request, "child_chunk_overlap", None),
+            user_id=user_id,
+            db=db,
+        )
+    elif strategy == "no_chunking":
+        return await _create_chunks_internal(
+            file_id=request.file_id,
+            chunking_strategy="no_chunking",
+            chunk_size=None,
+            chunk_overlap=None,
+            max_buffer_size=None,
+            breakpoint_threshold=None,
+            parent_chunk_size=None,
+            child_chunk_size=None,
+            child_chunk_overlap=None,
+            user_id=user_id,
+            db=db,
+        )
+    else:
+        raise HTTPException(status_code=400, detail=f"Invalid chunking_strategy: {strategy}")
 
 
 # ==================== INTERNAL IMPLEMENTATION ====================
@@ -351,8 +294,14 @@ async def _create_chunks_internal(
             'no_chunking':  ChunkingStrategyEnum.NO_CHUNKING,
         }
 
+        # Final normalization: always use lowercase and map invalid to 'default'
+        normalized_strategy = str(chunking_strategy).lower()
+        if normalized_strategy not in strategy_map:
+            logger.warning(f"Final DB normalization: invalid chunking_strategy '{chunking_strategy}' remapped to 'default'.")
+            normalized_strategy = 'default'
+
         file_metadata.chunks_created = len(chunks)
-        file_metadata.chunking_strategy = strategy_map.get(chunking_strategy)
+        file_metadata.chunking_strategy = strategy_map.get(normalized_strategy)
 
         # Store params needed for faithful re-chunking in finalize
         if chunking_strategy == "default":

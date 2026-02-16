@@ -198,6 +198,14 @@ class EnhancedChunkingService:
         child_chunk_size: Optional[int] = None,
         child_chunk_overlap: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
+        # Defensive normalization: always use lowercase and valid enum
+        if isinstance(strategy, str):
+            strategy_str = strategy.lower()
+            try:
+                strategy = ChunkingStrategy(strategy_str)
+            except ValueError:
+                logger.warning(f"Invalid chunking strategy '{strategy}'. Falling back to 'default'.")
+                strategy = ChunkingStrategy.DEFAULT
         """
         Split *markdown_text* into chunks using *strategy*.
 
