@@ -28,7 +28,7 @@ router = APIRouter(prefix="/api/chunks", tags=["Chunks"])
 @router.post("/create")
 async def create_chunks(
     file_id: str,
-    chunking_strategy: ChunkingStrategy = ChunkingStrategy.FIXED_SIZE,
+    chunking_strategy: ChunkingStrategy = ChunkingStrategy.DEFAULT,
     target_chunk_tokens: Optional[int] = 512,
     chunk_overlap_tokens: Optional[int] = 50,
     force_recreate: bool = False,

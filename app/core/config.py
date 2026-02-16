@@ -85,7 +85,7 @@ class Settings(BaseSettings):
     
     # HuggingFace SPLADE Model (Sparse Vectors ONLY)
     splade_model_name: str = Field(
-        default="naver/splade-cocondenser-selfdistil",
+        default="naver/splade-v3",
         description="HuggingFace SPLADE model for sparse vectors",
         token=os.getenv('HUGGINGFACE_API_TOKEN')
     )
