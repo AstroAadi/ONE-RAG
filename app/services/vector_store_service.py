@@ -109,8 +109,13 @@ class VectorStoreService:
     - Caching
     """
     
-    def __init__(self):
-        """Initialize Qdrant with Bedrock dense + SPLADE sparse"""
+    def __init__(self, embedding_model_id: Optional[str] = None):
+        """Initialize Qdrant with Bedrock dense + SPLADE sparse
+        
+        Args:
+            embedding_model_id: Optional AWS Bedrock embedding model ID.
+                              If not provided, uses default from settings.
+        """
         try:
             self.client = QdrantClient(
                 url=settings.qdrant_url,
@@ -119,8 +124,9 @@ class VectorStoreService:
                 prefer_grpc=False
             )
             
-            # Use AWS Bedrock for dense embeddings
-            self.dense_embeddings = BedrockEmbeddingService()
+            # Use AWS Bedrock for dense embeddings with specified or default model
+            self.embedding_model_id = embedding_model_id or settings.bedrock_embedding_model_id
+            self.dense_embeddings = BedrockEmbeddingService(model_id=self.embedding_model_id)
             
             # Use HuggingFace SPLADE for sparse embeddings
             try:
@@ -139,7 +145,7 @@ class VectorStoreService:
             self._initialize_collection()
             
             logger.info(f"✅ Multi-tenant Vector Store initialized")
-            logger.info(f"  - Dense: AWS Bedrock ({settings.bedrock_embedding_model_id})")
+            logger.info(f"  - Dense: AWS Bedrock ({self.embedding_model_id})")
             logger.info(f"  - Sparse: {'HuggingFace SPLADE' if self.sparse_embeddings else 'DISABLED'}")
             logger.info(f"  - KB isolation: ENABLED")
             

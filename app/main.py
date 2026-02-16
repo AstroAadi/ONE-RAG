@@ -123,8 +123,8 @@ async def lifespan(app: FastAPI):
 # Create FastAPI application
 app = FastAPI(
     title="RAG System API",
-    description="Production-ready RAG system with support for thousands of concurrent users",
-    version="2.0.0",
+    description="",
+    version="1.0.0",
     lifespan=lifespan
 )
 
@@ -202,7 +202,7 @@ async def root():
     
     return {
         "message": "RAG System API - Concurrent Processing Enabled",
-        "version": "2.0.0",
+        "version": "1.0.0",
         "status": "online",
         "timestamp": datetime.utcnow().isoformat(),
         "features": {
@@ -216,7 +216,7 @@ async def root():
         },
         "endpoints": {
             "docs": "/docs",
-            "health": "/health",
+            "health": "/api/health",
             "upload": "/api/upload",
             "query": "/api/query",
             "tasks": "/api/tasks",
@@ -226,7 +226,7 @@ async def root():
 
 
 # Health check endpoint
-@app.get("/health")
+@app.get("/api/health")
 async def health_check():
     """
     Comprehensive health check endpoint
@@ -261,7 +261,7 @@ async def health_check():
             }
         },
         "system": {
-            "version": "2.0.0",
+            "version": "1.0.0",
             "mode": "concurrent",
             "io_workers": settings.max_io_workers,
             "cpu_workers": settings.max_cpu_workers
