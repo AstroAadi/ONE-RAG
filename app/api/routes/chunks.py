@@ -4,12 +4,14 @@ Only uses 4 states: uploaded, processing, completed, failed
 No granular status tracking
 """
 
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Body
 from sqlalchemy.orm import Session
-from typing import Optional, List
+from typing import Any, Optional, List, Dict
 from datetime import datetime
+from pathlib import Path
 import logging
 import json
+import time
 
 from app.core.dependencies import get_user_id, get_database_session
 from app.core.task_manager import get_task_manager, TaskType
@@ -17,7 +19,7 @@ from app.db.models import (
     FileMetadata, ChunkMetadata, KnowledgeBase,
     ProcessingStatus, ChunkingStrategyEnum
 )
-from app.models.schemas import ChunkingStrategy
+from app.models.schemas import ChunkingStrategy, BaseModel
 from app.services.chunking_service import EnhancedChunkingService
 from app.services.vector_store_service import VectorStoreService
 
@@ -25,121 +27,136 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/chunks", tags=["Chunks"])
 
 
+class ChunkCreateRequest(BaseModel):
+    file_id: str
+    user_id: str
+    chunking_strategy: ChunkingStrategy = ChunkingStrategy.DEFAULT
+    target_chunk_tokens: Optional[int] = None
+    chunk_overlap_tokens: Optional[int] = None
+    force_recreate: bool = False
+    strategy_config: Optional[Dict[str, Any]] = None
+
 @router.post("/create")
 async def create_chunks(
     file_id: str,
-    chunking_strategy: ChunkingStrategy = ChunkingStrategy.DEFAULT,
-    target_chunk_tokens: Optional[int] = 512,
-    chunk_overlap_tokens: Optional[int] = 50,
-    force_recreate: bool = False,
-    user_id: str = Depends(get_user_id),
+    chunking_strategy: ChunkingStrategy = Body(..., embed=True),
+    req: ChunkCreateRequest = Body(...),
     db: Session = Depends(get_database_session)
 ):
-    """
-    Create chunks from extracted document
-    
-    Status stays as COMPLETED (extraction already done)
-    """
     try:
-        # Get file metadata
+        # ── Validation (unchanged) ─────────────────────────────────────────────
+
         file_metadata = db.query(FileMetadata).filter(
-            FileMetadata.file_id == file_id,
-            FileMetadata.user_id == user_id
+            FileMetadata.file_id == req.file_id,
+            FileMetadata.user_id == req.user_id
         ).first()
-        
         if not file_metadata:
-            raise HTTPException(status_code=404, detail=f"File not found: {file_id}")
-        
-        # Verify KB exists
+            raise HTTPException(404, detail=f"File not found: {req.file_id}")
+
         kb = db.query(KnowledgeBase).filter(
             KnowledgeBase.knowledge_base_id == file_metadata.knowledge_base_id,
-            KnowledgeBase.user_id == user_id
+            KnowledgeBase.user_id == req.user_id
         ).first()
-        
         if not kb:
-            raise HTTPException(status_code=404, detail=f"Knowledge base not found")
-        
-        # Check if file is completed (extraction done)
+            raise HTTPException(404, detail="Knowledge base not found")
+
         if file_metadata.status != ProcessingStatus.COMPLETED:
-            raise HTTPException(
-                status_code=400,
-                detail=f"File must be extracted first. Current status: {file_metadata.status.value}"
-            )
-        
-        # Check if chunks already exist
+            # Provide detailed error message with extraction error if available
+            error_detail = f"File must be extracted first. Status: {file_metadata.status.value}"
+            if file_metadata.status == ProcessingStatus.FAILED and file_metadata.error_message:
+                error_detail = f"Extraction failed: {file_metadata.error_message}. Please re-upload the file."
+            elif file_metadata.status == ProcessingStatus.UPLOADED:
+                error_detail = "File extraction has not started yet. Please wait or check /api/upload/status/{file_id}"
+            elif file_metadata.status == ProcessingStatus.PROCESSING:
+                error_detail = "File extraction still in progress. Please wait and try again in a moment."
+            raise HTTPException(400, detail=error_detail)
+
+
         existing_chunks = db.query(ChunkMetadata).filter(
-            ChunkMetadata.file_id == file_id
+            ChunkMetadata.file_id == req.file_id
         ).count()
-        
-        if existing_chunks > 0 and not force_recreate:
-            raise HTTPException(
-                status_code=400,
-                detail=f"File already has {existing_chunks} chunks. Use force_recreate=true to recreate."
-            )
-        
-        # Delete existing chunks if force_recreate
-        if force_recreate and existing_chunks > 0:
-            logger.info(f"🗑️  Deleting {existing_chunks} existing chunks for file {file_id}")
-            db.query(ChunkMetadata).filter(
-                ChunkMetadata.file_id == file_id
-            ).delete()
-            
-            # Update KB stats
+
+        if existing_chunks > 0 and not req.force_recreate:
+            raise HTTPException(400, detail=f"File already has {existing_chunks} chunks. Use force_recreate=true")
+
+        if req.force_recreate and existing_chunks > 0:
+            db.query(ChunkMetadata).filter(ChunkMetadata.file_id == req.file_id).delete()
             kb.total_chunks = max(0, kb.total_chunks - existing_chunks)
             db.commit()
-        
-        # Get markdown content
-        markdown_content = None
-        if file_metadata.markdown_path:
-            try:
-                with open(file_metadata.markdown_path, 'r', encoding='utf-8') as f:
-                    markdown_content = f.read()
-            except Exception as e:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Could not read markdown content: {str(e)}"
-                )
-        
-        if not markdown_content:
-            raise HTTPException(
-                status_code=400,
-                detail="No markdown content available. Re-run extraction."
-            )
-        
-        logger.info(f"📊 Creating chunks for file {file_id} using {chunking_strategy.value}")
-        
-        # Create chunking service
+
+        # ── Read markdown ──────────────────────────────────────────────────────
+
+        with open(file_metadata.markdown_path, 'r', encoding='utf-8') as f:
+            markdown_content = f.read()
+
+        if not markdown_content.strip():
+            raise HTTPException(400, detail="Markdown content is empty")
+
+        # ── Chunking Service ───────────────────────────────────────────────────
+
         chunking_service = EnhancedChunkingService(
-            target_chunk_tokens=target_chunk_tokens or 512,
-            chunk_overlap_tokens=chunk_overlap_tokens or 50
+            target_chunk_tokens=req.target_chunk_tokens or 512,
+            chunk_overlap_tokens=req.chunk_overlap_tokens or 50
         )
-        
-        # Prepare metadata
+
+
         base_metadata = {
-            'user_id': user_id,
-            'file_id': file_id,
+            'user_id': req.user_id,
+            'file_id': req.file_id,
             'filename': file_metadata.safe_filename,
             'knowledge_base_id': kb.knowledge_base_id,
             'knowledge_base_name': kb.knowledge_base_name
         }
-        
-        # Create chunks
-        import time
+
+
+        cfg = req.strategy_config or {}
+        logger.info(f"Chunking {req.file_id} | strategy={req.chunking_strategy.value} | config={cfg}")
+
+
         start_time = time.time()
-        
-        chunks = chunking_service.split_document_into_chunks(
-            markdown_content,
-            base_metadata=base_metadata,
-            strategy=chunking_strategy
-        )
-        
+
+        # ── Strategy-specific routing ───────────────────────────────────────────
+
+        if req.chunking_strategy == ChunkingStrategy.SEMANTIC:
+            chunks = chunking_service.split_document_into_chunks(
+                markdown_content,
+                base_metadata=base_metadata,
+                strategy=req.chunking_strategy,
+                max_buffer_size=cfg.get("max_buffer_size"),
+                breakpoint_threshold=cfg.get("breakpoint_threshold"),
+                max_chunk_tokens=cfg.get("max_chunk_tokens")
+            )
+
+        elif req.chunking_strategy == ChunkingStrategy.FIXED_SIZE:
+            chunks = chunking_service.split_document_into_chunks(
+                markdown_content,
+                base_metadata=base_metadata,
+                strategy=req.chunking_strategy,
+                max_tokens=cfg.get("max_tokens", req.target_chunk_tokens),
+                overlap_percentage=cfg.get("overlap_percentage"),
+            )
+
+        elif req.chunking_strategy == ChunkingStrategy.HIERARCHICAL:
+            chunks = chunking_service.split_document_into_chunks(
+                markdown_content,
+                base_metadata=base_metadata,
+                strategy=req.chunking_strategy,
+                max_parent_tokens=cfg.get("max_parent_tokens"),
+                max_child_tokens=cfg.get("max_child_tokens"),
+                overlap_tokens=cfg.get("overlap_tokens")
+            )
+
+        elif req.chunking_strategy == ChunkingStrategy.DEFAULT:
+            chunks = chunking_service.split_document_into_chunks(
+                markdown_content,
+                base_metadata=base_metadata,
+                strategy=req.chunking_strategy
+            )
+
         chunking_time = time.time() - start_time
-        
-        logger.info(f"✅ Created {len(chunks)} chunks in {chunking_time:.2f}s")
-        
-        # Save chunks to database
+
+        # ── Save to DB (unchanged) ─────────────────────────────────────────────
         chunk_ids = []
-        
         for chunk in chunks:
             chunk_db = ChunkMetadata(
                 chunk_id=chunk['chunk_id'],
@@ -152,48 +169,45 @@ async def create_chunks(
             )
             db.add(chunk_db)
             chunk_ids.append(chunk['chunk_id'])
-        
-        # Map strategy - only 4 valid strategies
+
+        # Update metadata
         strategy_map = {
             'default': ChunkingStrategyEnum.DEFAULT,
             'fixed_size': ChunkingStrategyEnum.FIXED_SIZE,
             'hierarchical': ChunkingStrategyEnum.HIERARCHICAL,
             'semantic': ChunkingStrategyEnum.SEMANTIC
         }
-        
-        # Update file metadata
+
+
         file_metadata.chunks_created = len(chunks)
-        file_metadata.chunking_strategy = strategy_map.get(chunking_strategy.value)
-        file_metadata.target_chunk_tokens = target_chunk_tokens or 512
-        file_metadata.chunk_overlap_tokens = chunk_overlap_tokens or 50
-        
-        # Update KB stats
+        file_metadata.chunking_strategy = strategy_map.get(req.chunking_strategy.value)
+        file_metadata.target_chunk_tokens = req.target_chunk_tokens if req.target_chunk_tokens is not None else 512
+        file_metadata.chunk_overlap_tokens = req.chunk_overlap_tokens if req.chunk_overlap_tokens is not None else 50
+        file_metadata.strategy_config_json = json.dumps(cfg)   # optional but very useful
+
         kb.total_chunks += len(chunks)
         kb.updated_at = datetime.utcnow()
-        
+
         db.commit()
-        
-        logger.info(f"🎉 Chunking complete: {len(chunks)} chunks saved")
-        
+
         return {
             "file_id": file_id,
             "knowledge_base_id": kb.knowledge_base_id,
             "chunks_created": len(chunks),
-            "chunk_ids": chunk_ids[:10],
+            "chunk_ids_sample": chunk_ids[:10],
             "total_chunk_ids": len(chunk_ids),
             "chunking_strategy": chunking_strategy.value,
             "chunking_time_seconds": round(chunking_time, 2),
             "status": "completed",
             "message": f"Created {len(chunks)} chunks successfully"
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
         db.rollback()
-        logger.error(f"❌ Chunking failed: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Chunking failed: {str(e)}")
-
+        logger.error(f"Chunking failed: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/finalize")
 async def finalize_chunks(

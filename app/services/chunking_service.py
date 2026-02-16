@@ -167,7 +167,8 @@ class EnhancedChunkingService:
         markdown_text: str,
         structured_data: Optional[Dict] = None,
         base_metadata: Optional[Dict] = None,
-        strategy: ChunkingStrategy = ChunkingStrategy.FIXED_SIZE
+        strategy: ChunkingStrategy = ChunkingStrategy.FIXED_SIZE,
+        **kwargs
     ) -> List[Dict[str, Any]]:
         """
         Split document into chunks using specified strategy
@@ -177,6 +178,7 @@ class EnhancedChunkingService:
             structured_data: Optional structured data
             base_metadata: Base metadata for all chunks
             strategy: Chunking strategy to use
+            **kwargs: Strategy-specific parameters
             
         Returns:
             List of chunk dictionaries with metadata
@@ -194,20 +196,32 @@ class EnhancedChunkingService:
         # Route to appropriate chunking strategy
         if strategy == ChunkingStrategy.DEFAULT:
             chunks = self._chunk_default_size(markdown_text, base_metadata)
-        elif strategy == ChunkingStrategy.FIXED_SIZE:
-            chunks = self._chunk_fixed_size(markdown_text, base_metadata)
-        # elif strategy == ChunkingStrategy.SENTENCE:
-        #     chunks = self._chunk_by_sentence(markdown_text, base_metadata)
-        # elif strategy == ChunkingStrategy.PARAGRAPH:
-        #     chunks = self._chunk_by_paragraph(markdown_text, base_metadata)
-        # elif strategy == ChunkingStrategy.SLIDING_WINDOW:
-        #     chunks = self._chunk_sliding_window(markdown_text, base_metadata)
-        # elif strategy == ChunkingStrategy.RECURSIVE:
-        #     chunks = self._chunk_recursive(markdown_text, base_metadata)
-        elif strategy == ChunkingStrategy.HIERARCHICAL:
-            chunks = self._chunk_hierarchical(markdown_text, base_metadata)
+        
         elif strategy == ChunkingStrategy.SEMANTIC:
-            chunks = self._chunk_semantic(markdown_text, base_metadata)
+            return self._chunk_semantic(
+                markdown_text,
+                base_metadata=base_metadata,
+                max_buffer_size=kwargs.get("max_buffer_size", 1),
+                max_chunk_tokens=kwargs.get("max_chunk_tokens", 300),
+                threshold=kwargs.get("threshold", 0.3),
+            )
+
+        elif strategy == ChunkingStrategy.FIXED_SIZE:
+            return self._chunk_fixed_size(
+                markdown_text,
+                base_metadata=base_metadata,
+                max_chunk_tokens=kwargs.get("max_chunk_tokens", self.target_chunk_tokens),
+                overlap_tokens=kwargs.get("overlap_tokens", self.chunk_overlap_tokens),
+            )
+
+        elif strategy == ChunkingStrategy.HIERARCHICAL:
+            return self._chunk_hierarchical(
+                markdown_text,
+                base_metadata=base_metadata,
+                max_parent_tokens=kwargs.get("max_parent_tokens", 1500),
+                max_child_tokens=kwargs.get("max_child_tokens", 300),
+                parent_overlap_tokens=kwargs.get("overlap_tokens", 60),
+            )    
         else:
             logger.warning(f"Unknown strategy {strategy}, falling back to fixed_size")
             chunks = self._chunk_default_size(markdown_text, base_metadata)
@@ -238,7 +252,9 @@ class EnhancedChunkingService:
     def _chunk_fixed_size(
         self,
         text: str,
-        base_metadata: Dict
+        base_metadata: Dict,
+        max_chunk_tokens: Optional[int] = None,
+        overlap_tokens: Optional[int] = None
     ) -> List[Dict[str, Any]]:
         """
         Strategy 1: Fixed-size token-based chunking
@@ -246,6 +262,8 @@ class EnhancedChunkingService:
         Creates chunks of exactly target_chunk_tokens size
         No overlap, simple sequential split
         """
+        max_tokens = max_chunk_tokens or self.target_chunk_tokens
+        overlap = int(max_tokens * (overlap_tokens / 100))
         chunks = []
         
         if self.token_counter.encoding:
