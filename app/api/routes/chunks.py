@@ -198,15 +198,15 @@ async def _create_chunks_internal(
     try:
         # ── DB lookups ───────────────────────────────────────────────────
         file_metadata = db.query(FileMetadata).filter(
-            FileMetadata.file_id == req.file_id,
-            FileMetadata.user_id == req.user_id
+            FileMetadata.file_id == file_id,
+            FileMetadata.user_id == user_id
         ).first()
         if not file_metadata:
             raise HTTPException(status_code=404, detail=f"File not found: {file_id}")
 
         kb = db.query(KnowledgeBase).filter(
             KnowledgeBase.knowledge_base_id == file_metadata.knowledge_base_id,
-            KnowledgeBase.user_id == req.user_id
+            KnowledgeBase.user_id == user_id
         ).first()
         if not kb:
             raise HTTPException(status_code=404, detail="Knowledge base not found")
@@ -218,7 +218,7 @@ async def _create_chunks_internal(
             )
 
         existing_chunks = db.query(ChunkMetadata).filter(
-            ChunkMetadata.file_id == req.file_id
+            ChunkMetadata.file_id == file_id
         ).count()
         if existing_chunks > 0:
             raise HTTPException(
@@ -241,8 +241,8 @@ async def _create_chunks_internal(
         logger.info(f"📊 Creating chunks for file {file_id} using {chunking_strategy}")
 
         base_metadata = {
-            'user_id': req.user_id,
-            'file_id': req.file_id,
+            'user_id': user_id,
+            'file_id': file_id,
             'filename': file_metadata.safe_filename,
             'knowledge_base_id': kb.knowledge_base_id,
             'knowledge_base_name': kb.knowledge_base_name,
