@@ -4,7 +4,7 @@ Added Knowledge Base models for multi-tenant isolation
 """
 
 from pydantic import BaseModel, Field, field_validator, ConfigDict
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union, Literal
 from datetime import datetime
 from enum import Enum
 
@@ -41,6 +41,7 @@ class ChunkingStrategy(str, Enum):
     FIXED_SIZE = "fixed_size"
     HIERARCHICAL = "hierarchical"
     SEMANTIC = "semantic"
+    NO_CHUNKING = "no_chunking"
 
 
 # ==================== NEW: Knowledge Base Models ====================
@@ -212,6 +213,83 @@ class ConversationQueryRequest(QueryRequest):
         max_length=100,
         description="Conversation ID"
     )
+
+
+# ==================== Chunking Strategy Request Models ====================
+
+class DefaultChunkingRequest(BaseModel):
+    """Default chunking - no parameters needed"""
+    model_config = ConfigDict(str_strip_whitespace=True)
+    
+    file_id: str = Field(..., description="File ID to create chunks for")
+    chunking_strategy: Literal["default"] = Field(default="default", description="Chunking strategy (fixed: default)")
+
+
+class FixedSizeChunkingRequest(BaseModel):
+    """Fixed-size chunking with user-defined parameters"""
+    model_config = ConfigDict(str_strip_whitespace=True)
+    
+    file_id: str = Field(..., description="File ID to create chunks for")
+    chunking_strategy: Literal["fixed_size"] = Field(default="fixed_size", description="Chunking strategy (fixed: fixed_size)")
+    chunk_size: int = Field(..., ge=100, le=2048, description="Chunk size in tokens")
+    chunk_overlap: int = Field(..., ge=0, le=500, description="Overlap between chunks in tokens")
+
+
+class SemanticChunkingRequest(BaseModel):
+    """Semantic chunking - groups semantically similar content"""
+    model_config = ConfigDict(str_strip_whitespace=True)
+    
+    file_id: str = Field(..., description="File ID to create chunks for")
+    chunking_strategy: Literal["semantic"] = Field(default="semantic", description="Chunking strategy (fixed: semantic)")
+    chunk_size: int = Field(..., ge=100, le=2048, description="Target chunk size in tokens")
+    chunk_overlap: int = Field(..., ge=0, le=500, description="Overlap between chunks in tokens")
+    max_buffer_size: int = Field(..., ge=1, le=20, description="Maximum number of sentences to compare for similarity")
+    breakpoint_threshold: float = Field(..., ge=0.0, le=1.0, description="Similarity threshold for breaking chunks (0.5-0.7 recommended)")
+
+
+class HierarchicalChunkingRequest(BaseModel):
+    """Hierarchical chunking - creates parent-child relationships"""
+    model_config = ConfigDict(str_strip_whitespace=True)
+    
+    file_id: str = Field(..., description="File ID to create chunks for")
+    chunking_strategy: Literal["hierarchical"] = Field(default="hierarchical", description="Chunking strategy (fixed: hierarchical)")
+    parent_chunk_size: int = Field(..., ge=500, le=4096, description="Size of parent chunks in tokens")
+    child_chunk_size: int = Field(..., ge=100, le=1024, description="Size of child chunks in tokens")
+    child_chunk_overlap: int = Field(..., ge=0, le=200, description="Overlap between child chunks in tokens")
+
+
+class NoChunkingRequest(BaseModel):
+    """No chunking - entire document as single chunk"""
+    model_config = ConfigDict(str_strip_whitespace=True)
+    
+    file_id: str = Field(..., description="File ID to create chunks for")
+    chunking_strategy: Literal["no_chunking"] = Field(default="no_chunking", description="Chunking strategy (fixed: no_chunking)")
+
+
+# Union type for all chunking requests
+ChunkingRequest = Union[
+    DefaultChunkingRequest,
+    FixedSizeChunkingRequest,
+    SemanticChunkingRequest,
+    HierarchicalChunkingRequest,
+    NoChunkingRequest
+]
+
+
+class ChunkCreationResponse(BaseModel):
+    """Response after creating chunks"""
+    model_config = ConfigDict(from_attributes=True)
+    
+    file_id: str
+    knowledge_base_id: str
+    chunks_created: int
+    chunk_ids: List[str] = Field(description="First 10 chunk IDs")
+    total_chunk_ids: int
+    chunking_strategy: str
+    chunking_time_seconds: float
+    status: str
+    parameters: Dict[str, Any] = Field(description="Parameters used for chunking")
+    message: str
 
 
 # ==================== Chunk Models ====================

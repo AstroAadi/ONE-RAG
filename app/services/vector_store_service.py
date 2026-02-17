@@ -110,24 +110,13 @@ class VectorStoreService:
     - Lazy initialization with graceful degradation
     """
     
-    def __init__(self):
-        """Initialize Qdrant with Bedrock dense + SPLADE sparse (lazy initialization)"""
-        self.client = None
-        self.dense_embeddings = None
-        self.sparse_embeddings = None
-        self.embedding_cache = None
-        self.collection_name = settings.qdrant_collection_name
-        self._initialized = False
-        self._init_error = None
+    def __init__(self, embedding_model_id: Optional[str] = None):
+        """Initialize Qdrant with Bedrock dense + SPLADE sparse
         
-        # Try initial connection but don't fail if unavailable
-        self._try_initialize()
-    
-    def _try_initialize(self):
-        """Try to initialize Qdrant connection"""
-        if self._initialized or self._init_error:
-            return  # Already tried initialization
-        
+        Args:
+            embedding_model_id: Optional AWS Bedrock embedding model ID.
+                              If not provided, uses default from settings.
+        """
         try:
             logger.info("Attempting to connect to Qdrant...")
             self.client = QdrantClient(
@@ -137,8 +126,9 @@ class VectorStoreService:
                 prefer_grpc=False
             )
             
-            # Use AWS Bedrock for dense embeddings
-            self.dense_embeddings = BedrockEmbeddingService()
+            # Use AWS Bedrock for dense embeddings with specified or default model
+            self.embedding_model_id = embedding_model_id or settings.bedrock_embedding_model_id
+            self.dense_embeddings = BedrockEmbeddingService(model_id=self.embedding_model_id)
             
             # Use HuggingFace SPLADE for sparse embeddings
             try:
@@ -163,7 +153,7 @@ class VectorStoreService:
             
             self._initialized = True
             logger.info(f"✅ Multi-tenant Vector Store initialized")
-            logger.info(f"  - Dense: AWS Bedrock ({settings.bedrock_embedding_model_id})")
+            logger.info(f"  - Dense: AWS Bedrock ({self.embedding_model_id})")
             logger.info(f"  - Sparse: {'HuggingFace SPLADE' if self.sparse_embeddings else 'DISABLED'}")
             logger.info(f"  - KB isolation: ENABLED")
             
