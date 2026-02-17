@@ -124,7 +124,8 @@ class VectorStoreService:
                 timeout=30,
                 prefer_grpc=False
             )
-            
+            collection_name = settings.qdrant_collection_name
+            self.collection_name = collection_name
             # Use AWS Bedrock for dense embeddings with specified or default model
             self.embedding_model_id = embedding_model_id or settings.bedrock_embedding_model_id
             self.dense_embeddings = BedrockEmbeddingService(model_id=self.embedding_model_id)

@@ -319,7 +319,7 @@ async def _create_chunks_internal(
             file_metadata.target_chunk_tokens = child_chunk_size
             file_metadata.chunk_overlap_tokens = child_chunk_overlap
         elif chunking_strategy == "no_chunking":
-            file_metadata.target_chunk_tokens = 0
+            file_metadata.target_chunk_tokens = 10000
             file_metadata.chunk_overlap_tokens = 0
 
         kb.total_chunks += len(chunks)
