@@ -43,7 +43,43 @@ async def create_chunks(
 ):
     """
     Unified chunk creation endpoint. Accepts all chunking strategies.
-    """
+
+    Example request bodies:
+1. Default:
+{
+    "file_id": "example_file_id",
+    "chunking_strategy": "default"
+}
+2. Fixed Size:
+{
+    "file_id": "example_file_id",
+    "chunking_strategy": "fixed_size",
+    "chunk_size": 1000,
+    "chunk_overlap": 100
+}
+3. Semantic:
+{
+    "file_id": "example_file_id",
+    "chunking_strategy": "semantic",
+    "chunk_size": 1000,
+    "chunk_overlap": 100,
+    "max_buffer_size": 256,
+    "breakpoint_threshold": 0.8
+}
+4. Hierarchical:
+{
+    "file_id": "example_file_id",
+    "chunking_strategy": "hierarchical",
+    "parent_chunk_size": 2048,
+    "child_chunk_size": 512,
+    "child_chunk_overlap": 64
+}
+5. No Chunking:
+{
+    "file_id": "example_file_id",
+    "chunking_strategy": "no_chunking"
+}
+"""
     strategy = getattr(request, "chunking_strategy", "default")
     if strategy == "default":
         return await _create_chunks_internal(
@@ -319,7 +355,7 @@ async def _create_chunks_internal(
             file_metadata.target_chunk_tokens = child_chunk_size
             file_metadata.chunk_overlap_tokens = child_chunk_overlap
         elif chunking_strategy == "no_chunking":
-            file_metadata.target_chunk_tokens = 10000
+            file_metadata.target_chunk_tokens = 0
             file_metadata.chunk_overlap_tokens = 0
 
         kb.total_chunks += len(chunks)
