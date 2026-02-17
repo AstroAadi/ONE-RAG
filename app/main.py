@@ -2,7 +2,9 @@
 Main FastAPI Application - CONCURRENT VERSION
 Supports multiple concurrent users with background task processing
 """
-
+import sys
+sys.stdout.reconfigure(encoding='utf-8')
+sys.stderr.reconfigure(encoding='utf-8')
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -10,7 +12,8 @@ from contextlib import asynccontextmanager
 import logging
 import time
 from datetime import datetime
-
+from dotenv import load_dotenv
+load_dotenv()
 # Import configurations
 from app.core.config import settings
 from app.core.database import create_all_tables, close_database_connections, check_database_health
@@ -28,15 +31,25 @@ from app.api.routes import (
     chunks
 )
 
-# Configure logging
+# Configure logging with custom stream handler for Windows compatibility
 logging.basicConfig(
     level=getattr(logging, settings.log_level),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(settings.log_file_path),
-        logging.StreamHandler()
+        logging.FileHandler(settings.log_file_path, encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
     ]
 )
+
+# Fix logging on Windows to handle emoji and unicode
+for handler in logging.root.handlers:
+    if isinstance(handler, logging.StreamHandler):
+        # Configure stream handler to handle encoding errors gracefully
+        handler.setFormatter(logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        ))
+
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +77,7 @@ async def lifespan(app: FastAPI):
     # Create database tables
     try:
         create_all_tables()
-        logger.info("✅ Database tables created/verified")
+        logger.info(" Database tables created/verified")
     except Exception as e:
         logger.error(f"❌ Database initialization failed: {e}")
         raise
@@ -113,7 +126,7 @@ async def lifespan(app: FastAPI):
         close_database_connections()
         logger.info("✅ Database connections closed")
     except Exception as e:
-        logger.error(f"❌ Database shutdown error: {e}")
+        logger.error(f"❌ Database shutdown error: {e}") 
     
     logger.info("=" * 70)
     logger.info("RAG SYSTEM SHUTDOWN COMPLETE")
