@@ -27,23 +27,9 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/query", tags=["Query"])
 
-# Initialize services with lazy loading
-_vector_store = None
-_llm_service = None
-
-def get_vector_store():
-    """Get or initialize vector store (lazy loading)"""
-    global _vector_store
-    if _vector_store is None:
-        _vector_store = VectorStoreService()
-    return _vector_store
-
-def get_llm_service():
-    """Get or initialize LLM service (lazy loading)"""
-    global _llm_service
-    if _llm_service is None:
-        _llm_service = LLMService()
-    return _llm_service
+# Initialize services
+vector_store = VectorStoreService()
+llm_service = LLMService()
 
 
 # ==================== QUERY RESULT CACHE ====================
@@ -265,7 +251,7 @@ async def query_knowledge_base(
         
         # Vector search WITH KB ISOLATION
         try:
-            documents, metadatas, scores = get_vector_store().search(
+            documents, metadatas, scores = vector_store.search(
                 query=request.question,
                 user_id=user_id,
                 knowledge_base_id=request.knowledge_base_id,  # MANDATORY
@@ -290,7 +276,7 @@ async def query_knowledge_base(
         
         # Generate answer
         try:
-            answer = get_llm_service().generate_answer(
+            answer = llm_service.generate_answer(
                 question=request.question,
                 context=context,
                 user_id=user_id,
@@ -304,7 +290,7 @@ async def query_knowledge_base(
             raise LLMGenerationError(f"Failed to generate answer: {str(e)}")
         
         # Detect hallucinations
-        is_hallucination, confidence = get_llm_service().detect_hallucination(answer, context)
+        is_hallucination, confidence = llm_service.detect_hallucination(answer, context)
         
         if is_hallucination:
             logger.warning(f"Low confidence detected: {confidence:.2f}")
@@ -409,7 +395,7 @@ async def query_with_conversation(
         
         # Vector search with KB isolation
         try:
-            documents, metadatas, scores = get_vector_store().search(
+            documents, metadatas, scores = vector_store.search(
                 query=request.question,
                 user_id=user_id,
                 knowledge_base_id=request.knowledge_base_id,
@@ -431,7 +417,7 @@ async def query_with_conversation(
         
         # Generate answer with conversation history
         try:
-            answer = get_llm_service().generate_answer(
+            answer = llm_service.generate_answer(
                 question=request.question,
                 context=context,
                 user_id=user_id,
@@ -445,7 +431,7 @@ async def query_with_conversation(
             raise LLMGenerationError(f"Failed to generate answer: {str(e)}")
         
         # Detect hallucinations
-        is_hallucination, confidence = get_llm_service().detect_hallucination(answer, context)
+        is_hallucination, confidence = llm_service.detect_hallucination(answer, context)
         
         if is_hallucination:
             answer += f"\n\n⚠️ Note: Lower confidence ({confidence:.2f})."
@@ -502,7 +488,7 @@ async def clear_conversation(
 ):
     """Clear conversation history"""
     try:
-        get_llm_service().clear_conversation(conversation_id, user_id, db)
+        llm_service.clear_conversation(conversation_id, user_id, db)
         
         return {
             "message": f"Conversation {conversation_id} cleared",

@@ -8,15 +8,8 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/settings", tags=["Settings"])
 
-# Initialize LLM service with lazy loading
-_llm_service = None
-
-def get_llm_service():
-    """Get or initialize LLM service (lazy loading)"""
-    global _llm_service
-    if _llm_service is None:
-        _llm_service = LLMService()
-    return _llm_service
+# Initialize LLM service
+llm_service = LLMService()
 
 
 class ModelUpdateRequest(BaseModel):
@@ -39,7 +32,7 @@ async def get_current_model():
     """
     try:
         return ModelInfoResponse(
-            current_model_id=get_llm_service().get_current_model(),
+            current_model_id=llm_service.get_current_model(),
             temperature=settings.temperature,
             max_tokens=settings.max_tokens,
             embedding_model_id=settings.embedding_model_id
@@ -69,7 +62,7 @@ async def update_model(request: ModelUpdateRequest):
     To make permanent, update BEDROCK_MODEL_ID in .env
     """
     try:
-        success = get_llm_service().update_model(request.model_id)
+        success = llm_service.update_model(request.model_id)
         
         if success:
             return {

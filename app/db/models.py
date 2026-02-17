@@ -6,7 +6,7 @@ No granular tracking - keeps it simple!
 
 from sqlalchemy import (
     Column, String, Integer, DateTime, Boolean, Float, Text, ForeignKey, Enum,
-    Index, UniqueConstraint, CheckConstraint
+    Index, UniqueConstraint
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
@@ -41,133 +41,6 @@ class ChunkingStrategyEnum(str, enum.Enum):
     HIERARCHICAL = "hierarchical"
     SEMANTIC = "semantic"
     NO_CHUNKING = "no_chunking"
-
-
-# ==================== ENUM VALIDATORS (Production-safe) ====================
-
-def validate_processing_status(status):
-    """
-    Convert and validate processing status to lowercase.
-    Safe for database insertion.
-    
-    Args:
-        status: Either a string or ProcessingStatus enum member
-        
-    Returns:
-        Validated lowercase string value
-        
-    Raises:
-        ValueError: If status is not valid
-    """
-    if isinstance(status, ProcessingStatus):
-        return status.value
-    
-    status_str = str(status).lower().strip()
-    valid_values = {s.value for s in ProcessingStatus}
-    
-    if status_str not in valid_values:
-        raise ValueError(f"Invalid status '{status}'. Must be one of: {valid_values}")
-    
-    return status_str
-
-
-def validate_file_type(file_type):
-    """
-    Convert and validate file type to lowercase.
-    Safe for database insertion.
-    
-    Args:
-        file_type: Either a string or FileType enum member
-        
-    Returns:
-        Validated lowercase string value
-        
-    Raises:
-        ValueError: If file_type is not valid
-    """
-    if isinstance(file_type, FileType):
-        return file_type.value
-    
-    file_type_str = str(file_type).lower().strip()
-    valid_values = {f.value for f in FileType}
-    
-    if file_type_str not in valid_values:
-        raise ValueError(f"Invalid file type '{file_type}'. Must be one of: {valid_values}")
-    
-    return file_type_str
-
-
-def validate_chunking_strategy(strategy):
-    """
-    Convert and validate chunking strategy to lowercase.
-    Safe for database insertion.
-    
-    Args:
-        strategy: Either a string or ChunkingStrategyEnum member
-        
-    Returns:
-        Validated lowercase string value
-        
-    Raises:
-        ValueError: If strategy is not valid
-    """
-    if isinstance(strategy, ChunkingStrategyEnum):
-        return strategy.value
-    
-    strategy_str = str(strategy).lower().strip()
-    valid_values = {s.value for s in ChunkingStrategyEnum}
-    
-    if strategy_str not in valid_values:
-        raise ValueError(f"Invalid strategy '{strategy}'. Must be one of: {valid_values}")
-    
-    return strategy_str
-
-
-# ==================== HELPER FUNCTIONS FOR DB INSERTION ====================
-
-def get_processing_status_value(status):
-    """
-    Get safe lowercase string value for ProcessingStatus enum member.
-    
-    Args:
-        status: ProcessingStatus enum member or string
-        
-    Returns:
-        Lowercase string value safe for PostgreSQL insertion
-    """
-    if isinstance(status, ProcessingStatus):
-        return status.value.lower()
-    return str(status).lower().strip()
-
-
-def get_file_type_value(file_type):
-    """
-    Get safe lowercase string value for FileType enum member.
-    
-    Args:
-        file_type: FileType enum member or string
-        
-    Returns:
-        Lowercase string value safe for PostgreSQL insertion
-    """
-    if isinstance(file_type, FileType):
-        return file_type.value.lower()
-    return str(file_type).lower().strip()
-
-
-def get_chunking_strategy_value(strategy):
-    """
-    Get safe lowercase string value for ChunkingStrategyEnum member.
-    
-    Args:
-        strategy: ChunkingStrategyEnum member or string
-        
-    Returns:
-        Lowercase string value safe for PostgreSQL insertion
-    """
-    if isinstance(strategy, ChunkingStrategyEnum):
-        return strategy.value.lower()
-    return str(strategy).lower().strip()
 
 
 # ==================== KNOWLEDGE BASE MODEL ====================
@@ -252,24 +125,24 @@ class FileMetadata(Base):
     original_filename = Column(String(500), nullable=False)
     safe_filename = Column(String(500), nullable=False)
     file_extension = Column(String(20), nullable=False)
-    file_type = Column(String(20), nullable=False)  # String instead of Enum
+    file_type = Column(Enum(FileType), nullable=False)
     file_size_bytes = Column(Integer, nullable=False)
     
     # Storage paths
     storage_path = Column(String(1000), nullable=False)
     markdown_path = Column(String(1000), nullable=True)
     
-    # STATUS: Simple 4 states only - String column (not Enum) to avoid psycopg2 issues
-    status = Column(String(20), default="uploaded", nullable=False, index=True)
+    # STATUS: Simple 4 states only
+    status = Column(Enum(ProcessingStatus), default=ProcessingStatus.UPLOADED, nullable=False, index=True)
     
     # Processing information
     chunks_created = Column(Integer, default=0, nullable=False)
     total_pages = Column(Integer, default=0, nullable=False)
     
-    # Chunking strategy - String column (not Enum) to avoid psycopg2 issues
+    # Chunking strategy
     chunking_strategy = Column(
-        String(20),
-        default="default",
+        Enum(ChunkingStrategyEnum),
+        default=ChunkingStrategyEnum.DEFAULT,
         nullable=True
     )
     target_chunk_tokens = Column(Integer, default=512, nullable=False)

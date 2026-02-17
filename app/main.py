@@ -28,25 +28,15 @@ from app.api.routes import (
     chunks
 )
 
-# Configure logging with custom stream handler for Windows compatibility
+# Configure logging
 logging.basicConfig(
     level=getattr(logging, settings.log_level),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(settings.log_file_path, encoding='utf-8'),
-        logging.StreamHandler()  # Will use system default encoding
+        logging.FileHandler(settings.log_file_path),
+        logging.StreamHandler()
     ]
 )
-
-# Fix logging on Windows to handle emoji and unicode
-for handler in logging.root.handlers:
-    if isinstance(handler, logging.StreamHandler):
-        # Configure stream handler to handle encoding errors gracefully
-        handler.setFormatter(logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        ))
-
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +113,7 @@ async def lifespan(app: FastAPI):
         close_database_connections()
         logger.info("✅ Database connections closed")
     except Exception as e:
-        logger.error(f"❌ Database shutdown error: {e}") 
+        logger.error(f"❌ Database shutdown error: {e}")
     
     logger.info("=" * 70)
     logger.info("RAG SYSTEM SHUTDOWN COMPLETE")

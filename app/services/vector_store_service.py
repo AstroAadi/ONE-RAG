@@ -107,7 +107,6 @@ class VectorStoreService:
     - User isolation
     - Hybrid search (dense + sparse)
     - Caching
-    - Lazy initialization with graceful degradation
     """
     
     def __init__(self, embedding_model_id: Optional[str] = None):
@@ -118,11 +117,10 @@ class VectorStoreService:
                               If not provided, uses default from settings.
         """
         try:
-            logger.info("Attempting to connect to Qdrant...")
             self.client = QdrantClient(
                 url=settings.qdrant_url,
                 api_key=settings.qdrant_api_key,
-                timeout=30,
+                timeout=60,
                 prefer_grpc=False
             )
             
@@ -142,37 +140,18 @@ class VectorStoreService:
                 self.sparse_embeddings = None
             
             self.embedding_cache = EmbeddingCache(max_size=10000, ttl_seconds=3600)
+            self.collection_name = settings.qdrant_collection_name
             
-            # Try to initialize collection
-            try:
-                self._initialize_collection()
-            except Exception as e:
-                logger.warning(f"Collection initialization deferred: {e}")
-                logger.info("Vector store will attempt lazy initialization on first use")
-                return
+            self._initialize_collection()
             
-            self._initialized = True
             logger.info(f"✅ Multi-tenant Vector Store initialized")
             logger.info(f"  - Dense: AWS Bedrock ({self.embedding_model_id})")
             logger.info(f"  - Sparse: {'HuggingFace SPLADE' if self.sparse_embeddings else 'DISABLED'}")
             logger.info(f"  - KB isolation: ENABLED")
             
         except Exception as e:
-            self._init_error = str(e)
-            logger.warning(f"⚠️  Qdrant initialization deferred: {e}")
-            logger.info("Vector store will attempt lazy initialization on first use")
-    
-    def _ensure_initialized(self):
-        """Ensure the vector store is initialized before operations"""
-        if self._initialized and self.client:
-            return
-        
-        self._try_initialize()
-        
-        if not self._initialized or not self.client:
-            raise VectorStoreException(
-                f"Vector store not available: {self._init_error or 'Unknown error'}"
-            )
+            logger.error(f"Failed to initialize Qdrant: {e}", exc_info=True)
+            raise VectorStoreException(f"Failed to initialize vector store: {str(e)}")
     
     def _initialize_collection(self):
         """Create collection with dense + sparse vectors"""

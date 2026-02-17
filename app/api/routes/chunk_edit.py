@@ -18,15 +18,8 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/chunks", tags=["Chunk Management"])
 
-# Initialize vector store with lazy loading
-_vector_store = None
-
-def get_vector_store():
-    """Get or initialize vector store (lazy loading)"""
-    global _vector_store
-    if _vector_store is None:
-        _vector_store = VectorStoreService()
-    return _vector_store
+# Initialize vector store
+vector_store = VectorStoreService()
 
 
 class ChunkDetailResponse(BaseModel):
@@ -99,7 +92,7 @@ async def get_chunk_details(
     """
     try:
         # Retrieve chunk from vector store
-        chunk_data = get_vector_store().get_chunk_by_id(
+        chunk_data = vector_store.get_chunk_by_id(
             chunk_id=chunk_id,
             user_id=user_id,
             knowledge_base_id=knowledge_base_id
@@ -199,7 +192,7 @@ async def edit_chunk(
             )
         
         # Retrieve existing chunk
-        existing_chunk = get_vector_store().get_chunk_by_id(
+        existing_chunk = vector_store.get_chunk_by_id(
             chunk_id=request.chunk_id,
             user_id=user_id,
             knowledge_base_id=kb.knowledge_base_id
@@ -221,7 +214,7 @@ async def edit_chunk(
         old_char_count = existing_chunk.get('char_count', 0)
         
         # Perform the update in vector store WITH KB
-        success = get_vector_store().update_chunk(
+        success = vector_store.update_chunk(
             chunk_id=request.chunk_id,
             file_id=request.file_id,
             new_text=request.new_text,

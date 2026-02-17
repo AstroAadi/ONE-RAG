@@ -23,8 +23,7 @@ from app.core.dependencies import get_user_id, get_database_session
 from app.core.task_manager import get_task_manager, TaskType
 from app.db.models import (
     FileMetadata, ChunkMetadata, KnowledgeBase,
-    ProcessingStatus, ChunkingStrategyEnum,
-    get_chunking_strategy_value
+    ProcessingStatus, ChunkingStrategyEnum
 )
 from typing import Dict, List
 # FIX A: import request/response schemas (their ChunkingStrategy enum is only
@@ -214,7 +213,7 @@ async def _create_chunks_internal(
         if file_metadata.status != ProcessingStatus.COMPLETED:
             raise HTTPException(
                 status_code=400,
-                detail=f"File must be extracted first. Current status: {file_metadata.status}"
+                detail=f"File must be extracted first. Current status: {file_metadata.status.value}"
             )
 
         existing_chunks = db.query(ChunkMetadata).filter(
