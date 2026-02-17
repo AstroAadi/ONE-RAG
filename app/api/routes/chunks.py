@@ -15,7 +15,8 @@ from app.core.dependencies import get_user_id, get_database_session
 from app.core.task_manager import get_task_manager, TaskType
 from app.db.models import (
     FileMetadata, ChunkMetadata, KnowledgeBase,
-    ProcessingStatus, ChunkingStrategyEnum
+    ProcessingStatus, ChunkingStrategyEnum,
+    get_chunking_strategy_value
 )
 from app.models.schemas import ChunkingStrategy
 from app.services.chunking_service import EnhancedChunkingService
@@ -60,10 +61,10 @@ async def create_chunks(
             raise HTTPException(status_code=404, detail=f"Knowledge base not found")
         
         # Check if file is completed (extraction done)
-        if file_metadata.status != ProcessingStatus.COMPLETED:
+        if file_metadata.status != ProcessingStatus.COMPLETED.value:
             raise HTTPException(
                 status_code=400,
-                detail=f"File must be extracted first. Current status: {file_metadata.status.value}"
+                detail=f"File must be extracted first. Current status: {file_metadata.status}"
             )
         
         # Check if chunks already exist
@@ -158,12 +159,14 @@ async def create_chunks(
             'default': ChunkingStrategyEnum.DEFAULT,
             'fixed_size': ChunkingStrategyEnum.FIXED_SIZE,
             'hierarchical': ChunkingStrategyEnum.HIERARCHICAL,
-            'semantic': ChunkingStrategyEnum.SEMANTIC
+            'semantic': ChunkingStrategyEnum.SEMANTIC,
+            
         }
         
         # Update file metadata
         file_metadata.chunks_created = len(chunks)
-        file_metadata.chunking_strategy = strategy_map.get(chunking_strategy.value)
+        strategy_enum = strategy_map.get(chunking_strategy.value)
+        file_metadata.chunking_strategy = get_chunking_strategy_value(strategy_enum) if strategy_enum else "default"
         file_metadata.target_chunk_tokens = target_chunk_tokens or 512
         file_metadata.chunk_overlap_tokens = chunk_overlap_tokens or 50
         

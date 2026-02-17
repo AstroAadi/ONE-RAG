@@ -20,8 +20,13 @@ from app.core.config import settings
 from app.core.dependencies import get_user_id, get_database_session
 from app.core.exceptions import FileSizeError, FileTypeError
 from app.db.models import (
-    FileMetadata, ProcessingStatus as DBProcessingStatus,
-    FileType, KnowledgeBase
+    FileMetadata, 
+    ProcessingStatus as DBProcessingStatus,
+    FileType, 
+    KnowledgeBase,
+    get_processing_status_value,
+    get_file_type_value,
+    get_chunking_strategy_value
 )
 from app.core.task_manager import get_task_manager, TaskType
 
@@ -127,6 +132,9 @@ async def upload_file(
         
         # Get file category
         file_category = FileValidator.get_file_category(safe_filename)
+        logger.debug(f"� File category detected: {file_category}")
+        
+        # Map to FileType enum member
         file_type_map = {
             'document': FileType.DOCUMENT,
             'presentation': FileType.PRESENTATION,
@@ -136,8 +144,12 @@ async def upload_file(
             'unknown': FileType.OTHER
         }
         file_type_enum = file_type_map.get(file_category, FileType.OTHER)
+        logger.info(f"✓ File type: {file_type_enum.name} = {file_type_enum.value}")
         
-        # Create file metadata - simple status (no chunking params here)
+        # ✅ PRODUCTION-SAFE: Convert enum members to lowercase string values for DB
+        file_type_str = get_file_type_value(file_type_enum)
+        status_str = get_processing_status_value(DBProcessingStatus.PROCESSING)
+        
         file_metadata = FileMetadata(
             file_id=file_id,
             user_id=user_id,
@@ -145,11 +157,17 @@ async def upload_file(
             original_filename=file.filename,
             safe_filename=unique_filename,
             file_extension=file_extension,
-            file_type=file_type_enum,
+            file_type=file_type_str,  # ✅ Pass lowercase string value
             file_size_bytes=file_size,
             storage_path=str(upload_path),
-            status=DBProcessingStatus.PROCESSING,
+            status=status_str,  # ✅ Pass lowercase string value
             uploaded_at=datetime.utcnow()
+        )
+        
+        logger.debug(
+            f"🔍 FileMetadata created: "
+            f"file_type={file_metadata.file_type} | "
+            f"status={file_metadata.status}"
         )
         
         db.add(file_metadata)
@@ -290,8 +308,8 @@ def extract_document_background(
             if progress_callback:
                 progress_callback(90.0)
             
-            # Update file metadata - COMPLETED after extraction only
-            file_metadata.status = DBProcessingStatus.COMPLETED
+            # Update file metadata - COMPLETED after extraction
+            file_metadata.status = get_processing_status_value(DBProcessingStatus.COMPLETED)
             file_metadata.processed_at = datetime.utcnow()
             file_metadata.markdown_path = str(markdown_path) if markdown_saved else None
             file_metadata.total_pages = total_pages
@@ -334,14 +352,14 @@ def extract_document_background(
         
         try:
             from app.core.database import get_db_context
-            from app.db.models import ProcessingStatus as DBProcessingStatus
+            from app.db.models import ProcessingStatus as DBProcessingStatus, get_processing_status_value
             with get_db_context() as db:
                 file_metadata = db.query(FileMetadata).filter(
                     FileMetadata.file_id == file_id
                 ).first()
                 
                 if file_metadata:
-                    file_metadata.status = DBProcessingStatus.FAILED
+                    file_metadata.status = get_processing_status_value(DBProcessingStatus.FAILED)
                     file_metadata.error_message = str(e)
                     db.commit()
         except Exception as db_error:
