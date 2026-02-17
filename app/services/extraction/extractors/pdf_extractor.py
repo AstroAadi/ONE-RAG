@@ -1,20 +1,4 @@
-"""
-Enhanced PDF Extractor with Docling + Unstructured Fallback
-=============================================================
 
-COMPLETE IMPLEMENTATION with Direct Markdown Table Extraction
-
-Strategy:
-1. Get page count from Docling and Unstructured (BEFORE extraction)
-2. Compare with PyMuPDF page count (ground truth)
-3. If Docling matches → Use Docling (fast, better layout)
-4. If Unstructured matches → Use Unstructured (robust fallback)
-5. Both methods: Extract images, describe with Vision LLM, preserve layout
-6. Tables: Extract directly as Markdown (no HTML conversion!)
-
-Author: Complete Dual-Extractor Solution with Direct Markdown Tables
-Date: 2026-01-21
-"""
 
 import os
 from pathlib import Path
@@ -77,6 +61,9 @@ class PDFExtractor(BaseExtractor):
         self.image_cache = get_image_cache()
         self.image_service = get_image_description_service()
         # self.caption_detector = CaptionDetector
+        
+        # Initialize GPU availability from settings
+        self.is_gpu_available = settings.is_gpu_available
         
         # Statistics tracking
         self.extraction_stats = {
@@ -263,21 +250,24 @@ class PDFExtractor(BaseExtractor):
                 }
             )
             
+            logger.debug(f"Converting PDF with Docling: {Path(file_path).name}")
             result = converter.convert(file_path)
             page_count = len(result.document.pages)
             logger.debug(f"✓ Docling page count: {page_count}")
             return page_count
             
         except Exception as e:
-            logger.warning(f"Docling page count failed: {e}")
+            logger.error(f"❌ Docling page count failed: {e}", exc_info=True)
             return 0
     
     def _get_unstructured_page_count(self, file_path: str) -> int:
         """Get Unstructured page count (quick check - fast strategy)"""
         if not UNSTRUCTURED_AVAILABLE:
+            logger.debug("Unstructured not available, skipping page count")
             return 0
         
         try:
+            logger.debug(f"Running Unstructured partition_pdf (fast strategy): {Path(file_path).name}")
             # Use fast strategy for quick page count
             elements = partition_pdf(
                 filename=file_path,
@@ -286,19 +276,25 @@ class PDFExtractor(BaseExtractor):
                 strategy="fast",  # Fastest strategy
             )
             
+            if not elements:
+                logger.debug("❌ Unstructured returned no elements")
+                return 0
+            
+            logger.debug(f"Unstructured returned {len(elements)} elements")
+            
             # Get unique page numbers
-            page_numbers = {
-                elem.metadata.page_number 
-                for elem in elements 
-                if elem.metadata.page_number
-            }
+            page_numbers = set()
+            for elem in elements:
+                if hasattr(elem, 'metadata') and elem.metadata:
+                    if hasattr(elem.metadata, 'page_number') and elem.metadata.page_number:
+                        page_numbers.add(elem.metadata.page_number)
             
             page_count = max(page_numbers) if page_numbers else 0
-            logger.debug(f"✓ Unstructured page count: {page_count}")
+            logger.debug(f"✓ Unstructured page count: {page_count} (from {len(page_numbers)} unique pages, {len(elements)} total elements)")
             return page_count
             
         except Exception as e:
-            logger.warning(f"Unstructured page count failed: {e}")
+            logger.error(f"❌ Unstructured page count failed: {e}", exc_info=True)
             return 0
     
     # ============================================================================
@@ -408,7 +404,6 @@ class PDFExtractor(BaseExtractor):
                 extract_images_in_pdf=True,  # Extract images
                 infer_table_structure=True,  # Infer tables
                 strategy="hi_res",  # High resolution
-                languages=["eng"],
                 extract_image_block_output_dir=str(temp_image_dir)
             )
             
@@ -647,16 +642,8 @@ class PDFExtractor(BaseExtractor):
         pipeline_options.generate_picture_images = True
         
         # ⚡ ENABLE GPU FOR OCR
-        if self.is_gpu_available and pipeline_options.do_ocr:
-            try:
-                pipeline_options.ocr_options = {
-                    'use_gpu': True,
-                    'gpu_id': 0,
-                    'verbose': False
-                }
-                logger.info("🎮 Docling OCR configured to use GPU")
-            except Exception as e:
-                logger.warning(f"Could not enable GPU for OCR: {e}")
+        # OCR configuration removed - use Docling defaults
+        # Custom ocr_options can cause compatibility issues with different Docling versions
         
         try:
             pipeline_options.generate_page_images = False
