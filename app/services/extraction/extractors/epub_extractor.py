@@ -190,7 +190,6 @@ class EPUBExtractor(BaseExtractor):
         for i, href in enumerate(spine):
             try:
                 # Construct full path
-                if opf_dir:
                 href = href.replace('\\', '/')
 
                 if href in epub_zip.namelist():
