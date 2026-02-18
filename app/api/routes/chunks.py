@@ -33,9 +33,186 @@ from app.services.vector_store_service import VectorStoreService
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+
+# ==================== PREVIEW ENDPOINT ====================
+
+@router.post("/preview", tags=["Chunks - Preview"])
+async def preview_chunks(
+    request: ChunkingRequest = Body(...),
+    user_id: str = Depends(get_user_id),
+    db: Session = Depends(get_database_session)
+):
+    """
+    Preview the first 5 chunks that *would* be created for a given file and
+    chunking strategy — without persisting anything to the database.
+
+    Accepts the same request body as /create. Returns up to 5 sample chunks
+    so the user can evaluate the chunking configuration before committing.
+
+    Example request:
+    {
+        "file_id": "example_file_id",
+        "chunking_strategy": "fixed_size",
+        "chunk_size": 500,
+        "chunk_overlap": 50
+    }
+    """
+    import time
+
+    strategy = getattr(request, "chunking_strategy", "default")
+
+    # ── DB lookups ───────────────────────────────────────────────────────────
+    file_metadata = db.query(FileMetadata).filter(
+        FileMetadata.file_id == request.file_id,
+        FileMetadata.user_id == user_id
+    ).first()
+    if not file_metadata:
+        raise HTTPException(status_code=404, detail=f"File not found: {request.file_id}")
+
+    kb = db.query(KnowledgeBase).filter(
+        KnowledgeBase.knowledge_base_id == file_metadata.knowledge_base_id,
+        KnowledgeBase.user_id == user_id
+    ).first()
+    if not kb:
+        raise HTTPException(status_code=404, detail="Knowledge base not found")
+
+    if file_metadata.status != ProcessingStatus.COMPLETED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File must be extracted first. Current status: {file_metadata.status.value}"
+        )
+
+    # ── Read markdown ────────────────────────────────────────────────────────
+    if not file_metadata.markdown_path:
+        raise HTTPException(status_code=400, detail="No markdown content available. Re-run extraction.")
+    try:
+        with open(file_metadata.markdown_path, 'r', encoding='utf-8') as f:
+            markdown_content = f.read()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not read markdown content: {e}")
+
+    if not markdown_content:
+        raise HTTPException(status_code=400, detail="No markdown content available. Re-run extraction.")
+
+    base_metadata = {
+        'user_id': user_id,
+        'file_id': request.file_id,
+        'filename': file_metadata.safe_filename,
+        'knowledge_base_id': kb.knowledge_base_id,
+        'knowledge_base_name': kb.knowledge_base_name,
+    }
+
+    # ── Build constructor / call kwargs (mirrors _create_chunks_internal) ────
+    constructor_kwargs: dict = {}
+    call_kwargs: dict = {}
+    params: dict = {}
+
+    if strategy == "default":
+        constructor_kwargs = {'target_chunk_tokens': 300, 'chunk_overlap_tokens': 30}
+        params = {"chunk_size": 300, "chunk_overlap": 30}
+
+    elif strategy == "fixed_size":
+        chunk_size = getattr(request, "chunk_size", None)
+        chunk_overlap = getattr(request, "chunk_overlap", None)
+        if chunk_size is None or chunk_overlap is None:
+            raise HTTPException(status_code=400,
+                detail="fixed_size strategy requires: chunk_size, chunk_overlap")
+        constructor_kwargs = {'target_chunk_tokens': chunk_size, 'chunk_overlap_tokens': chunk_overlap}
+        params = {"chunk_size": chunk_size, "chunk_overlap": chunk_overlap}
+
+    elif strategy == "semantic":
+        chunk_size = getattr(request, "chunk_size", None)
+        chunk_overlap = getattr(request, "chunk_overlap", None)
+        max_buffer_size = getattr(request, "max_buffer_size", None)
+        breakpoint_threshold = getattr(request, "breakpoint_threshold", None)
+        if None in (chunk_size, chunk_overlap, max_buffer_size, breakpoint_threshold):
+            raise HTTPException(status_code=400,
+                detail="semantic strategy requires: chunk_size, chunk_overlap, max_buffer_size, breakpoint_threshold")
+        constructor_kwargs = {'target_chunk_tokens': chunk_size, 'chunk_overlap_tokens': chunk_overlap}
+        call_kwargs = {'max_buffer_size': max_buffer_size, 'breakpoint_threshold': breakpoint_threshold}
+        params = {"chunk_size": chunk_size, "chunk_overlap": chunk_overlap,
+                  "max_buffer_size": max_buffer_size, "breakpoint_threshold": breakpoint_threshold}
+
+    elif strategy == "hierarchical":
+        parent_chunk_size = getattr(request, "parent_chunk_size", None)
+        child_chunk_size = getattr(request, "child_chunk_size", None)
+        child_chunk_overlap = getattr(request, "child_chunk_overlap", None)
+        if None in (parent_chunk_size, child_chunk_size, child_chunk_overlap):
+            raise HTTPException(status_code=400,
+                detail="hierarchical strategy requires: parent_chunk_size, child_chunk_size, child_chunk_overlap")
+        constructor_kwargs = {'target_chunk_tokens': child_chunk_size, 'chunk_overlap_tokens': child_chunk_overlap}
+        call_kwargs = {'parent_chunk_size': parent_chunk_size,
+                       'child_chunk_size': child_chunk_size,
+                       'child_chunk_overlap': child_chunk_overlap}
+        params = {"parent_chunk_size": parent_chunk_size,
+                  "child_chunk_size": child_chunk_size,
+                  "child_chunk_overlap": child_chunk_overlap}
+
+    elif strategy == "no_chunking":
+        params = {"note": "Full document as single chunk"}
+
+    else:
+        raise HTTPException(status_code=400, detail=f"Invalid chunking_strategy: {strategy}")
+
+    # ── Run chunking (no DB writes) ──────────────────────────────────────────
+    try:
+        start_time = time.time()
+
+        if strategy == "no_chunking":
+            svc = EnhancedChunkingService()
+            all_chunks = svc._chunk_no_chunking(markdown_content, base_metadata)
+        else:
+            chunking_service = EnhancedChunkingService(**constructor_kwargs)
+            strategy_enum = ChunkingStrategy(strategy)
+            all_chunks = chunking_service.split_document_into_chunks(
+                markdown_content,
+                base_metadata=base_metadata,
+                strategy=strategy_enum,
+                **call_kwargs,
+            )
+
+        preview_time = time.time() - start_time
+
+    except Exception as e:
+        logger.error(f"❌ Preview chunking failed: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Preview chunking failed: {str(e)}")
+
+    # ── Return first 5 chunks only ───────────────────────────────────────────
+    PREVIEW_LIMIT = 5
+    preview_chunks_data = all_chunks[:PREVIEW_LIMIT]
+
+    sample = [
+        {
+            "chunk_index": chunk["metadata"]["chunk_index"],
+            "chunk_id": chunk["chunk_id"],
+            "chunk_type": chunk["metadata"].get("chunk_type", "text"),
+            "char_count": chunk["char_count"],
+            "page_number": chunk["metadata"].get("page_number", 0),
+            "content": chunk["text"],
+        }
+        for chunk in preview_chunks_data
+    ]
+
+    logger.info(
+        f"👁️ Preview for file {request.file_id} ({strategy}): "
+        f"showing {len(sample)} of {len(all_chunks)} total chunks"
+    )
+
+    return {
+        "file_id": request.file_id,
+        "knowledge_base_id": kb.knowledge_base_id,
+        "chunking_strategy": strategy,
+        "parameters": params,
+        "preview_chunks": sample,
+        "preview_count": len(sample),
+        "estimated_total_chunks": len(all_chunks),
+        "preview_time_seconds": round(preview_time, 2),
+        "note": "This is a preview only. No data has been saved. Call /create to persist chunks.",
+    }
+
 # ==================== SINGLE UNIFIED ENDPOINT ====================
 
-@router.post("/create", tags=["Chunks"])
+@router.post("/create", tags=["Chunks - Create"])
 async def create_chunks(
     request: ChunkingRequest = Body(...),
     user_id: str = Depends(get_user_id),
