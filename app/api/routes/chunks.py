@@ -49,12 +49,40 @@ async def preview_chunks(
     Accepts the same request body as /create. Returns up to 5 sample chunks
     so the user can evaluate the chunking configuration before committing.
 
-    Example request:
+        Example request bodies:
+    1. Default:
+    {
+        "file_id": "example_file_id",
+        "chunking_strategy": "default"
+    }
+    2. Fixed Size:
     {
         "file_id": "example_file_id",
         "chunking_strategy": "fixed_size",
-        "chunk_size": 500,
-        "chunk_overlap": 50
+        "chunk_size": 1000,
+        "chunk_overlap": 100
+    }
+    3. Semantic:
+    {
+        "file_id": "example_file_id",
+        "chunking_strategy": "semantic",
+        "chunk_size": 1000,
+        "chunk_overlap": 100,
+        "max_buffer_size": 256,
+        "breakpoint_threshold": 0.8
+    }
+    4. Hierarchical:
+    {
+        "file_id": "example_file_id",
+        "chunking_strategy": "hierarchical",
+        "parent_chunk_size": 2048,
+        "child_chunk_size": 512,
+        "child_chunk_overlap": 64
+    }
+    5. No Chunking:
+    {
+        "file_id": "example_file_id",
+        "chunking_strategy": "no_chunking"
     }
     """
     import time
@@ -222,40 +250,40 @@ async def create_chunks(
     Unified chunk creation endpoint. Accepts all chunking strategies.
 
     Example request bodies:
-1. Default:
-{
-    "file_id": "example_file_id",
-    "chunking_strategy": "default"
-}
-2. Fixed Size:
-{
-    "file_id": "example_file_id",
-    "chunking_strategy": "fixed_size",
-    "chunk_size": 1000,
-    "chunk_overlap": 100
-}
-3. Semantic:
-{
-    "file_id": "example_file_id",
-    "chunking_strategy": "semantic",
-    "chunk_size": 1000,
-    "chunk_overlap": 100,
-    "max_buffer_size": 256,
-    "breakpoint_threshold": 0.8
-}
-4. Hierarchical:
-{
-    "file_id": "example_file_id",
-    "chunking_strategy": "hierarchical",
-    "parent_chunk_size": 2048,
-    "child_chunk_size": 512,
-    "child_chunk_overlap": 64
-}
-5. No Chunking:
-{
-    "file_id": "example_file_id",
-    "chunking_strategy": "no_chunking"
-}
+    1. Default:
+    {
+        "file_id": "example_file_id",
+        "chunking_strategy": "default"
+    }
+    2. Fixed Size:
+    {
+        "file_id": "example_file_id",
+        "chunking_strategy": "fixed_size",
+        "chunk_size": 1000,
+        "chunk_overlap": 100
+    }
+    3. Semantic:
+    {
+        "file_id": "example_file_id",
+        "chunking_strategy": "semantic",
+        "chunk_size": 1000,
+        "chunk_overlap": 100,
+        "max_buffer_size": 256,
+        "breakpoint_threshold": 0.8
+    }
+    4. Hierarchical:
+    {
+        "file_id": "example_file_id",
+        "chunking_strategy": "hierarchical",
+        "parent_chunk_size": 2048,
+        "child_chunk_size": 512,
+        "child_chunk_overlap": 64
+    }
+    5. No Chunking:
+    {
+        "file_id": "example_file_id",
+        "chunking_strategy": "no_chunking"
+    }
 """
     strategy = getattr(request, "chunking_strategy", "default")
     if strategy == "default":
