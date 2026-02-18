@@ -356,7 +356,15 @@ async def get_file_status(
     user_id: str = Depends(get_user_id),
     db: Session = Depends(get_database_session)
 ):
-    """Get file processing status"""
+    """
+    Get file processing status with detailed error information and retry guidance.
+    
+    Status values:
+    - uploaded: File uploaded, extraction queued
+    - processing: Extraction in progress
+    - completed: Extraction completed successfully (ready for chunking)
+    - failed: Extraction failed - use /api/chunks/retry-extraction to retry
+    """
     file_metadata = db.query(FileMetadata).filter(
         FileMetadata.file_id == file_id,
         FileMetadata.user_id == user_id
@@ -369,7 +377,8 @@ async def get_file_status(
         KnowledgeBase.knowledge_base_id == file_metadata.knowledge_base_id
     ).first()
     
-    return {
+    # Build response with guidance
+    response = {
         "file_id": file_id,
         "filename": file_metadata.safe_filename,
         "knowledge_base_id": file_metadata.knowledge_base_id,
@@ -382,3 +391,16 @@ async def get_file_status(
         "chunks_created": file_metadata.chunks_created,
         "error_message": file_metadata.error_message
     }
+    
+    # Add next action guidance
+    if file_metadata.status.value == "completed":
+        response["next_action"] = "Chunking ready. POST to /api/chunks/create to create chunks."
+    elif file_metadata.status.value == "processing":
+        response["next_action"] = "Extraction in progress. Check back in a moment."
+    elif file_metadata.status.value == "failed":
+        response["next_action"] = f"Extraction failed. Use POST /api/chunks/retry-extraction to retry, or re-upload file."
+        response["retry_endpoint"] = "/api/chunks/retry-extraction"
+    elif file_metadata.status.value == "uploaded":
+        response["next_action"] = "File uploaded. Extraction queued. Check status again shortly."
+    
+    return response

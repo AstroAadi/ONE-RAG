@@ -198,6 +198,14 @@ class EnhancedChunkingService:
         child_chunk_size: Optional[int] = None,
         child_chunk_overlap: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
+        # Defensive normalization: always use lowercase and valid enum
+        if isinstance(strategy, str):
+            strategy_str = strategy.lower()
+            try:
+                strategy = ChunkingStrategy(strategy_str)
+            except ValueError:
+                logger.warning(f"Invalid chunking strategy '{strategy}'. Falling back to 'default'.")
+                strategy = ChunkingStrategy.DEFAULT
         """
         Split *markdown_text* into chunks using *strategy*.
 
@@ -264,10 +272,29 @@ class EnhancedChunkingService:
     # ──────────────────────────────────────────────────────────────────────
 
     def _chunk_no_chunking(
-        self, text: str, base_metadata: Dict
+        self,
+        text: str,
+        base_metadata: Dict[str, Any]
     ) -> List[Dict[str, Any]]:
-        """Whole document as a single chunk."""
-        return [self._create_chunk(text, 1, base_metadata, chunk_type="full_document")]
+        """
+        No-chunking strategy: entire document becomes one single chunk.
+        
+        Returns:
+            List with exactly one chunk (or empty list if input is blank).
+        """
+        if not text or not text.strip():
+            logger.debug("No content → returning empty list (no chunk)")
+            return []
+
+        # Use your standard chunk creation helper
+        return [self._create_chunk(
+            text=text,
+            chunk_index=1,
+            base_metadata=base_metadata,
+            chunk_type="full_document",          # clearly mark it
+            position=0,
+            total_tokens=self.token_counter.count_tokens(text)
+        )]
 
     # ──────────────────────────────────────────────────────────────────────
     # STRATEGY: Fixed-size  (also used by DEFAULT)
