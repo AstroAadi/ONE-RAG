@@ -190,11 +190,23 @@ class EPUBExtractor(BaseExtractor):
         for i, href in enumerate(spine):
             try:
                 # Construct full path
-                if opf_dir:
-                    full_path = str(Path(opf_dir) / href)
-                else:
+                href = href.replace('\\', '/')
+
+                if href in epub_zip.namelist():
                     full_path = href
-                
+                else:
+                    candidate = str(Path(opf_dir) / href).replace('\\', '/')
+                    if candidate in epub_zip.namelist():
+                        full_path = candidate
+                    else:
+                        matches = [f for f in epub_zip.namelist() if f.endswith(href)]
+                        if matches:
+                            full_path = matches[0]
+                        else: 
+                            continue
+                content = epub_zip.read(full_path).decode('utf-8', errors='ignore') 
+
+
                 # Read content
                 if full_path in epub_zip.namelist():
                     content = epub_zip.read(full_path).decode('utf-8', errors='ignore')

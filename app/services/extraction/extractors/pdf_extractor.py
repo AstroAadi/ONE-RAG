@@ -1,20 +1,4 @@
-"""
-Enhanced PDF Extractor with Docling + Unstructured Fallback
-=============================================================
 
-COMPLETE IMPLEMENTATION with Direct Markdown Table Extraction
-
-Strategy:
-1. Get page count from Docling and Unstructured (BEFORE extraction)
-2. Compare with PyMuPDF page count (ground truth)
-3. If Docling matches → Use Docling (fast, better layout)
-4. If Unstructured matches → Use Unstructured (robust fallback)
-5. Both methods: Extract images, describe with Vision LLM, preserve layout
-6. Tables: Extract directly as Markdown (no HTML conversion!)
-
-Author: Complete Dual-Extractor Solution with Direct Markdown Tables
-Date: 2026-01-21
-"""
 
 import os
 from pathlib import Path

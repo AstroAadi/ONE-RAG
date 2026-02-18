@@ -107,7 +107,7 @@ class Settings(BaseSettings):
     
     # Database URL - supports both SQLite and PostgreSQL
     database_url: str = Field(
-        default="postgresql+psycopg2://postgres:root@localhost:5432/oneragdb2",
+        default="postgresql+psycopg2://postgres:root@localhost:5432/one-rag-db",
         description="Database URL (SQLite or PostgreSQL)"
     )
     
