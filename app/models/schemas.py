@@ -243,7 +243,7 @@ class SemanticChunkingRequest(BaseModel):
     chunking_strategy: Literal["semantic"] = Field(default="semantic", description="Chunking strategy (fixed: semantic)")
     chunk_size: int = Field(..., ge=100, le=2048, description="Target chunk size in tokens")
     chunk_overlap: int = Field(..., ge=0, le=500, description="Overlap between chunks in tokens")
-    max_buffer_size: int = Field(..., ge=1, le=512, description="Maximum number of sentences to compare for similarity")
+    max_buffer_size: int = Field(..., ge=1, le=20, description="Maximum number of sentences to compare for similarity")
     breakpoint_threshold: float = Field(..., ge=0.0, le=1.0, description="Similarity threshold for breaking chunks (0.5-0.7 recommended)")
 
 
