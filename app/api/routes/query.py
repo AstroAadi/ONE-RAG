@@ -18,6 +18,7 @@ from app.core.exceptions import (
 from app.db.models import QueryLog, KnowledgeBase
 import time
 import logging
+import uuid
 from datetime import datetime, timedelta
 from typing import Tuple, List, Dict
 from functools import lru_cache
@@ -288,6 +289,9 @@ async def query_knowledge_base(
             documents, metadatas, scores, request.knowledge_base_id
         )
         
+        # Always ensure a conversation_id exists — generate one if not provided
+        conversation_id = getattr(request, "conversation_id", None) or str(uuid.uuid4())
+
         # Generate answer
         try:
             answer = get_llm_service().generate_answer(
@@ -295,7 +299,7 @@ async def query_knowledge_base(
                 context=context,
                 user_id=user_id,
                 db=db,
-                conversation_id=None,
+                conversation_id=conversation_id,
                 include_citations=True,
                 temperature=request.temperature or 0.7
             )
@@ -320,7 +324,8 @@ async def query_knowledge_base(
             "processing_time": round(processing_time, 2),
             "search_type": search_type,
             "confidence_score": round(confidence, 3),
-            "knowledge_base_id": request.knowledge_base_id
+            "knowledge_base_id": request.knowledge_base_id,
+            "conversation_id": conversation_id
         }
         
         # Cache result
@@ -337,7 +342,7 @@ async def query_knowledge_base(
         log_query_to_db(
             db, user_id, request.knowledge_base_id, request.question, answer,
             request.top_k, len(documents), processing_time,
-            confidence, search_type.value, None
+            confidence, search_type.value, conversation_id
         )
         
         logger.info(
@@ -400,6 +405,10 @@ async def query_with_conversation(
         kb.last_accessed = datetime.utcnow()
         db.commit()
         
+        # Always ensure a conversation_id exists — generate one if not provided
+        if not request.conversation_id:
+            request.conversation_id = str(uuid.uuid4())
+
         search_type = request.search_type or SearchType.HYBRID
         
         logger.info(
