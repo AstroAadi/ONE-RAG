@@ -189,7 +189,7 @@ async def preview_chunks(
                 "chunk_type": "parent",
                 "char_count": chunk["char_count"],
                 "page_number": chunk["metadata"].get("page_number", 0),
-                "content_preview": chunk["text"][:1200] + (" …" if len(chunk["text"]) > 1200 else ""),
+                "content_preview": chunk["text"],
                 "full_char_count": len(chunk["text"]),
                 "children": []
             }
@@ -213,7 +213,7 @@ async def preview_chunks(
                     "chunk_type": "child",
                     "char_count": chunk["char_count"],
                     "page_number": chunk["metadata"].get("page_number", 0),
-                    "content_preview": chunk["text"][:900] + (" …" if len(chunk["text"]) > 900 else ""),
+                    "content_preview": chunk["text"],
                     "full_char_count": len(chunk["text"]),
                 }
                 parent_map[parent_id]["children"].append(child_item)
@@ -229,7 +229,7 @@ async def preview_chunks(
                     "parent_chunk_id": chunk["metadata"].get("parent_chunk_id"),
                     "chunk_index": chunk["metadata"]["chunk_index"],
                     "char_count": chunk["char_count"],
-                    "content_preview": chunk["text"][:500] + " …"
+                    "content_preview": chunk["text"]
                 })
 
     else:
