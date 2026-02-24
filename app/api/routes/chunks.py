@@ -171,52 +171,65 @@ async def preview_chunks(
     preview_data = []
 
     if strategy == "hierarchical":
-        # Nested structure: parents contain children
-        current_parent = None
-        included_count = 0
-        MAX_ITEMS = 15  # safety limit – total flat chunks (parents + children)
+        parent_map = {}  # chunk_id → preview parent dict
+        MAX_PARENTS = 4
+        MAX_TOTAL_FLAT = 25   # parents + children safety
 
+        # Step 1: Collect parents (first N parents)
+        parent_count = 0
         for chunk in all_chunks:
-            if included_count >= MAX_ITEMS:
+            if chunk["metadata"].get("chunk_type") != "parent":
+                continue
+            if parent_count >= MAX_PARENTS:
                 break
-
-            chunk_type = chunk["metadata"].get("chunk_type", "text")
 
             item = {
                 "chunk_index": chunk["metadata"]["chunk_index"],
                 "chunk_id": chunk["chunk_id"],
-                "chunk_type": chunk_type,
+                "chunk_type": "parent",
                 "char_count": chunk["char_count"],
                 "page_number": chunk["metadata"].get("page_number", 0),
-                "content_preview": (
-                    chunk["text"]
-                ),
+                "content_preview": chunk["text"][:1200] + (" …" if len(chunk["text"]) > 1200 else ""),
                 "full_char_count": len(chunk["text"]),
+                "children": []
             }
+            parent_map[chunk["chunk_id"]] = item
+            preview_data.append(item)
+            parent_count += 1
 
-            if chunk_type == "parent":
-                current_parent = item
-                current_parent["children"] = []
-                preview_data.append(current_parent)
-                included_count += 1
-            elif chunk_type == "child" and current_parent is not None:
-                current_parent["children"].append(item)
-                included_count += 1
-
-        # Handle orphan children (very rare)
-        parent_ids_in_preview = {p["chunk_id"] for p in preview_data}
+        # Step 2: Attach children to the correct parent using parent_chunk_id
         for chunk in all_chunks:
-            if (chunk["metadata"].get("chunk_type") == "child" and
-                chunk["metadata"].get("parent_chunk_id") not in parent_ids_in_preview):
-                preview_data.append({
+            if len(preview_data) + sum(len(p["children"]) for p in preview_data) >= MAX_TOTAL_FLAT:
+                break
+
+            if chunk["metadata"].get("chunk_type") != "child":
+                continue
+
+            parent_id = chunk["metadata"].get("parent_chunk_id")
+            if parent_id in parent_map:
+                child_item = {
                     "chunk_index": chunk["metadata"]["chunk_index"],
                     "chunk_id": chunk["chunk_id"],
                     "chunk_type": "child",
                     "char_count": chunk["char_count"],
                     "page_number": chunk["metadata"].get("page_number", 0),
-                    "content_preview": chunk["text"][:900] + " …" if len(chunk["text"]) > 900 else chunk["text"],
+                    "content_preview": chunk["text"][:900] + (" …" if len(chunk["text"]) > 900 else ""),
                     "full_char_count": len(chunk["text"]),
-                    "warning": "orphan child (parent not in preview)"
+                }
+                parent_map[parent_id]["children"].append(child_item)
+
+        # Optional: show orphans if any (should be rare)
+        shown_parent_ids = set(parent_map.keys())
+        for chunk in all_chunks:
+            if (chunk["metadata"].get("chunk_type") == "child" and
+                chunk["metadata"].get("parent_chunk_id") not in shown_parent_ids):
+                preview_data.append({
+                    "warning": "orphan child - parent not included in preview",
+                    "chunk_id": chunk["chunk_id"],
+                    "parent_chunk_id": chunk["metadata"].get("parent_chunk_id"),
+                    "chunk_index": chunk["metadata"]["chunk_index"],
+                    "char_count": chunk["char_count"],
+                    "content_preview": chunk["text"][:500] + " …"
                 })
 
     else:
@@ -256,7 +269,6 @@ async def preview_chunks(
         "preview_time_seconds": round(preview_time, 2),
         "note": "This is a preview only. No data has been saved. Call /create to persist chunks.",
     }
-
 # ==================== SINGLE UNIFIED ENDPOINT ====================
 
 @router.post("/create", tags=["Chunks - Create"])
