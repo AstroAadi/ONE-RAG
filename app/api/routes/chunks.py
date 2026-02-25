@@ -206,37 +206,107 @@ async def preview_chunks(
         raise HTTPException(status_code=500, detail=f"Preview chunking failed: {str(e)}")
 
     # ── Return first 5 chunks only ───────────────────────────────────────────
-    PREVIEW_LIMIT = 5
-    preview_chunks_data = all_chunks[:PREVIEW_LIMIT]
+    PREVIEW_LIMIT = 100
 
-    sample = [
-        {
-            "chunk_index": chunk["metadata"]["chunk_index"],
-            "chunk_id": chunk["chunk_id"],
-            "chunk_type": chunk["metadata"].get("chunk_type", "text"),
-            "char_count": chunk["char_count"],
-            "page_number": chunk["metadata"].get("page_number", 0),
-            "content": chunk["text"],
-        }
-        for chunk in preview_chunks_data
-    ]
+    if strategy == "hierarchical":
+        # ── Group by parent → children ───────────────────────────────────
+        # Hierarchical chunks carry 'parent_chunk_id' in metadata for children
+        # and have chunk_type == 'parent' / 'child'.
+        parents: dict = {}      # parent_chunk_id -> parent entry
+        orphans: list = []      # child chunks whose parent wasn't seen yet
+
+        for chunk in all_chunks:
+            meta       = chunk["metadata"]
+            chunk_type = meta.get("chunk_type", "")
+            chunk_id   = chunk["chunk_id"]
+
+            if chunk_type == "parent":
+                parents[chunk_id] = {
+                    "chunk_index" : meta["chunk_index"],
+                    "chunk_id"    : chunk_id,
+                    "chunk_type"  : "parent",
+                    "char_count"  : chunk["char_count"],
+                    "page_number" : meta.get("page_number", 0),
+                    "content"     : chunk["text"],
+                    "children"    : [],
+                }
+            elif chunk_type == "child":
+                parent_id = meta.get("parent_chunk_id")
+                child_entry = {
+                    "chunk_index" : meta["chunk_index"],
+                    "chunk_id"    : chunk_id,
+                    "chunk_type"  : "child",
+                    "char_count"  : chunk["char_count"],
+                    "page_number" : meta.get("page_number", 0),
+                    "content"     : chunk["text"],
+                }
+                if parent_id and parent_id in parents:
+                    parents[parent_id]["children"].append(child_entry)
+                else:
+                    orphans.append(child_entry)
+
+        # Build ordered list: parent + its children, then next parent, ...
+        hierarchical_flat: list = []
+        for parent_entry in parents.values():
+            hierarchical_flat.append(parent_entry)
+            hierarchical_flat.extend(parent_entry["children"])
+
+        # Append any orphaned children at the end (edge case)
+        hierarchical_flat.extend(orphans)
+
+        # Take up to PREVIEW_LIMIT parents (each with all their children)
+        parent_count = 0
+        preview_hierarchical: list = []
+        for entry in hierarchical_flat:
+            if entry["chunk_type"] == "parent":
+                if parent_count >= PREVIEW_LIMIT:
+                    break
+                parent_count += 1
+            preview_hierarchical.append(entry)
+
+        sample = preview_hierarchical
+        estimated_total_parents  = sum(1 for c in all_chunks if c["metadata"].get("chunk_type") == "parent")
+        estimated_total_children = sum(1 for c in all_chunks if c["metadata"].get("chunk_type") == "child")
+
+    else:
+        # ── Flat preview for all other strategies ─────────────────────────
+        preview_chunks_data = all_chunks[:PREVIEW_LIMIT]
+        sample = [
+            {
+                "chunk_index": chunk["metadata"]["chunk_index"],
+                "chunk_id"   : chunk["chunk_id"],
+                "chunk_type" : chunk["metadata"].get("chunk_type", "text"),
+                "char_count" : chunk["char_count"],
+                "page_number": chunk["metadata"].get("page_number", 0),
+                "content"    : chunk["text"],
+            }
+            for chunk in preview_chunks_data
+        ]
+        estimated_total_parents  = None
+        estimated_total_children = None
 
     logger.info(
-        f"👁️ Preview for file {request.file_id} ({strategy}): "
-        f"showing {len(sample)} of {len(all_chunks)} total chunks"
+        f"Preview for file {request.file_id} ({strategy}): "
+        f"showing {len(sample)} entries of {len(all_chunks)} total chunks"
     )
 
-    return {
-        "file_id": request.file_id,
-        "knowledge_base_id": kb.knowledge_base_id,
-        "chunking_strategy": strategy,
-        "parameters": params,
-        "preview_chunks": sample,
-        "preview_count": len(sample),
-        "estimated_total_chunks": len(all_chunks),
-        "preview_time_seconds": round(preview_time, 2),
-        "note": "This is a preview only. No data has been saved. Call /create to persist chunks.",
+    response = {
+        "file_id"                 : request.file_id,
+        "knowledge_base_id"       : kb.knowledge_base_id,
+        "chunking_strategy"       : strategy,
+        "parameters"              : params,
+        "preview_chunks"          : sample,
+        "preview_count"           : len(sample),
+        "estimated_total_chunks"  : len(all_chunks),
+        "preview_time_seconds"    : round(preview_time, 2),
+        "note"                    : "This is a preview only. No data has been saved. Call /create to persist chunks.",
     }
+
+    if strategy == "hierarchical":
+        response["estimated_total_parents"]  = estimated_total_parents
+        response["estimated_total_children"] = estimated_total_children
+
+    return response
 
 # ==================== SINGLE UNIFIED ENDPOINT ====================
 

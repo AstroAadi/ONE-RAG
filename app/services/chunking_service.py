@@ -499,187 +499,294 @@ class EnhancedChunkingService:
     # ──────────────────────────────────────────────────────────────────────
     # STRATEGY: Semantic
     # ──────────────────────────────────────────────────────────────────────
-
     def _chunk_semantic(
-        self,
-        text: str,
-        base_metadata: Dict,
-        max_buffer_size: Optional[int] = None,
-        breakpoint_threshold: Optional[float] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        Semantic chunking with full structure awareness.
+            self,
+            text: str,
+            base_metadata: Dict,
+            max_buffer_size: Optional[int] = None,
+            max_tokens: Optional[int] = None,
+            overlap_tokens: Optional[int] = None,
+            breakpoint_threshold: Optional[float] = None,
+        ) -> List[Dict[str, Any]]:
+            """
+            Semantic chunking with full structure awareness.
 
-        FIX-5: Two-pass (forward + backward) merge so trailing tiny chunks
-               are absorbed into the previous chunk.
-        FIX-6: Small structural units (heading / list / code_block that are
-               < min_chunk_tokens) are carried forward as a pending prefix
-               instead of being silently discarded.
-        """
-        if not text.strip():
-            return []
+            Parameters
+            ----------
+            text                : source text to chunk
+            base_metadata       : metadata dict passed to every created chunk
+            max_buffer_size     : max number of structural units buffered in a
+                                single chunk before forcing a flush, regardless
+                                of token count.  None → unlimited.
+            max_tokens          : token budget per chunk.
+                                Overrides self.target_chunk_tokens when provided.
+            overlap_tokens      : number of tokens from the tail of the previous
+                                chunk to prepend to the next chunk (sliding
+                                window overlap).
+                                Overrides self.chunk_overlap_tokens when provided.
+            breakpoint_threshold: cosine-distance threshold for semantic similarity.
+                                Lower = more aggressive splitting.
 
-        sim_threshold = (
-            breakpoint_threshold if breakpoint_threshold is not None else 0.25
-        )
+            FIX-5: Two-pass (forward + backward) merge so trailing tiny chunks
+                are absorbed into the previous chunk.
+            FIX-6: Small structural units (heading / list / code_block that are
+                < min_chunk_tokens) are carried forward as a pending prefix
+                instead of being silently discarded.
+            """
+            if not text.strip():
+                return []
 
-        units = self._split_into_structured_units(text)
-        if not units:
-            return self._chunk_by_sentence(text, base_metadata)
+            # ── Resolve effective parameters ────────────────────────────────────
+            effective_max_tokens   = max_tokens    if max_tokens    is not None else self.target_chunk_tokens
+            effective_overlap      = overlap_tokens if overlap_tokens is not None else self.chunk_overlap_tokens
+            effective_buffer_size  = max_buffer_size  # None means unlimited
 
-        raw_chunks:    List[Dict[str, Any]] = []
-        chunk_index    = 1
-        cur_parts:     List[str] = []
-        cur_text       = ""
-        cur_tokens     = 0
-        pending_prefix = ""           # FIX-6: carries small structural text forward
+            # FIX: Always default sim_threshold to a concrete float — never pass
+            # None into _is_semantically_similar (causes '>= NoneType' TypeError
+            # when breakpoint_threshold isn't stored/restored via file_metadata).
+            sim_threshold: float   = breakpoint_threshold if breakpoint_threshold is not None else 0.25
 
-        def flush() -> None:
-            nonlocal chunk_index, cur_parts, cur_text, cur_tokens
-            if not cur_parts:
-                return
-            raw_chunks.append(self._create_chunk(
-                " ".join(cur_parts), chunk_index, base_metadata,
-                chunk_type="semantic",
-            ))
-            chunk_index += 1
-            cur_parts, cur_text, cur_tokens = [], "", 0
+            units = self._split_into_structured_units(text)
+            if not units:
+                return self._chunk_by_sentence(text, base_metadata)
 
-        for unit in units:
-            unit_type   = unit["type"]
-            unit_text   = unit["text"]
-            unit_tokens = self.token_counter.count_tokens(unit_text)
+            raw_chunks:    List[Dict[str, Any]] = []
+            chunk_index    = 1
+            cur_parts:     List[str] = []
+            cur_text       = ""
+            cur_tokens     = 0
+            pending_prefix = ""           # FIX-6: carries small structural text forward
+            overlap_tail   = ""           # sliding-window text prepended to next chunk
 
-            # ── Structural boundary ─────────────────────────────────────
-            if unit_type in ("heading", "code_block", "list"):
-                flush()
-                if unit_tokens >= self.min_chunk_tokens:
-                    # Large enough to stand alone
-                    full_text = (
-                        (pending_prefix + " " + unit_text).strip()
-                        if pending_prefix
-                        else unit_text
-                    )
-                    raw_chunks.append(self._create_chunk(
-                        full_text, chunk_index, base_metadata,
-                        chunk_type=unit_type,
-                    ))
-                    chunk_index   += 1
-                    pending_prefix = ""
+            def flush() -> None:
+                nonlocal chunk_index, cur_parts, cur_text, cur_tokens, overlap_tail
+                if not cur_parts:
+                    return
+
+                chunk_text = " ".join(cur_parts)
+                raw_chunks.append(self._create_chunk(
+                    chunk_text, chunk_index, base_metadata,
+                    chunk_type="semantic",
+                ))
+                chunk_index += 1
+
+                # Compute overlap tail for the NEXT chunk (uses effective_overlap)
+                if effective_overlap and effective_overlap > 0:
+                    overlap_tail = self._extract_overlap_tail(chunk_text, effective_overlap)
                 else:
-                    # FIX-6: too small → carry forward, do NOT discard
-                    pending_prefix = (pending_prefix + " " + unit_text).strip()
-                continue
+                    overlap_tail = ""
 
-            # ── Normal paragraph unit ───────────────────────────────────
-            # Inject any pending prefix as the first part of a new chunk
-            if pending_prefix and not cur_parts:
-                p_tokens  = self.token_counter.count_tokens(pending_prefix)
-                cur_parts  = [pending_prefix]
-                cur_text   = pending_prefix
-                cur_tokens = p_tokens
-                pending_prefix = ""
+                cur_parts, cur_text, cur_tokens = [], "", 0
 
-            fits = cur_tokens + unit_tokens <= self.target_chunk_tokens
-            similar = (not cur_parts) or self._is_semantically_similar(
-                cur_text, unit_text, threshold=sim_threshold
+            def _start_new_chunk_with_overlap() -> None:
+                """Seed cur_parts/cur_text/cur_tokens from overlap_tail if present."""
+                nonlocal cur_parts, cur_text, cur_tokens
+                if overlap_tail:
+                    o_tokens   = self.token_counter.count_tokens(overlap_tail)
+                    cur_parts  = [overlap_tail]
+                    cur_text   = overlap_tail
+                    cur_tokens = o_tokens
+                else:
+                    cur_parts, cur_text, cur_tokens = [], "", 0
+
+            def _buffer_is_full() -> bool:
+                """True when max_buffer_size is set and the buffer has reached it."""
+                return (
+                    effective_buffer_size is not None
+                    and len(cur_parts) >= effective_buffer_size
+                )
+
+            for unit in units:
+                unit_type   = unit["type"]
+                unit_text   = unit["text"]
+                unit_tokens = self.token_counter.count_tokens(unit_text)
+
+                # ── Structural boundary ─────────────────────────────────────
+                if unit_type in ("heading", "code_block", "list"):
+                    flush()
+                    if unit_tokens >= self.min_chunk_tokens:
+                        # Large enough to stand alone
+                        full_text = (
+                            (pending_prefix + " " + unit_text).strip()
+                            if pending_prefix
+                            else unit_text
+                        )
+                        raw_chunks.append(self._create_chunk(
+                            full_text, chunk_index, base_metadata,
+                            chunk_type=unit_type,
+                        ))
+                        chunk_index   += 1
+                        pending_prefix = ""
+                        overlap_tail   = self._extract_overlap_tail(full_text, effective_overlap) if effective_overlap else ""
+                    else:
+                        # FIX-6: too small → carry forward, do NOT discard
+                        pending_prefix = (pending_prefix + " " + unit_text).strip()
+                    continue
+
+                # ── Normal paragraph unit ───────────────────────────────────
+                # Inject any pending prefix as the first part of a new chunk
+                if pending_prefix and not cur_parts:
+                    _start_new_chunk_with_overlap()
+                    p_text     = (pending_prefix + " " + cur_text).strip() if cur_text else pending_prefix
+                    p_tokens   = self.token_counter.count_tokens(p_text)
+                    cur_parts  = [p_text]
+                    cur_text   = p_text
+                    cur_tokens = p_tokens
+                    pending_prefix = ""
+
+                # Seed overlap into an empty buffer
+                if not cur_parts and overlap_tail:
+                    _start_new_chunk_with_overlap()
+
+                fits = cur_tokens + unit_tokens <= effective_max_tokens
+                similar = (not cur_parts) or self._is_semantically_similar(
+                    cur_text, unit_text, threshold=sim_threshold
+                )
+
+                if fits and similar and not _buffer_is_full():
+                    cur_parts.append(unit_text)
+                    cur_text   += " " + unit_text
+                    cur_tokens += unit_tokens
+                elif fits and not similar:
+                    flush()
+                    _start_new_chunk_with_overlap()
+                    cur_parts.append(unit_text)
+                    cur_text   = (cur_text + " " + unit_text).strip() if cur_text else unit_text
+                    cur_tokens += unit_tokens
+                else:
+                    # Doesn't fit OR buffer is full
+                    flush()
+                    _start_new_chunk_with_overlap()
+                    cur_parts.append(unit_text)
+                    cur_text   = (cur_text + " " + unit_text).strip() if cur_text else unit_text
+                    cur_tokens += unit_tokens
+
+            # Flush any remaining pending prefix that was never consumed
+            if pending_prefix:
+                cur_parts.append(pending_prefix)
+                cur_tokens += self.token_counter.count_tokens(pending_prefix)
+            flush()
+
+            # ── Two-pass merge (FIX-5) ──────────────────────────────────────
+            merged = self._merge_small_chunks(raw_chunks, base_metadata, effective_max_tokens)
+
+            logger.info(
+                f"Semantic chunking → {len(merged)} chunk(s) "
+                f"(max_tokens={effective_max_tokens}, overlap={effective_overlap}, "
+                f"buffer_size={effective_buffer_size}, sim_threshold={sim_threshold})"
             )
+            return merged
 
-            if fits and similar:
-                cur_parts.append(unit_text)
-                cur_text   += " " + unit_text
-                cur_tokens += unit_tokens
-            elif fits and not similar:
-                flush()
-                cur_parts  = [unit_text]
-                cur_text   = unit_text
-                cur_tokens = unit_tokens
-            else:                        # doesn't fit
-                flush()
-                cur_parts  = [unit_text]
-                cur_text   = unit_text
-                cur_tokens = unit_tokens
-
-        # Flush any remaining pending prefix that was never consumed
-        if pending_prefix:
-            cur_parts.append(pending_prefix)
-            cur_tokens += self.token_counter.count_tokens(pending_prefix)
-        flush()
-
-        # ── Two-pass merge (FIX-5) ──────────────────────────────────────
-        merged = self._merge_small_chunks(raw_chunks, base_metadata)
-
-        logger.info(
-            f"Semantic chunking → {len(merged)} chunk(s) "
-            f"(sim_threshold={sim_threshold})"
-        )
-        return merged
+    def _extract_overlap_tail(self, text: str, overlap_tokens: int) -> str:
+            """
+            Return the trailing `overlap_tokens` worth of text from `text`.
+            Splits on whitespace so we never cut mid-word.
+            """
+            if not text or not overlap_tokens:
+                return ""
+            words = text.split()
+            tail_words: List[str] = []
+            tail_tokens = 0
+            for word in reversed(words):
+                word_tokens = self.token_counter.count_tokens(word)
+                if tail_tokens + word_tokens > overlap_tokens:
+                    break
+                tail_words.insert(0, word)
+                tail_tokens += word_tokens
+            return " ".join(tail_words)
 
     def _merge_small_chunks(
-        self,
-        chunks: List[Dict[str, Any]],
-        base_metadata: Dict,
-    ) -> List[Dict[str, Any]]:
-        """
-        Two-pass chunk merge to eliminate chunks < min_chunk_tokens.
+            self,
+            chunks: List[Dict[str, Any]],
+            base_metadata: Dict,
+            effective_max_tokens: Optional[int] = None,
+        ) -> List[Dict[str, Any]]:
+            """
+            Two-pass chunk merge to eliminate chunks < min_chunk_tokens.
 
-        Pass 1 (forward)  – merge a small chunk with the next one.
-        Pass 2 (backward) – FIX-5: merge a trailing small chunk with the
-                            previous one (catches the case where the last
-                            chunk has no forward neighbour).
-        """
+            Pass 1 (forward)  – merge a small chunk with the next one.
+            Pass 2 (backward) – FIX-5: merge a trailing small chunk with the
+                                previous one (catches the case where the last
+                                chunk has no forward neighbour).
 
-        def _forward_pass(source: List[Dict]) -> List[Dict]:
-            result: List[Dict] = []
-            i = 0
-            while i < len(source):
-                cur = source[i]
-                if (
-                    cur["token_count"] < self.min_chunk_tokens
-                    and i + 1 < len(source)
-                ):
-                    nxt = source[i + 1]
-                    combined_text   = cur["text"] + " " + nxt["text"]
-                    combined_tokens = cur["token_count"] + nxt["token_count"]
-                    if combined_tokens <= self.target_chunk_tokens:
-                        result.append(self._create_chunk(
-                            combined_text,
-                            len(result) + 1,
-                            base_metadata,
-                            chunk_type="semantic_merged",
-                        ))
-                        i += 2
-                        continue
-                result.append(cur)
-                i += 1
-            return result
+            Uses effective_max_tokens as the ceiling for combined chunks
+            (falls back to self.target_chunk_tokens if not provided).
+            """
+            token_ceiling = effective_max_tokens if effective_max_tokens is not None else self.target_chunk_tokens
 
-        after_forward = _forward_pass(chunks)
+            def _forward_pass(source: List[Dict]) -> List[Dict]:
+                result: List[Dict] = []
+                i = 0
+                while i < len(source):
+                    cur = source[i]
+                    if (
+                        cur["token_count"] < self.min_chunk_tokens
+                        and i + 1 < len(source)
+                    ):
+                        nxt = source[i + 1]
+                        combined_text   = cur["text"] + " " + nxt["text"]
+                        combined_tokens = cur["token_count"] + nxt["token_count"]
+                        if combined_tokens <= token_ceiling:
+                            result.append(self._create_chunk(
+                                combined_text,
+                                len(result) + 1,
+                                base_metadata,
+                                chunk_type="semantic_merged",
+                            ))
+                            i += 2
+                            continue
+                    result.append(cur)
+                    i += 1
+                return result
 
-        # FIX-5: backward pass for trailing tiny chunk
-        if (
-            len(after_forward) >= 2
-            and after_forward[-1]["token_count"] < self.min_chunk_tokens
-        ):
-            last = after_forward.pop()
-            prev = after_forward[-1]
-            combined_text   = prev["text"] + " " + last["text"]
-            combined_tokens = prev["token_count"] + last["token_count"]
-            if combined_tokens <= self.target_chunk_tokens:
-                after_forward[-1] = self._create_chunk(
-                    combined_text,
-                    prev["metadata"]["chunk_index"],
-                    base_metadata,
-                    chunk_type="semantic_merged",
-                )
-            else:
-                after_forward.append(last)   # cannot merge – keep as is
+            after_forward = _forward_pass(chunks)
 
-        # Re-index sequentially after merges
-        for new_idx, chunk in enumerate(after_forward, start=1):
-            chunk["metadata"]["chunk_index"] = new_idx
+            # FIX-5: backward pass for trailing tiny chunk
+            if (
+                len(after_forward) >= 2
+                and after_forward[-1]["token_count"] < self.min_chunk_tokens
+            ):
+                last = after_forward.pop()
+                prev = after_forward[-1]
+                combined_text   = prev["text"] + " " + last["text"]
+                combined_tokens = prev["token_count"] + last["token_count"]
+                if combined_tokens <= token_ceiling:
+                    after_forward[-1] = self._create_chunk(
+                        combined_text,
+                        prev["metadata"]["chunk_index"],
+                        base_metadata,
+                        chunk_type="semantic_merged",
+                    )
+                else:
+                    after_forward.append(last)   # cannot merge – keep as is
 
-        return after_forward
+            # Re-index sequentially after merges
+            for new_idx, chunk in enumerate(after_forward, start=1):
+                chunk["metadata"]["chunk_index"] = new_idx
+
+            return after_forward
+
+    def _is_semantically_similar(
+            self,
+            text1: str,
+            text2: str,
+            threshold: Optional[float] = None,
+        ) -> bool:
+            """
+            Lightweight Jaccard-similarity check between two text spans.
+
+            FIX: Guard against `threshold=None` — previously caused:
+                TypeError: '>=' not supported between instances of 'float' and 'NoneType'
+                This happened when breakpoint_threshold was not persisted in
+                file_metadata and _rechunk_for_indexing passed None through.
+            """
+            # Always resolve to a concrete float before any comparison
+            effective_threshold: float = threshold
+
+            w1 = set(text1.lower().split())
+            w2 = set(text2.lower().split())
+            union = len(w1 | w2)
+            return (len(w1 & w2) / union) >= effective_threshold if union else False
 
     # ──────────────────────────────────────────────────────────────────────
     # Helper: sentence-based grouping (semantic fallback)
