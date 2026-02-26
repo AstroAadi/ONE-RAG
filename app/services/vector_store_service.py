@@ -121,7 +121,7 @@ class VectorStoreService:
             self.client = QdrantClient(
                 url=settings.qdrant_url,
                 api_key=settings.qdrant_api_key,
-                timeout=30,
+                timeout=120,
                 prefer_grpc=False
             )
             collection_name = settings.qdrant_collection_name
@@ -297,114 +297,120 @@ class VectorStoreService:
         user_id: str,
         structured_data: Optional[Dict] = None
     ) -> int:
-        """
-        Add document chunks to Qdrant with KB metadata
-        
-        Uses:
-        - AWS Bedrock for dense embeddings
-        - HuggingFace SPLADE for sparse embeddings
-        """
+
         if not chunks:
             logger.warning(f"No chunks provided for {file_id}")
             return 0
-        
+
         try:
-            points = []
-            texts_for_embedding = []
-            
+            dense_dim = self.dense_embeddings.get_embedding_dimension()
+
+            parent_chunks = []
+            child_chunks = []
+
+            # ===============================
+            # 1️⃣ Separate parent & child
+            # ===============================
             for chunk in chunks:
-                text = chunk.get('text', '')
-                chunk_id = chunk.get('chunk_id', '')
-                metadata = chunk.get('metadata', {})
-                
-                if not text or not chunk_id:
-                    logger.warning(f"Skipping invalid chunk: {chunk_id}")
-                    continue
-                
-                # Build payload with KB isolation
-                payload = {
-                    # Multi-tenant fields (REQUIRED)
-                    'user_id': str(user_id),
-                    'knowledge_base_id': str(knowledge_base_id),
-                    'knowledge_base_name': str(knowledge_base_name),
-                    
-                    # File identification
-                    'file_id': str(file_id),
-                    'filename': str(filename),
-                    
-                    # Chunk data
-                    'chunk_id': str(chunk_id),
-                    'text': text,
-                    'chunk_type': str(metadata.get('chunk_type', 'text')),
-                    'chunk_index': int(chunk.get('chunk_index', metadata.get('chunk_index', 0))),
-                    'page_number': int(metadata.get('page_number', 0)),
-                    
-                    # Timestamps
-                    'created_at': datetime.utcnow().isoformat()
-                }
-                
-                # Add any additional metadata
-                for key, value in metadata.items():
-                    if key not in payload and value is not None:
-                        payload[key] = str(value) if not isinstance(value, (int, float, bool)) else value
-                
-                texts_for_embedding.append(text)
-                points.append({'id': chunk_id, 'payload': payload})
-            
-            if not points:
-                logger.warning(f"No valid chunks for {file_id}")
-                return 0
-            
-            # Truncate texts
-            max_len = settings.embedding_max_length
-            truncated_texts = [text[:max_len] if len(text) > max_len else text for text in texts_for_embedding]
-            
-            # Generate embeddings
-            logger.info(f"Generating embeddings for {len(truncated_texts)} chunks...")
-            
-            # Dense: AWS Bedrock
-            dense_embeddings = self.dense_embeddings.embed_documents(truncated_texts)
-            
-            # Sparse: HuggingFace SPLADE (REQUIRED)
-            if not self.sparse_embeddings:
-                raise VectorStoreException(
-                    "SPLADE (sparse embeddings) is not available. "
-                    "Cannot proceed with hybrid search. "
-                    "Please fix SPLADE initialization or disable sparse requirement."
-                )
-            
-            sparse_embeddings = self.sparse_embeddings.embed_documents(truncated_texts)
-            
-            # Create points with BOTH dense and sparse
+                if chunk.get("metadata", {}).get("chunk_type") == "parent":
+                    parent_chunks.append(chunk)
+                else:
+                    child_chunks.append(chunk)
+
+            logger.info(
+                f"[VectorStore] {len(parent_chunks)} parents | "
+                f"{len(child_chunks)} children"
+            )
+
             qdrant_points = []
-            for i, point in enumerate(points):
-                point_uuid = string_to_uuid(point['id'])
-                
+
+            # ===============================
+            # 2️⃣ Embed ONLY children
+            # ===============================
+            if child_chunks:
+
+                child_texts = [
+                    c["text"][:settings.embedding_max_length]
+                    for c in child_chunks
+                ]
+
+                dense_embeddings = self.dense_embeddings.embed_documents(child_texts)
+
+                if not self.sparse_embeddings:
+                    raise VectorStoreException("Sparse embeddings unavailable")
+
+                sparse_embeddings = self.sparse_embeddings.embed_documents(child_texts)
+
+                for i, chunk in enumerate(child_chunks):
+
+                    payload = {
+                        "user_id": str(user_id),
+                        "knowledge_base_id": str(knowledge_base_id),
+                        "knowledge_base_name": str(knowledge_base_name),
+                        "file_id": str(file_id),
+                        "filename": str(filename),
+                        "chunk_id": str(chunk["chunk_id"]),
+                        "text": chunk["text"],
+                        **chunk["metadata"],
+                        "created_at": datetime.utcnow().isoformat()
+                    }
+
+                    qdrant_points.append(
+                        PointStruct(
+                            id=string_to_uuid(chunk["chunk_id"]),
+                            vector={
+                                "dense": dense_embeddings[i],
+                                "sparse": sparse_embeddings[i]
+                            },
+                            payload=payload
+                        )
+                    )
+
+            # ===============================
+            # 3️⃣ Store parents with ZERO vector
+            # ===============================
+            for chunk in parent_chunks:
+
+                payload = {
+                    "user_id": str(user_id),
+                    "knowledge_base_id": str(knowledge_base_id),
+                    "knowledge_base_name": str(knowledge_base_name),
+                    "file_id": str(file_id),
+                    "filename": str(filename),
+                    "chunk_id": str(chunk["chunk_id"]),
+                    "text": chunk["text"],
+                    **chunk["metadata"],
+                    "created_at": datetime.utcnow().isoformat()
+                }
+
                 qdrant_points.append(
                     PointStruct(
-                        id=point_uuid,
-                        vector={"dense": dense_embeddings[i], "sparse": sparse_embeddings[i]},
-                        payload=point['payload']
+                        id=string_to_uuid(chunk["chunk_id"]),
+                        vector={
+                            "dense": [0.0] * dense_dim,
+                            "sparse": SparseVector(indices=[0], values=[0.0])
+                        },
+                        payload=payload
                     )
                 )
-            
-            # Upload in batches
-            batch_size = 100
-            for i in range(0, len(qdrant_points), batch_size):
-                batch = qdrant_points[i:i + batch_size]
+
+            # ===============================
+            # 4️⃣ Upsert everything
+            # ===============================
+            if qdrant_points:
                 self.client.upsert(
                     collection_name=self.collection_name,
-                    points=batch
+                    points=qdrant_points
                 )
-            
-            logger.info(f"✓ Added {len(qdrant_points)} chunks to KB '{knowledge_base_name}' ({knowledge_base_id})")
-            
+
+            logger.info(f"✓ Stored {len(qdrant_points)} total chunks")
+
             return len(qdrant_points)
-            
+
         except Exception as e:
             logger.error(f"Error adding chunks: {str(e)}", exc_info=True)
             raise VectorStoreException(f"Failed to add chunks: {str(e)}")
-    
+        
     # ==================== SEARCH METHODS WITH KB ISOLATION ====================
     
     def _build_filter(
@@ -585,6 +591,51 @@ class VectorStoreService:
         
         return fused
     
+    # def search(
+    #     self,
+    #     query: str,
+    #     user_id: str,
+    #     knowledge_base_id: str,
+    #     top_k: int = 5,
+    #     file_id: Optional[str] = None,
+    #     search_type: Literal["dense", "sparse", "hybrid"] = "hybrid"
+    # ) -> Tuple[List[str], List[Dict], List[float]]:
+    #     """
+    #     Main search method with MANDATORY KB isolation
+        
+    #     Dense: AWS Bedrock
+    #     Sparse: HuggingFace SPLADE
+    #     """
+    #     try:
+    #         if search_type == "dense":
+    #             results = self._dense_search(query, top_k, user_id, knowledge_base_id, file_id)
+    #         elif search_type == "sparse":
+    #             results = self._sparse_search(query, top_k, user_id, knowledge_base_id, file_id)
+    #         else:
+    #             results = self._hybrid_search(query, top_k, user_id, knowledge_base_id, file_id)
+            
+    #         documents, metadatas, scores = results
+            
+    #         # Ensure metadata completeness
+    #         for meta in metadatas:
+    #             if 'chunk_id' not in meta:
+    #                 meta['chunk_id'] = 'unknown'
+    #             if 'file_id' not in meta:
+    #                 meta['file_id'] = 'unknown'
+    #             if 'knowledge_base_id' not in meta:
+    #                 meta['knowledge_base_id'] = knowledge_base_id
+            
+    #         logger.info(
+    #             f"Search: KB={knowledge_base_id}, query='{query[:50]}...', "
+    #             f"type={search_type}, results={len(documents)}"
+    #         )
+            
+    #         return documents, metadatas, scores
+            
+    #     except Exception as e:
+    #         logger.error(f"Search error: {e}", exc_info=True)
+    #         raise SearchError(f"Search failed: {str(e)}")
+
     def search(
         self,
         query: str,
@@ -594,44 +645,117 @@ class VectorStoreService:
         file_id: Optional[str] = None,
         search_type: Literal["dense", "sparse", "hybrid"] = "hybrid"
     ) -> Tuple[List[str], List[Dict], List[float]]:
-        """
-        Main search method with MANDATORY KB isolation
-        
-        Dense: AWS Bedrock
-        Sparse: HuggingFace SPLADE
-        """
+
         try:
+            # ===========================================
+            # 1️⃣ Perform Search (dense / sparse / hybrid)
+            # ===========================================
             if search_type == "dense":
                 results = self._dense_search(query, top_k, user_id, knowledge_base_id, file_id)
             elif search_type == "sparse":
                 results = self._sparse_search(query, top_k, user_id, knowledge_base_id, file_id)
             else:
                 results = self._hybrid_search(query, top_k, user_id, knowledge_base_id, file_id)
-            
+
             documents, metadatas, scores = results
-            
-            # Ensure metadata completeness
-            for meta in metadatas:
-                if 'chunk_id' not in meta:
-                    meta['chunk_id'] = 'unknown'
-                if 'file_id' not in meta:
-                    meta['file_id'] = 'unknown'
-                if 'knowledge_base_id' not in meta:
-                    meta['knowledge_base_id'] = knowledge_base_id
-            
-            logger.info(
-                f"Search: KB={knowledge_base_id}, query='{query[:50]}...', "
-                f"type={search_type}, results={len(documents)}"
+
+            if not documents:
+                return [], [], []
+
+            # ===========================================
+            # 2️⃣ Detect if hierarchical retrieval
+            # ===========================================
+            is_hierarchical = any(
+                meta.get("parent_chunk_id") for meta in metadatas
             )
-            
-            return documents, metadatas, scores
-            
+
+            # ===========================================
+            # 3️⃣ NON-HIERARCHICAL → return as-is
+            # ===========================================
+            if not is_hierarchical:
+
+                logger.info(
+                    f"[Flat Retrieval] Returned {len(documents)} chunks"
+                )
+
+                return documents, metadatas, scores
+
+            # ===========================================
+            # 4️⃣ HIERARCHICAL: Group children by parent
+            # ===========================================
+
+            parent_map = {}
+
+            for doc, meta, score in zip(documents, metadatas, scores):
+
+                parent_id = meta.get("parent_chunk_id") or meta.get("chunk_id")
+
+                if parent_id not in parent_map:
+                    parent_map[parent_id] = {
+                        "aggregated_score": 0.0,
+                        "children": []
+                    }
+
+                parent_map[parent_id]["aggregated_score"] += float(score)
+
+                parent_map[parent_id]["children"].append({
+                    "chunk_id": meta.get("chunk_id"),
+                    "text": doc,
+                    "score": round(float(score), 4),
+                    "chunk_index": meta.get("chunk_index"),
+                    "page_number": meta.get("page_number")
+                })
+
+            # ===========================================
+            # 5️⃣ Rank parents by aggregated score
+            # ===========================================
+            ranked_parents = sorted(
+                parent_map.items(),
+                key=lambda x: x[1]["aggregated_score"],
+                reverse=True
+            )[:top_k]
+
+            final_documents = []
+            final_metadatas = []
+            final_scores = []
+
+            # ===========================================
+            # 6️⃣ Fetch parent chunks from Qdrant
+            # ===========================================
+            for parent_id, data in ranked_parents:
+
+                parent_chunk = self.get_chunk_by_id(
+                    chunk_id=parent_id,
+                    user_id=user_id,
+                    knowledge_base_id=knowledge_base_id
+                )
+
+                if not parent_chunk:
+                    logger.warning(f"Parent chunk not found: {parent_id}")
+                    continue
+
+                # Attach metadata for transparency
+                parent_chunk["aggregated_score"] = round(data["aggregated_score"], 4)
+                parent_chunk["retrieval_type"] = "parent_expanded"
+                parent_chunk["matched_children"] = data["children"]
+
+                final_documents.append(parent_chunk["text"])
+                final_metadatas.append(parent_chunk)
+                final_scores.append(round(data["aggregated_score"], 4))
+
+            logger.info(
+                f"[Hierarchical Retrieval] "
+                f"{len(metadatas)} children → {len(final_documents)} parents"
+            )
+
+            return final_documents, final_metadatas, final_scores
+
         except Exception as e:
             logger.error(f"Search error: {e}", exc_info=True)
             raise SearchError(f"Search failed: {str(e)}")
-    
+            
     # ==================== OTHER METHODS (unchanged from original) ====================
-    
+
     def get_chunk_by_id(
         self,
         chunk_id: str,

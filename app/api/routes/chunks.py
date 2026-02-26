@@ -718,12 +718,34 @@ async def finalize_chunks(
         if not markdown_content:
             raise HTTPException(status_code=400, detail="Markdown content is empty")
 
-        chunks = _rechunk_for_indexing(file_metadata, kb, user_id, markdown_content)
+        all_chunks = _rechunk_for_indexing(file_metadata, kb, user_id, markdown_content)
 
+        # ✅ Separate parent and child chunks
+        parent_chunks = []
+        child_chunks = []
+
+        for chunk in all_chunks:
+            if chunk["metadata"].get("chunk_type") == "parent":
+                parent_chunks.append(chunk)
+            elif chunk["metadata"].get("chunk_type") == "child":
+                child_chunks.append(chunk)
+            else:
+                # For non-hierarchical strategies, treat as normal child
+                child_chunks.append(chunk)
+
+        logger.info(
+            f"Chunk split for indexing → "
+            f"{len(parent_chunks)} parents, {len(child_chunks)} children"
+        )
+
+        if not child_chunks:
+            raise HTTPException(status_code=500, detail="No child chunks found for indexing.")
         import time
         start_time = time.time()
         chunks_indexed = vector_store.add_document_chunks(
-            chunks, file_id, file_metadata.safe_filename,
+            parent_chunks + child_chunks,
+            file_id,
+            file_metadata.safe_filename,
             knowledge_base_id=kb.knowledge_base_id,
             knowledge_base_name=kb.knowledge_base_name,
             user_id=user_id,
@@ -850,11 +872,29 @@ def index_chunks_background(
             with open(file_metadata.markdown_path, 'r', encoding='utf-8') as f:
                 markdown_content = f.read()
 
-            chunks = _rechunk_for_indexing(file_metadata, kb, user_id, markdown_content)
+            all_chunks = _rechunk_for_indexing(file_metadata, kb, user_id, markdown_content)
+            parent_chunks =[]
+            child_chunks =[]
+
+            for chunk in all_chunks:
+                if chunk.get('chunk_type') == 'parent':
+                    parent_chunks.append(chunk)
+                elif chunk.get('chunk_type') == 'child':
+                    child_chunks.append(chunk)
+                else:
+                    child_chunks.append(chunk)
+            logger.info(
+                f"[Task {task_id}]Split -> "
+                f"{len(parent_chunks)} parents, {len(child_chunks)} children"
+            )
+            if not child_chunks:
+                raise ValueError("No child chunks found for indexing.")
 
             vector_store = VectorStoreService(embedding_model_id=embedding_model)
             total_indexed = vector_store.add_document_chunks(
-                chunks, file_id, file_metadata.safe_filename,
+                parent_chunks + child_chunks,
+                file_id, 
+                file_metadata.safe_filename,
                 knowledge_base_id=knowledge_base_id,
                 knowledge_base_name=kb.knowledge_base_name,
                 user_id=user_id,
