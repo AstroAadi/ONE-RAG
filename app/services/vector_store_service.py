@@ -308,11 +308,12 @@ class VectorStoreService:
             parent_chunks = []
             child_chunks = []
 
-            # ===============================
+            # ===================================
             # 1️⃣ Separate parent & child
-            # ===============================
+            # ===================================
             for chunk in chunks:
-                if chunk.get("metadata", {}).get("chunk_type") == "parent":
+                metadata = chunk.get("metadata", {})
+                if metadata.get("chunk_type") == "parent":
                     parent_chunks.append(chunk)
                 else:
                     child_chunks.append(chunk)
@@ -324,9 +325,9 @@ class VectorStoreService:
 
             qdrant_points = []
 
-            # ===============================
+            # ===================================
             # 2️⃣ Embed ONLY children
-            # ===============================
+            # ===================================
             if child_chunks:
 
                 child_texts = [
@@ -343,6 +344,8 @@ class VectorStoreService:
 
                 for i, chunk in enumerate(child_chunks):
 
+                    metadata = chunk.get("metadata", {})
+
                     payload = {
                         "user_id": str(user_id),
                         "knowledge_base_id": str(knowledge_base_id),
@@ -351,7 +354,10 @@ class VectorStoreService:
                         "filename": str(filename),
                         "chunk_id": str(chunk["chunk_id"]),
                         "text": chunk["text"],
-                        **chunk["metadata"],
+                        "chunk_type": "child",
+                        "parent_chunk_id": metadata.get("parent_chunk_id"),
+                        "chunk_index": metadata.get("chunk_index"),
+                        "page_number": metadata.get("page_number"),
                         "created_at": datetime.utcnow().isoformat()
                     }
 
@@ -366,10 +372,18 @@ class VectorStoreService:
                         )
                     )
 
-            # ===============================
-            # 3️⃣ Store parents with ZERO vector
-            # ===============================
+            # ===================================
+            # 3️⃣ Store parents SAFELY
+            # ===================================
+            # We store parent for expansion, but prevent retrieval dominance.
+            # Use tiny epsilon vector instead of zero.
+
+            epsilon_dense = [1e-9] * dense_dim
+            epsilon_sparse = SparseVector(indices=[0], values=[1e-9])
+
             for chunk in parent_chunks:
+
+                metadata = chunk.get("metadata", {})
 
                 payload = {
                     "user_id": str(user_id),
@@ -379,7 +393,9 @@ class VectorStoreService:
                     "filename": str(filename),
                     "chunk_id": str(chunk["chunk_id"]),
                     "text": chunk["text"],
-                    **chunk["metadata"],
+                    "chunk_type": "parent",
+                    "chunk_index": metadata.get("chunk_index"),
+                    "page_number": metadata.get("page_number"),
                     "created_at": datetime.utcnow().isoformat()
                 }
 
@@ -387,30 +403,34 @@ class VectorStoreService:
                     PointStruct(
                         id=string_to_uuid(chunk["chunk_id"]),
                         vector={
-                            "dense": [0.0] * dense_dim,
-                            "sparse": SparseVector(indices=[0], values=[0.0])
+                            "dense": epsilon_dense,
+                            "sparse": epsilon_sparse
                         },
                         payload=payload
                     )
                 )
 
-            # ===============================
-            # 4️⃣ Upsert everything
-            # ===============================
-            if qdrant_points:
+            # ===================================
+            # 4️⃣ Batch Upsert
+            # ===================================
+            batch_size = 100
+            total_inserted = 0
+
+            for i in range(0, len(qdrant_points), batch_size):
+                batch = qdrant_points[i:i + batch_size]
                 self.client.upsert(
                     collection_name=self.collection_name,
-                    points=qdrant_points
+                    points=batch
                 )
+                total_inserted += len(batch)
 
-            logger.info(f"✓ Stored {len(qdrant_points)} total chunks")
+            logger.info(f"✓ Stored {total_inserted} total chunks")
 
-            return len(qdrant_points)
+            return total_inserted
 
         except Exception as e:
             logger.error(f"Error adding chunks: {str(e)}", exc_info=True)
             raise VectorStoreException(f"Failed to add chunks: {str(e)}")
-        
     # ==================== SEARCH METHODS WITH KB ISOLATION ====================
     
     def _build_filter(
