@@ -79,6 +79,7 @@ Unified chunk creation endpoint. Accepts all chunking strategies.
     {
         "file_id": "example_file_id",
         "chunking_strategy": "no_chunking"
+        }
     """
     import time
 
