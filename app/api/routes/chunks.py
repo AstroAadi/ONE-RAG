@@ -46,6 +46,42 @@ async def preview_chunks(
     Preview the first few chunks that would be created for a given file and chunking strategy.
     For hierarchical strategy → returns nested structure (parents containing children).
     For other strategies → returns flat list like before.
+
+    Example request bodies:
+    1. Default:
+    {
+        "file_id": "example_file_id",
+        "chunking_strategy": "default"
+    }
+    2. Fixed Size:
+    {
+        "file_id": "example_file_id",
+        "chunking_strategy": "fixed_size",
+        "chunk_size": 1000,
+        "chunk_overlap": 100
+    }
+    3. Semantic:
+    {
+        "file_id": "example_file_id",
+        "chunking_strategy": "semantic",
+        "chunk_size": 1000,
+        "chunk_overlap": 100,
+        "max_buffer_size": 256,
+        "breakpoint_threshold": 0.8
+    }
+    4. Hierarchical:
+    {
+        "file_id": "example_file_id",
+        "chunking_strategy": "hierarchical",
+        "parent_chunk_size": 2048,
+        "child_chunk_size": 512,
+        "child_chunk_overlap": 64
+    }
+    5. No Chunking:
+    {
+        "file_id": "example_file_id",
+        "chunking_strategy": "no_chunking"
+    }
     """
     import time
 
