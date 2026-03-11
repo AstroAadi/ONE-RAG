@@ -256,7 +256,7 @@ async def query_knowledge_base(
             request.knowledge_base_id,
             request.question, 
             request.top_k,
-            request.file_id
+            # request.file_id
         )
         
         if cached_result:
@@ -270,7 +270,7 @@ async def query_knowledge_base(
                 user_id=user_id,
                 knowledge_base_id=request.knowledge_base_id,  # MANDATORY
                 top_k=request.top_k,
-                file_id=request.file_id,
+                # file_id=request.file_id,
                 search_type=search_type.value
             )
         except Exception as e:
@@ -330,7 +330,7 @@ async def query_knowledge_base(
             request.question,
             request.top_k,
             response_data,
-            request.file_id
+            # request.file_id
         )
         
         # Log to database
@@ -414,7 +414,7 @@ async def query_with_conversation(
                 user_id=user_id,
                 knowledge_base_id=request.knowledge_base_id,
                 top_k=request.top_k,
-                file_id=request.file_id,
+                # file_id=request.file_id,
                 search_type=search_type.value
             )
         except Exception as e:

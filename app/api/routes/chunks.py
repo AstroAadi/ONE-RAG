@@ -1,16 +1,5 @@
 """
-Chunks API - SIMPLIFIED VERSION
-Only uses 4 states: uploaded, processing, completed, failed
-No granular status tracking
-
-BUG FIXES (vs original):
-  A. ChunkingStrategy is now imported ONLY from chunking_service (the service's
-     enum includes NO_CHUNKING); schemas.py version is used only for request
-     model type hints to avoid shadowing.
-  B. finalize_chunks (and background worker) re-chunk with the correct
-     strategy-specific params stored in file_metadata, including hierarchical
-     parent/child sizes, so the re-chunk produces the same chunks that were
-     originally saved to the DB.
+Chunks API
 """
 
 from fastapi import APIRouter, HTTPException, Depends, Body
@@ -43,47 +32,9 @@ async def preview_chunks(
     db: Session = Depends(get_database_session)
 ):
     """
-    Preview the first 5 chunks that *would* be created for a given file and
-    chunking strategy — without persisting anything to the database.
-
-    Accepts the same request body as /create. Returns up to 5 sample chunks
-    so the user can evaluate the chunking configuration before committing.
-
-        Example request bodies:
-    1. Default:
-    {
-        "file_id": "example_file_id",
-        "chunking_strategy": "default"
-    }
-    2. Fixed Size:
-    {
-        "file_id": "example_file_id",
-        "chunking_strategy": "fixed_size",
-        "chunk_size": 1000,
-        "chunk_overlap": 100
-    }
-    3. Semantic:
-    {
-        "file_id": "example_file_id",
-        "chunking_strategy": "semantic",
-        "chunk_size": 1000,
-        "chunk_overlap": 100,
-        "max_buffer_size": 256,
-        "breakpoint_threshold": 0.8
-    }
-    4. Hierarchical:
-    {
-        "file_id": "example_file_id",
-        "chunking_strategy": "hierarchical",
-        "parent_chunk_size": 2048,
-        "child_chunk_size": 512,
-        "child_chunk_overlap": 64
-    }
-    5. No Chunking:
-    {
-        "file_id": "example_file_id",
-        "chunking_strategy": "no_chunking"
-    }
+    Preview the first few chunks that would be created for a given file and chunking strategy.
+    For hierarchical strategy → returns nested structure (parents containing children).
+    For other strategies → returns flat list like before.
     """
     import time
 
@@ -130,7 +81,7 @@ async def preview_chunks(
         'knowledge_base_name': kb.knowledge_base_name,
     }
 
-    # ── Build constructor / call kwargs (mirrors _create_chunks_internal) ────
+    # ── Build constructor / call kwargs ──────────────────────────────────────
     constructor_kwargs: dict = {}
     call_kwargs: dict = {}
     params: dict = {}
@@ -205,38 +156,109 @@ async def preview_chunks(
         logger.error(f"❌ Preview chunking failed: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Preview chunking failed: {str(e)}")
 
-    # ── Return first 5 chunks only ───────────────────────────────────────────
-    PREVIEW_LIMIT = 5
-    preview_chunks_data = all_chunks[:PREVIEW_LIMIT]
+    # ── Prepare preview data ─────────────────────────────────────────────────
+    preview_data = []
 
-    sample = [
-        {
-            "chunk_index": chunk["metadata"]["chunk_index"],
-            "chunk_id": chunk["chunk_id"],
-            "chunk_type": chunk["metadata"].get("chunk_type", "text"),
-            "char_count": chunk["char_count"],
-            "page_number": chunk["metadata"].get("page_number", 0),
-            "content": chunk["text"],
-        }
-        for chunk in preview_chunks_data
-    ]
+    if strategy == "hierarchical":
+        parent_map = {}  # chunk_id → preview parent dict
+        MAX_PARENTS = 4
+        MAX_TOTAL_FLAT = 25   # parents + children safety
+
+        # Step 1: Collect parents (first N parents)
+        parent_count = 0
+        for chunk in all_chunks:
+            if chunk["metadata"].get("chunk_type") != "parent":
+                continue
+            if parent_count >= MAX_PARENTS:
+                break
+
+            item = {
+                "chunk_index": chunk["metadata"]["chunk_index"],
+                "chunk_id": chunk["chunk_id"],
+                "chunk_type": "parent",
+                "char_count": chunk["char_count"],
+                "page_number": chunk["metadata"].get("page_number", 0),
+                "content_preview": chunk["text"][:1200] + (" …" if len(chunk["text"]) > 1200 else ""),
+                "full_char_count": len(chunk["text"]),
+                "children": []
+            }
+            parent_map[chunk["chunk_id"]] = item
+            preview_data.append(item)
+            parent_count += 1
+
+        # Step 2: Attach children to the correct parent using parent_chunk_id
+        for chunk in all_chunks:
+            if len(preview_data) + sum(len(p["children"]) for p in preview_data) >= MAX_TOTAL_FLAT:
+                break
+
+            if chunk["metadata"].get("chunk_type") != "child":
+                continue
+
+            parent_id = chunk["metadata"].get("parent_chunk_id")
+            if parent_id in parent_map:
+                child_item = {
+                    "chunk_index": chunk["metadata"]["chunk_index"],
+                    "chunk_id": chunk["chunk_id"],
+                    "chunk_type": "child",
+                    "char_count": chunk["char_count"],
+                    "page_number": chunk["metadata"].get("page_number", 0),
+                    "content_preview": chunk["text"][:900] + (" …" if len(chunk["text"]) > 900 else ""),
+                    "full_char_count": len(chunk["text"]),
+                }
+                parent_map[parent_id]["children"].append(child_item)
+
+        # Optional: show orphans if any (should be rare)
+        shown_parent_ids = set(parent_map.keys())
+        for chunk in all_chunks:
+            if (chunk["metadata"].get("chunk_type") == "child" and
+                chunk["metadata"].get("parent_chunk_id") not in shown_parent_ids):
+                preview_data.append({
+                    "warning": "orphan child - parent not included in preview",
+                    "chunk_id": chunk["chunk_id"],
+                    "parent_chunk_id": chunk["metadata"].get("parent_chunk_id"),
+                    "chunk_index": chunk["metadata"]["chunk_index"],
+                    "char_count": chunk["char_count"],
+                    "content_preview": chunk["text"][:500] + " …"
+                })
+
+    else:
+        # Flat structure for non-hierarchical strategies
+        PREVIEW_LIMIT = 5
+        preview_chunks_data = all_chunks[:PREVIEW_LIMIT]
+        preview_data = [
+            {
+                "chunk_index": chunk["metadata"]["chunk_index"],
+                "chunk_id": chunk["chunk_id"],
+                "chunk_type": chunk["metadata"].get("chunk_type", "text"),
+                "char_count": chunk["char_count"],
+                "page_number": chunk["metadata"].get("page_number", 0),
+                "content": chunk["text"],
+            }
+            for chunk in preview_chunks_data
+        ]
+
+    # ── Logging ──────────────────────────────────────────────────────────────
+    flat_count = sum(1 + len(p.get("children", [])) for p in preview_data) if strategy == "hierarchical" else len(preview_data)
 
     logger.info(
         f"👁️ Preview for file {request.file_id} ({strategy}): "
-        f"showing {len(sample)} of {len(all_chunks)} total chunks"
+        f"showing {flat_count} items of {len(all_chunks)} total chunks"
     )
 
+    # ── Response ─────────────────────────────────────────────────────────────
     return {
         "file_id": request.file_id,
         "knowledge_base_id": kb.knowledge_base_id,
         "chunking_strategy": strategy,
         "parameters": params,
-        "preview_chunks": sample,
-        "preview_count": len(sample),
+        "preview_chunks": preview_data,
+        "preview_structure": "nested (parents → children)" if strategy == "hierarchical" else "flat",
+        "preview_count_flat": flat_count,
         "estimated_total_chunks": len(all_chunks),
         "preview_time_seconds": round(preview_time, 2),
         "note": "This is a preview only. No data has been saved. Call /create to persist chunks.",
     }
+ 
 
 # ==================== SINGLE UNIFIED ENDPOINT ====================
 
@@ -250,40 +272,40 @@ async def create_chunks(
     Unified chunk creation endpoint. Accepts all chunking strategies.
 
     Example request bodies:
-    1. Default:
-    {
-        "file_id": "example_file_id",
-        "chunking_strategy": "default"
-    }
-    2. Fixed Size:
-    {
-        "file_id": "example_file_id",
-        "chunking_strategy": "fixed_size",
-        "chunk_size": 1000,
-        "chunk_overlap": 100
-    }
-    3. Semantic:
-    {
-        "file_id": "example_file_id",
-        "chunking_strategy": "semantic",
-        "chunk_size": 1000,
-        "chunk_overlap": 100,
-        "max_buffer_size": 256,
-        "breakpoint_threshold": 0.8
-    }
-    4. Hierarchical:
-    {
-        "file_id": "example_file_id",
-        "chunking_strategy": "hierarchical",
-        "parent_chunk_size": 2048,
-        "child_chunk_size": 512,
-        "child_chunk_overlap": 64
-    }
-    5. No Chunking:
-    {
-        "file_id": "example_file_id",
-        "chunking_strategy": "no_chunking"
-    }
+1. Default:
+{
+    "file_id": "example_file_id",
+    "chunking_strategy": "default"
+}
+2. Fixed Size:
+{
+    "file_id": "example_file_id",
+    "chunking_strategy": "fixed_size",
+    "chunk_size": 1000,
+    "chunk_overlap": 100
+}
+3. Semantic:
+{
+    "file_id": "example_file_id",
+    "chunking_strategy": "semantic",
+    "chunk_size": 1000,
+    "chunk_overlap": 100,
+    "max_buffer_size": 256,
+    "breakpoint_threshold": 0.8
+}
+4. Hierarchical:
+{
+    "file_id": "example_file_id",
+    "chunking_strategy": "hierarchical",
+    "parent_chunk_size": 500,
+    "child_chunk_size": 200,
+    "child_chunk_overlap": 30
+}
+5. No Chunking:
+{
+    "file_id": "example_file_id",
+    "chunking_strategy": "no_chunking"
+}
 """
     strategy = getattr(request, "chunking_strategy", "default")
     if strategy == "default":
@@ -410,6 +432,9 @@ async def _create_chunks_internal(
                 detail=f"File already has {existing_chunks} chunks. Delete them first."
             )
 
+        # BUG-1 CHECK: document_count is already incremented during upload.
+        # _create_chunks_internal must NOT touch document_count here.
+
         # ── Read markdown ────────────────────────────────────────────────
         if not file_metadata.markdown_path:
             raise HTTPException(status_code=400, detail="No markdown content available. Re-run extraction.")
@@ -459,6 +484,9 @@ async def _create_chunks_internal(
                 'target_chunk_tokens': chunk_size,
                 'chunk_overlap_tokens': chunk_overlap,
             }
+            # FIX: pass semantic-specific params in call_kwargs so they are
+            # used during chunking AND stored below for faithful re-chunking
+            # in finalize.
             call_kwargs = {
                 'max_buffer_size': max_buffer_size,
                 'breakpoint_threshold': breakpoint_threshold,
@@ -490,15 +518,14 @@ async def _create_chunks_internal(
 
         # ── Create chunks ────────────────────────────────────────────────
         import time
-        start_time = time.time()
+        start_time = time.time()  # FIX-5: always start the timer before any branching
 
         if chunking_strategy == "no_chunking":
-            from app.services.chunking_service import EnhancedChunkingService as _CS
-            _svc = _CS()
-            chunks = _svc._chunk_no_chunking(markdown_content, base_metadata)
-            # override chunk_id so it's deterministic and file-scoped
-            chunks[0]['chunk_id'] = f"{file_id}_chunk_0"
-            chunking_time = 0.0
+            svc = EnhancedChunkingService()
+            chunks = svc._chunk_no_chunking(markdown_content, base_metadata)
+            # FIX-4: do NOT override chunk_id here. The SHA-256 hash produced by
+            # _create_chunk is the canonical ID and must match what _rechunk_for_indexing
+            # produces during finalize. Overriding it here caused a permanent mismatch.
         else:
             chunking_service = EnhancedChunkingService(**constructor_kwargs)
             strategy_enum = ChunkingStrategy(chunking_strategy)
@@ -508,7 +535,8 @@ async def _create_chunks_internal(
                 strategy=strategy_enum,
                 **call_kwargs,
             )
-            chunking_time = time.time() - start_time
+
+        chunking_time = time.time() - start_time  # FIX-5: measure time for all strategies
 
         logger.info(f"✅ Created {len(chunks)} chunks in {chunking_time:.2f}s")
 
@@ -521,6 +549,7 @@ async def _create_chunks_internal(
                 chunk_index=chunk['metadata']['chunk_index'],
                 chunk_type=chunk['metadata'].get('chunk_type', 'text'),
                 char_count=chunk['char_count'],
+                token_count=chunk.get('token_count'),  # store token count (new field)
                 page_number=chunk['metadata'].get('page_number', 0),
                 created_at=datetime.utcnow(),
             )
@@ -544,25 +573,49 @@ async def _create_chunks_internal(
         file_metadata.chunks_created = len(chunks)
         file_metadata.chunking_strategy = strategy_map.get(normalized_strategy)
 
-        # Store params needed for faithful re-chunking in finalize
+        # Store params needed for faithful re-chunking in finalize.
+        # Every param that influences chunk boundaries must be persisted.
         if chunking_strategy == "default":
             file_metadata.target_chunk_tokens = 300
             file_metadata.chunk_overlap_tokens = 30
+            file_metadata.parent_chunk_size = None
         elif chunking_strategy == "fixed_size":
             file_metadata.target_chunk_tokens = chunk_size
             file_metadata.chunk_overlap_tokens = chunk_overlap
+            file_metadata.parent_chunk_size = None
         elif chunking_strategy == "semantic":
             file_metadata.target_chunk_tokens = chunk_size
             file_metadata.chunk_overlap_tokens = chunk_overlap
+            # FIX (semantic params): max_buffer_size and breakpoint_threshold
+            # are not dedicated columns. We reuse target/overlap for size/overlap
+            # and store semantic extras in processing_metadata (JSON) below.
+            file_metadata.parent_chunk_size = None
         elif chunking_strategy == "hierarchical":
-            # FIX B: store child size as target so the service constructor
-            # initialises with correct child_chunk_size on re-chunk.
+            # FIX-2 & FIX-3: persist child size as target AND parent_chunk_size
+            # separately so _rechunk_for_indexing can reproduce the exact same
+            # windows that were used here.
             file_metadata.target_chunk_tokens = child_chunk_size
             file_metadata.chunk_overlap_tokens = child_chunk_overlap
+            file_metadata.parent_chunk_size = parent_chunk_size  # NEW column
         elif chunking_strategy == "no_chunking":
             file_metadata.target_chunk_tokens = 0
             file_metadata.chunk_overlap_tokens = 0
+            file_metadata.parent_chunk_size = None
 
+        # Persist semantic extra params and any other call_kwargs into
+        # processing_metadata (already a JSON text column on the model).
+        import json
+        existing_meta: dict = {}
+        if file_metadata.processing_metadata:
+            try:
+                existing_meta = json.loads(file_metadata.processing_metadata)
+            except Exception:
+                existing_meta = {}
+        existing_meta['chunking_call_kwargs'] = call_kwargs
+        file_metadata.processing_metadata = json.dumps(existing_meta)
+
+        # BUG-1: document_count is already incremented at upload time (upload.py).
+        # Do NOT increment it again here.
         kb.total_chunks += len(chunks)
         kb.updated_at = datetime.utcnow()
         db.commit()
@@ -736,9 +789,20 @@ def _rechunk_for_indexing(
     Re-produce the exact same chunks that were originally created,
     using the strategy + params stored on file_metadata.
 
-    FIX B: hierarchical re-chunk now passes parent_chunk_size from
-    file_metadata.extra_params (or falls back to service defaults).
+    FIX-2 & FIX-3: hierarchical re-chunk now passes the persisted
+    parent_chunk_size so the parent windows are identical to those
+    produced during /create, giving identical child boundaries and
+    therefore identical chunk_ids.
+
+    FIX (semantic): max_buffer_size and breakpoint_threshold are
+    restored from processing_metadata['chunking_call_kwargs'] so
+    semantic chunks are reproduced faithfully too.
+
+    FIX-4: no_chunking uses the same EnhancedChunkingService._chunk_no_chunking
+    path with no chunk_id override, matching /create exactly.
     """
+    import json
+
     strategy_str = file_metadata.chunking_strategy.value  # e.g. "hierarchical"
     strategy_enum = ChunkingStrategy(strategy_str)
 
@@ -753,6 +817,7 @@ def _rechunk_for_indexing(
     target  = file_metadata.target_chunk_tokens  or 300
     overlap = file_metadata.chunk_overlap_tokens or 20
 
+    # FIX-4: no_chunking path — no overrides, matches /create exactly
     if strategy_str == "no_chunking":
         svc = EnhancedChunkingService()
         return svc._chunk_no_chunking(markdown_content, base_metadata)
@@ -762,18 +827,35 @@ def _rechunk_for_indexing(
         chunk_overlap_tokens=overlap,
     )
 
+    # Restore any extra call-time kwargs that were saved during /create
+    saved_call_kwargs: dict = {}
+    if file_metadata.processing_metadata:
+        try:
+            meta = json.loads(file_metadata.processing_metadata)
+            saved_call_kwargs = meta.get('chunking_call_kwargs', {})
+        except Exception:
+            saved_call_kwargs = {}
+
     call_kwargs: dict = {}
 
     if strategy_str == "hierarchical":
-        # target_chunk_tokens was stored as child_chunk_size;
-        # overlap was stored as child_chunk_overlap.
-        # We don't have parent_chunk_size persisted separately, so let
-        # _chunk_hierarchical compute it from its 4× default.
+        # FIX-2 & FIX-3: use the persisted parent_chunk_size (new column)
+        # so parent windows are identical to those in /create.
+        # Fall back to 4x child size only if the column is somehow missing
+        # (e.g. rows created before the migration).
+        stored_parent = file_metadata.parent_chunk_size
         call_kwargs = {
+            'parent_chunk_size': stored_parent,   # None → service default (4× child)
             'child_chunk_size': target,
             'child_chunk_overlap': overlap,
-            # parent_chunk_size left as None → service uses 4× child default
         }
+
+    elif strategy_str == "semantic":
+        # FIX (semantic): restore max_buffer_size and breakpoint_threshold
+        # that were saved into processing_metadata during /create.
+        call_kwargs = saved_call_kwargs
+
+    # default and fixed_size need no extra call_kwargs beyond constructor args.
 
     return chunking_service.split_document_into_chunks(
         markdown_content,
