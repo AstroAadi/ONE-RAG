@@ -259,7 +259,14 @@ class VectorStoreService:
                 field_schema="keyword"
             )
             
-            logger.info("✓ Created payload indexes (user_id, knowledge_base_id, file_id, chunk_id)")
+            # Index chunk_type (for hierarchical chunk resolution)
+            self.client.create_payload_index(
+                collection_name=self.collection_name,
+                field_name="chunk_type",
+                field_schema="keyword"
+            )
+            
+            logger.info("✓ Created payload indexes (user_id, knowledge_base_id, file_id, chunk_id, chunk_type)")
             
         except Exception as e:
             logger.warning(f"Could not create payload indexes: {e}")
@@ -543,6 +550,111 @@ class VectorStoreService:
         
         return documents, metadatas, scores
     
+    def _resolve_hierarchical_chunks(
+        self,
+        documents: List[str],
+        metadatas: List[Dict],
+        scores: List[float],
+        top_k: int
+    ) -> Tuple[List[str], List[Dict], List[float]]:
+        """
+        Post-process raw search results to handle a KB whose files were indexed
+        with different chunking strategies.
+
+        Rules:
+          - chunk_type in (text, semantic, semantic_merged, full_document)
+                → pass through unchanged (fixed-size / semantic / no-chunking files)
+          - chunk_type == 'child'
+                → collect parent_chunk_id; inherit the highest child score seen
+          - chunk_type == 'parent'
+                → discard from raw results (will be fetched by ID via child promotion)
+
+        After collecting all unique parent IDs, fetch their payloads in one
+        batch retrieve() call, then merge + deduplicate + re-rank everything
+        by score before returning the final top_k results.
+        """
+        regular: List[Tuple[str, Dict, float]] = []
+        parent_id_to_best_score: Dict[str, float] = {}
+
+        for doc, meta, score in zip(documents, metadatas, scores):
+            chunk_type = meta.get('chunk_type', 'text')
+
+            if chunk_type == 'child':
+                parent_id = meta.get('parent_chunk_id')
+                if parent_id:
+                    # Track the highest relevance score pointing at this parent
+                    if parent_id not in parent_id_to_best_score or score > parent_id_to_best_score[parent_id]:
+                        parent_id_to_best_score[parent_id] = score
+                else:
+                    # Orphan child (no parent_chunk_id stored) — surface as-is
+                    regular.append((doc, meta, score))
+
+            elif chunk_type == 'parent':
+                # Skip raw parent hits; they will be fetched cleanly via child promotion.
+                # If somehow a parent surfaced with no children in this result set,
+                # still include it so we don't silently lose relevant content.
+                parent_id = meta.get('chunk_id')
+                if parent_id and parent_id not in parent_id_to_best_score:
+                    parent_id_to_best_score[parent_id] = score
+
+            else:
+                # text / semantic / semantic_merged / full_document
+                regular.append((doc, meta, score))
+
+        # ── Batch-fetch all needed parent chunks from Qdrant ─────────────
+        promoted: List[Tuple[str, Dict, float]] = []
+        if parent_id_to_best_score:
+            parent_uuids = [string_to_uuid(pid) for pid in parent_id_to_best_score]
+            try:
+                parent_points = self.client.retrieve(
+                    collection_name=self.collection_name,
+                    ids=parent_uuids,
+                    with_payload=True,
+                    with_vectors=False
+                )
+                for point in parent_points:
+                    payload = point.payload
+                    parent_chunk_id = payload.get('chunk_id', '')
+                    best_score = parent_id_to_best_score.get(parent_chunk_id, 0.0)
+                    promoted.append((
+                        payload.get('text', ''),
+                        {k: v for k, v in payload.items() if k != 'text'},
+                        best_score
+                    ))
+                logger.debug(
+                    f"Hierarchical resolution: promoted {len(promoted)} parent(s) "
+                    f"from {len(parent_id_to_best_score)} child reference(s)"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Parent batch-fetch failed — falling back to raw child text. Error: {e}"
+                )
+                # Graceful degradation: re-add the child results we had dropped
+                for doc, meta, score in zip(documents, metadatas, scores):
+                    if meta.get('chunk_type') == 'child':
+                        regular.append((doc, meta, score))
+
+        # ── Merge, deduplicate by chunk_id, sort by score, take top_k ────
+        all_results = regular + promoted
+        seen_ids: set = set()
+        deduped: List[Tuple[str, Dict, float]] = []
+
+        for doc, meta, score in sorted(all_results, key=lambda x: x[2], reverse=True):
+            cid = meta.get('chunk_id', '')
+            if cid not in seen_ids:
+                seen_ids.add(cid)
+                deduped.append((doc, meta, score))
+
+        deduped = deduped[:top_k]
+
+        if not deduped:
+            return [], [], []
+
+        docs_out   = [r[0] for r in deduped]
+        metas_out  = [r[1] for r in deduped]
+        scores_out = [r[2] for r in deduped]
+        return docs_out, metas_out, scores_out
+
     def _reciprocal_rank_fusion(
         self,
         dense_results: List[Tuple],
@@ -601,14 +713,24 @@ class VectorStoreService:
         Sparse: HuggingFace SPLADE
         """
         try:
+            # Fetch extra candidates so that after child→parent promotion and
+            # deduplication we still end up with at least top_k final results.
+            fetch_k = top_k * 3
+
             if search_type == "dense":
-                results = self._dense_search(query, top_k, user_id, knowledge_base_id, file_id)
+                results = self._dense_search(query, fetch_k, user_id, knowledge_base_id, file_id)
             elif search_type == "sparse":
-                results = self._sparse_search(query, top_k, user_id, knowledge_base_id, file_id)
+                results = self._sparse_search(query, fetch_k, user_id, knowledge_base_id, file_id)
             else:
-                results = self._hybrid_search(query, top_k, user_id, knowledge_base_id, file_id)
+                results = self._hybrid_search(query, fetch_k, user_id, knowledge_base_id, file_id)
             
             documents, metadatas, scores = results
+
+            # Resolve mixed chunk types (hierarchical child→parent promotion,
+            # pass-through for fixed-size / semantic / no-chunking chunks).
+            documents, metadatas, scores = self._resolve_hierarchical_chunks(
+                documents, metadatas, scores, top_k
+            )
             
             # Ensure metadata completeness
             for meta in metadatas:
