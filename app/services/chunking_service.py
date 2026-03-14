@@ -626,7 +626,7 @@ class EnhancedChunkingService:
         Two-pass chunk merge to eliminate chunks < min_chunk_tokens.
         """
 
-            def _forward_pass(source: List[Dict]) -> List[Dict]:
+        def _forward_pass(source: List[Dict]) -> List[Dict]:
                 result: List[Dict] = []
                 i = 0
                 while i < len(source):
