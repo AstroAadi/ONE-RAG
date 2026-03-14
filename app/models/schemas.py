@@ -1,7 +1,3 @@
-"""
-Pydantic Schemas for RAG System - MULTI-TENANT VERSION
-Added Knowledge Base models for multi-tenant isolation
-"""
 
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 from typing import List, Optional, Dict, Any, Union, Literal,Annotated
@@ -186,11 +182,11 @@ class QueryRequest(BaseModel):
         description="Number of chunks to retrieve"
     )
     
-    file_id: Optional[str] = Field(
-        default=None,
-        max_length=100,
-        description="Optional: Restrict to specific file"
-    )
+    # file_id: Optional[str] = Field(
+    #     default=None,
+    #     max_length=100,
+    #     description="Optional: Restrict to specific file"
+    # )
     
     temperature: Optional[float] = Field(
         default=None,

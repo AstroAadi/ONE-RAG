@@ -1,5 +1,4 @@
 """
-GPU-Enabled Configuration - Pydantic v2 Compatible
 Fixed version with proper model separation:
 - AWS Bedrock: Dense embeddings + LLM
 - HuggingFace: SPLADE sparse vectors ONLY

@@ -8,50 +8,6 @@ Strategies:
 3. Semantic     – similarity-guided grouping with structure awareness
 4. Hierarchical – overlapping parent windows → fixed-size child windows
 5. No-chunking  – whole document as one chunk
-
-Bug-fixes applied in this version
-──────────────────────────────────
-FIX-1  (Fixed-size)    Last chunk tail can be < min_chunk_tokens.
-                        → When the final window is shorter than min_chunk_tokens
-                          it is merged into the previous window instead of being
-                          emitted as a tiny stub.
-
-FIX-2  (Hierarchical)  _recursive_split_children silently dropped fragments
-                        smaller than min_chunk_tokens, causing data loss.
-                        → Replaced the recursive text-split approach with a
-                          straightforward token-window approach (_split_into_children)
-                          that applies the same tail-merge guard as FIX-1.
-                          No text is ever silently discarded.
-
-FIX-3  (Hierarchical)  depth-exceeded fallback called _chunk_fixed_size() which
-                        produced chunks with no parent_chunk_id.
-                        → The new _split_into_children always sets parent_chunk_id
-                          on every child chunk it produces.
-
-FIX-4  (Hierarchical)  Parent chunk_id was a bare "P001" label.  Parent chunks
-                        were never saved to the DB, making every
-                        child.metadata["parent_chunk_id"] reference an orphaned ID.
-                        → Parent chunk_id now uses the same SHA-256 hash as leaf
-                          chunks (stable & reproducible).
-                        → Parent chunks ARE now included in the return list
-                          (chunk_type="parent") so callers can persist them.
-                        → Each parent carries metadata["child_chunk_ids"].
-                        → Each child carries metadata["parent_chunk_id"].
-
-FIX-5  (Semantic)      Merge pass was forward-only: a trailing tiny chunk with
-                        no forward neighbour stayed small.
-                        → Added a backward pass after the forward pass so the
-                          last chunk is merged into the previous one when it fits.
-
-FIX-6  (Semantic)      Small structural units (headings, short code blocks,
-                        short lists < min_chunk_tokens) were silently discarded.
-                        → They are now carried as a "pending_prefix" and
-                          prepended to the next content unit, so no text is lost.
-
-FIX-7  (All)           chunk_id could collide when two chunks shared the same
-                        first 100 chars at the same local chunk_index.
-                        → Hash now also incorporates full text length and
-                          chunk_type, making collisions practically impossible.
 """
 
 from __future__ import annotations
@@ -198,14 +154,6 @@ class EnhancedChunkingService:
         child_chunk_size: Optional[int] = None,
         child_chunk_overlap: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        # Defensive normalization: always use lowercase and valid enum
-        if isinstance(strategy, str):
-            strategy_str = strategy.lower()
-            try:
-                strategy = ChunkingStrategy(strategy_str)
-            except ValueError:
-                logger.warning(f"Invalid chunking strategy '{strategy}'. Falling back to 'default'.")
-                strategy = ChunkingStrategy.DEFAULT
         """
         Split *markdown_text* into chunks using *strategy*.
 
@@ -218,6 +166,16 @@ class EnhancedChunkingService:
         Each parent carries:
             metadata["child_chunk_ids"]  → list of its children's chunk_ids
         """
+        # FIX-6: guard must be INSIDE the function body, after the docstring,
+        # so it actually executes. Previously it was placed before the docstring
+        # which made it syntactically odd and logically misplaced.
+        if isinstance(strategy, str):
+            strategy_str = strategy.lower()
+            try:
+                strategy = ChunkingStrategy(strategy_str)
+            except ValueError:
+                logger.warning(f"Invalid chunking strategy '{strategy}'. Falling back to 'default'.")
+                strategy = ChunkingStrategy.DEFAULT
         if not markdown_text or not markdown_text.strip():
             logger.warning("Empty document provided")
             return []
@@ -303,12 +261,7 @@ class EnhancedChunkingService:
     def _chunk_fixed_size(
         self, text: str, base_metadata: Dict
     ) -> List[Dict[str, Any]]:
-        """
-        Token-based sliding-window chunking with overlap.
-
-        FIX-1: Tail chunk smaller than min_chunk_tokens is merged into
-               the previous chunk so no stub is ever emitted.
-        """
+    
         tokens = self.token_counter.get_tokens(text)
         if not tokens:
             return self._chunk_fixed_size_chars(text, base_metadata)
@@ -361,10 +314,6 @@ class EnhancedChunkingService:
 
         Returns a flat list: parent chunks first, then child chunks in order.
 
-        FIX-2: No text is silently dropped.
-        FIX-3: Every child chunk carries parent_chunk_id.
-        FIX-4: Parent chunk_id is a SHA-256 hash (stable, reproducible).
-               Parents are included in the output so callers can persist them.
         """
         if not text.strip():
             return []
@@ -452,9 +401,6 @@ class EnhancedChunkingService:
     ) -> List[Dict[str, Any]]:
         """
         Produce fixed-size overlapping child chunks from one parent's text.
-
-        FIX-2: tail-merge guard prevents tiny stub children.
-        FIX-3: parent_chunk_id is set on every chunk produced.
         """
         tokens = self.token_counter.get_tokens(text)
         if not tokens:
@@ -500,41 +446,17 @@ class EnhancedChunkingService:
     # STRATEGY: Semantic
     # ──────────────────────────────────────────────────────────────────────
     def _chunk_semantic(
-            self,
-            text: str,
-            base_metadata: Dict,
-            max_buffer_size: Optional[int] = None,
-            max_tokens: Optional[int] = None,
-            overlap_tokens: Optional[int] = None,
-            breakpoint_threshold: Optional[float] = None,
-        ) -> List[Dict[str, Any]]:
-            """
-            Semantic chunking with full structure awareness.
-
-            Parameters
-            ----------
-            text                : source text to chunk
-            base_metadata       : metadata dict passed to every created chunk
-            max_buffer_size     : max number of structural units buffered in a
-                                single chunk before forcing a flush, regardless
-                                of token count.  None → unlimited.
-            max_tokens          : token budget per chunk.
-                                Overrides self.target_chunk_tokens when provided.
-            overlap_tokens      : number of tokens from the tail of the previous
-                                chunk to prepend to the next chunk (sliding
-                                window overlap).
-                                Overrides self.chunk_overlap_tokens when provided.
-            breakpoint_threshold: cosine-distance threshold for semantic similarity.
-                                Lower = more aggressive splitting.
-
-            FIX-5: Two-pass (forward + backward) merge so trailing tiny chunks
-                are absorbed into the previous chunk.
-            FIX-6: Small structural units (heading / list / code_block that are
-                < min_chunk_tokens) are carried forward as a pending prefix
-                instead of being silently discarded.
-            """
-            if not text.strip():
-                return []
+        self,
+        text: str,
+        base_metadata: Dict,
+        max_buffer_size: Optional[int] = None,
+        breakpoint_threshold: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Semantic chunking with full structure awareness.
+        """
+        if not text.strip():
+            return []
 
             # ── Resolve effective parameters ────────────────────────────────────
             effective_max_tokens   = max_tokens    if max_tokens    is not None else self.target_chunk_tokens
@@ -696,23 +618,13 @@ class EnhancedChunkingService:
             return " ".join(tail_words)
 
     def _merge_small_chunks(
-            self,
-            chunks: List[Dict[str, Any]],
-            base_metadata: Dict,
-            effective_max_tokens: Optional[int] = None,
-        ) -> List[Dict[str, Any]]:
-            """
-            Two-pass chunk merge to eliminate chunks < min_chunk_tokens.
-
-            Pass 1 (forward)  – merge a small chunk with the next one.
-            Pass 2 (backward) – FIX-5: merge a trailing small chunk with the
-                                previous one (catches the case where the last
-                                chunk has no forward neighbour).
-
-            Uses effective_max_tokens as the ceiling for combined chunks
-            (falls back to self.target_chunk_tokens if not provided).
-            """
-            token_ceiling = effective_max_tokens if effective_max_tokens is not None else self.target_chunk_tokens
+        self,
+        chunks: List[Dict[str, Any]],
+        base_metadata: Dict,
+    ) -> List[Dict[str, Any]]:
+        """
+        Two-pass chunk merge to eliminate chunks < min_chunk_tokens.
+        """
 
             def _forward_pass(source: List[Dict]) -> List[Dict]:
                 result: List[Dict] = []
@@ -974,10 +886,7 @@ class EnhancedChunkingService:
     def _generate_chunk_id(
         self, text: str, chunk_index: int, chunk_type: str = "text"
     ) -> str:
-        """
-        FIX-7: Hash incorporates full text length + chunk_type to prevent
-        collisions between chunks sharing the same first 100 characters.
-        """
+    
         hash_input = f"{text[:100].strip()}|{len(text)}|{chunk_index}|{chunk_type}"
         return hashlib.sha256(hash_input.encode()).hexdigest()[:16]
 
@@ -986,7 +895,6 @@ class EnhancedChunkingService:
     ) -> List[Dict[str, Any]]:
         """
         Character-based fallback when tiktoken is unavailable.
-        Applies the same FIX-1 tail-merge guard as the token version.
         """
         target_chars  = self.target_chunk_tokens  * 4
         overlap_chars = self.chunk_overlap_tokens * 4
