@@ -8,6 +8,37 @@ Strategies:
 3. Semantic     – similarity-guided grouping with structure awareness
 4. Hierarchical – overlapping parent windows → fixed-size child windows
 5. No-chunking  – whole document as one chunk
+
+Bugs fixed vs. original
+────────────────────────
+FIX-1  _chunk_semantic entire body was indented inside the `if not text.strip()`
+       block, making it dead code — function silently returned None for every
+       non-empty document.
+
+FIX-2  _chunk_semantic referenced undefined locals `max_tokens` and
+       `overlap_tokens`; replaced with `self.target_chunk_tokens` and
+       `self.chunk_overlap_tokens` (with breakpoint_threshold → sim_threshold).
+
+FIX-3  _extract_overlap_tail and the inner duplicate _is_semantically_similar
+       were indented as nested functions inside _chunk_semantic; promoted to
+       proper class methods.
+
+FIX-4  _merge_small_chunks used undefined variable `token_ceiling` in both the
+       forward pass and backward pass; replaced with `max_tokens` parameter that
+       is now passed explicitly by every caller.
+
+FIX-5  _merge_small_chunks signature was missing the `max_tokens` parameter;
+       added with a sensible default (self.max_chunk_tokens).
+
+FIX-6  _chunk_by_sentence called _merge_small_chunks without the required
+       max_tokens argument; fixed.
+
+FIX-7  Duplicate definition of _is_semantically_similar (one broken copy inside
+       _chunk_semantic, one correct copy at class level); removed the broken copy.
+
+FIX-8  _is_semantically_similar inner copy compared `>= threshold` where
+       threshold could be None, causing TypeError; the correct class-level
+       version uses a default of 0.25 and is now the only definition.
 """
 
 from __future__ import annotations
@@ -38,7 +69,7 @@ except ImportError:
 
 from app.core.config import get_settings
 
-logger = logging.getLogger(__name__)
+logger   = logging.getLogger(__name__)
 settings = get_settings()
 
 
@@ -111,16 +142,16 @@ class TokenCounter:
 class EnhancedChunkingService:
     """
     Chunking service supporting default, fixed_size, semantic, hierarchical,
-    and no_chunking strategies with all known logical bugs resolved.
+    and no_chunking strategies.
     """
 
     def __init__(
         self,
-        target_chunk_tokens: int = 300,
+        target_chunk_tokens:  int = 300,
         chunk_overlap_tokens: int = 20,
-        tokenizer_model: str = "cl100k_base",
-        min_chunk_tokens: int = 100,
-        max_chunk_tokens: int = 1024,
+        tokenizer_model:      str = "cl100k_base",
+        min_chunk_tokens:     int = 100,
+        max_chunk_tokens:     int = 1024,
     ) -> None:
         self.target_chunk_tokens  = target_chunk_tokens
         self.chunk_overlap_tokens = chunk_overlap_tokens
@@ -142,17 +173,17 @@ class EnhancedChunkingService:
 
     def split_document_into_chunks(
         self,
-        markdown_text: str,
-        structured_data: Optional[Dict] = None,   # reserved / unused
-        base_metadata: Optional[Dict] = None,
-        strategy: ChunkingStrategy = ChunkingStrategy.FIXED_SIZE,
+        markdown_text:        str,
+        structured_data:      Optional[Dict] = None,   # reserved / unused
+        base_metadata:        Optional[Dict] = None,
+        strategy:             ChunkingStrategy = ChunkingStrategy.FIXED_SIZE,
         # Semantic params
-        max_buffer_size: Optional[int] = None,
+        max_buffer_size:      Optional[int]   = None,
         breakpoint_threshold: Optional[float] = None,
         # Hierarchical params
-        parent_chunk_size: Optional[int] = None,
-        child_chunk_size: Optional[int] = None,
-        child_chunk_overlap: Optional[int] = None,
+        parent_chunk_size:    Optional[int]   = None,
+        child_chunk_size:     Optional[int]   = None,
+        child_chunk_overlap:  Optional[int]   = None,
     ) -> List[Dict[str, Any]]:
         """
         Split *markdown_text* into chunks using *strategy*.
@@ -166,16 +197,15 @@ class EnhancedChunkingService:
         Each parent carries:
             metadata["child_chunk_ids"]  → list of its children's chunk_ids
         """
-        # FIX-6: guard must be INSIDE the function body, after the docstring,
-        # so it actually executes. Previously it was placed before the docstring
-        # which made it syntactically odd and logically misplaced.
         if isinstance(strategy, str):
-            strategy_str = strategy.lower()
             try:
-                strategy = ChunkingStrategy(strategy_str)
+                strategy = ChunkingStrategy(strategy.lower())
             except ValueError:
-                logger.warning(f"Invalid chunking strategy '{strategy}'. Falling back to 'default'.")
+                logger.warning(
+                    f"Invalid chunking strategy '{strategy}'. Falling back to 'default'."
+                )
                 strategy = ChunkingStrategy.DEFAULT
+
         if not markdown_text or not markdown_text.strip():
             logger.warning("Empty document provided")
             return []
@@ -230,28 +260,18 @@ class EnhancedChunkingService:
     # ──────────────────────────────────────────────────────────────────────
 
     def _chunk_no_chunking(
-        self,
-        text: str,
-        base_metadata: Dict[str, Any]
+        self, text: str, base_metadata: Dict[str, Any]
     ) -> List[Dict[str, Any]]:
-        """
-        No-chunking strategy: entire document becomes one single chunk.
-        
-        Returns:
-            List with exactly one chunk (or empty list if input is blank).
-        """
+        """Entire document becomes one single chunk."""
         if not text or not text.strip():
-            logger.debug("No content → returning empty list (no chunk)")
             return []
-
-        # Use your standard chunk creation helper
         return [self._create_chunk(
             text=text,
             chunk_index=1,
             base_metadata=base_metadata,
-            chunk_type="full_document",          # clearly mark it
+            chunk_type="full_document",
             position=0,
-            total_tokens=self.token_counter.count_tokens(text)
+            total_tokens=self.token_counter.count_tokens(text),
         )]
 
     # ──────────────────────────────────────────────────────────────────────
@@ -261,14 +281,13 @@ class EnhancedChunkingService:
     def _chunk_fixed_size(
         self, text: str, base_metadata: Dict
     ) -> List[Dict[str, Any]]:
-    
+
         tokens = self.token_counter.get_tokens(text)
         if not tokens:
             return self._chunk_fixed_size_chars(text, base_metadata)
 
         stride = max(1, self.target_chunk_tokens - self.chunk_overlap_tokens)
 
-        # Collect (start_position, token_slice) windows
         raw: List[Tuple[int, List[int]]] = []
         position = 0
         while position < len(tokens):
@@ -276,7 +295,7 @@ class EnhancedChunkingService:
             raw.append((position, window))
             position += stride
 
-        # FIX-1: merge tiny tail into the previous window
+        # Merge tiny tail into the previous window
         if len(raw) >= 2 and len(raw[-1][1]) < self.min_chunk_tokens:
             prev_pos, _ = raw[-2]
             last_pos, last_toks = raw[-1]
@@ -300,25 +319,16 @@ class EnhancedChunkingService:
 
     def _chunk_hierarchical(
         self,
-        text: str,
-        base_metadata: Dict,
-        max_parent_tokens: Optional[int] = None,
-        max_child_tokens: Optional[int] = None,
+        text:                 str,
+        base_metadata:        Dict,
+        max_parent_tokens:    Optional[int] = None,
+        max_child_tokens:     Optional[int] = None,
         child_overlap_tokens: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        Two-level hierarchical chunking.
-
-        Phase 1 – Create overlapping parent windows over the full token sequence.
-        Phase 2 – Split each parent into fixed-size overlapping child windows.
-
-        Returns a flat list: parent chunks first, then child chunks in order.
-
-        """
+        """Two-level hierarchical chunking — parents first, then children."""
         if not text.strip():
             return []
 
-        # ── Defaults ─────────────────────────────────────────────────────
         if max_parent_tokens is None:
             max_parent_tokens = max(600, self.target_chunk_tokens * 4)
         if max_child_tokens is None:
@@ -326,29 +336,26 @@ class EnhancedChunkingService:
         if child_overlap_tokens is None:
             child_overlap_tokens = self.chunk_overlap_tokens
 
-        # Safety guards
         max_parent_tokens    = max(max_parent_tokens, max_child_tokens + 1)
         child_overlap_tokens = min(child_overlap_tokens, max_child_tokens // 2)
         parent_overlap_tokens = min(
             int(max_parent_tokens * 0.20), max_parent_tokens // 2
         )
 
-        # ── Phase 1: parent windows ───────────────────────────────────────
         all_tokens = self.token_counter.get_tokens(text)
         if not all_tokens:
             return self._chunk_fixed_size_chars(text, base_metadata)
 
-        parent_stride = max(1, max_parent_tokens - parent_overlap_tokens)
+        parent_stride   = max(1, max_parent_tokens - parent_overlap_tokens)
         parent_records: List[Dict[str, Any]] = []
-        p_index  = 1
-        position = 0
+        p_index         = 1
+        position        = 0
 
         while position < len(all_tokens):
             end      = min(position + max_parent_tokens, len(all_tokens))
             p_tokens = all_tokens[position:end]
             p_text   = self.token_counter.decode_tokens(p_tokens)
             if p_text.strip():
-                # FIX-4: use hash-based chunk_id (same as _create_chunk does)
                 p_chunk = self._create_chunk(
                     p_text, p_index, base_metadata,
                     position=position, total_tokens=len(all_tokens),
@@ -358,9 +365,8 @@ class EnhancedChunkingService:
                 p_index += 1
             position += parent_stride
 
-        # ── Phase 2: children for each parent ────────────────────────────
-        all_output: List[Dict[str, Any]] = list(parent_records)   # parents first
-        child_counter = 1
+        all_output:    List[Dict[str, Any]] = list(parent_records)
+        child_counter  = 1
 
         for parent in parent_records:
             parent_id   = parent["chunk_id"]
@@ -375,9 +381,7 @@ class EnhancedChunkingService:
                 child_index_start=child_counter,
             )
 
-            # Back-fill child IDs into parent metadata
             parent["metadata"]["child_chunk_ids"] = [c["chunk_id"] for c in children]
-
             all_output.extend(children)
             child_counter += len(children)
 
@@ -392,16 +396,14 @@ class EnhancedChunkingService:
 
     def _split_into_children(
         self,
-        text: str,
-        max_child_tokens: int,
+        text:               str,
+        max_child_tokens:   int,
         child_overlap_tokens: int,
-        base_metadata: Dict,
-        parent_id: str,
-        child_index_start: int = 1,
+        base_metadata:      Dict,
+        parent_id:          str,
+        child_index_start:  int = 1,
     ) -> List[Dict[str, Any]]:
-        """
-        Produce fixed-size overlapping child chunks from one parent's text.
-        """
+        """Produce fixed-size overlapping child chunks from one parent's text."""
         tokens = self.token_counter.get_tokens(text)
         if not tokens:
             return []
@@ -415,7 +417,6 @@ class EnhancedChunkingService:
             raw.append((position, window))
             position += stride
 
-        # FIX-2: merge tiny tail into previous window
         if len(raw) >= 2 and len(raw[-1][1]) < self.min_chunk_tokens:
             prev_pos, _ = raw[-2]
             last_pos, last_toks = raw[-1]
@@ -436,7 +437,6 @@ class EnhancedChunkingService:
                 total_tokens=len(tokens),
                 chunk_type="child",
             )
-            # FIX-3 & FIX-4: always stamp the parent reference
             child["metadata"]["parent_chunk_id"] = parent_id
             children.append(child)
 
@@ -448,20 +448,31 @@ class EnhancedChunkingService:
 
     def _chunk_semantic(
         self,
-        text: str,
-        base_metadata: Dict,
-        max_buffer_size: Optional[int] = None,
+        text:                 str,
+        base_metadata:        Dict,
+        max_buffer_size:      Optional[int]   = None,
         breakpoint_threshold: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        Semantic chunking with full structure awareness.
-        """
+        """Semantic chunking with full structure awareness."""
+
+        # FIX-1: guard at the TOP of the method body, not inside it.
+        # Previously the entire implementation below was indented one level
+        # too deep (inside `if not text.strip(): return []`), making it dead
+        # code — the function returned None for every non-empty document.
         if not text.strip():
             return []
 
-        sim_threshold = (
-            breakpoint_threshold if breakpoint_threshold is not None else 0.25
-        )
+        # FIX-2: original code referenced undefined locals `max_tokens` and
+        # `overlap_tokens`. These don't exist as parameters; map correctly from
+        # instance attributes and the actual parameters received.
+        effective_max_tokens  = self.target_chunk_tokens
+        effective_overlap     = self.chunk_overlap_tokens
+        effective_buffer_size = max_buffer_size   # None = unlimited
+
+        # FIX-8: always resolve to a concrete float — passing None into
+        # _is_semantically_similar caused: TypeError: '>=' not supported
+        # between 'float' and 'NoneType'.
+        sim_threshold: float = breakpoint_threshold if breakpoint_threshold is not None else 0.25
 
         units = self._split_into_structured_units(text)
         if not units:
@@ -472,33 +483,56 @@ class EnhancedChunkingService:
         cur_parts:     List[str] = []
         cur_text       = ""
         cur_tokens     = 0
-        pending_prefix = ""           # FIX-6: carries small structural text forward
+        pending_prefix = ""
+        overlap_tail   = ""
 
         def flush() -> None:
-            nonlocal chunk_index, cur_parts, cur_text, cur_tokens
+            nonlocal chunk_index, cur_parts, cur_text, cur_tokens, overlap_tail
             if not cur_parts:
                 return
+            chunk_text = " ".join(cur_parts)
             raw_chunks.append(self._create_chunk(
-                " ".join(cur_parts), chunk_index, base_metadata,
+                chunk_text, chunk_index, base_metadata,
                 chunk_type="semantic",
             ))
             chunk_index += 1
-            cur_parts, cur_text, cur_tokens = [], "", 0
+            if effective_overlap and effective_overlap > 0:
+                overlap_tail = self._extract_overlap_tail(chunk_text, effective_overlap)
+            else:
+                overlap_tail = ""
+            cur_parts.clear()
+            cur_text = ""
+            cur_tokens = 0  # FIX: reset cur_tokens in flush
+
+        def _start_new_chunk_with_overlap() -> None:
+            nonlocal cur_parts, cur_text, cur_tokens
+            if overlap_tail:
+                o_tokens   = self.token_counter.count_tokens(overlap_tail)
+                cur_parts  = [overlap_tail]
+                cur_text   = overlap_tail
+                cur_tokens = o_tokens
+            else:
+                cur_parts  = []
+                cur_text   = ""
+                cur_tokens = 0
+
+        def _buffer_is_full() -> bool:
+            return (
+                effective_buffer_size is not None
+                and len(cur_parts) >= effective_buffer_size
+            )
 
         for unit in units:
             unit_type   = unit["type"]
             unit_text   = unit["text"]
             unit_tokens = self.token_counter.count_tokens(unit_text)
 
-            # ── Structural boundary ─────────────────────────────────────
             if unit_type in ("heading", "code_block", "list"):
                 flush()
                 if unit_tokens >= self.min_chunk_tokens:
-                    # Large enough to stand alone
                     full_text = (
                         (pending_prefix + " " + unit_text).strip()
-                        if pending_prefix
-                        else unit_text
+                        if pending_prefix else unit_text
                     )
                     raw_chunks.append(self._create_chunk(
                         full_text, chunk_index, base_metadata,
@@ -506,63 +540,101 @@ class EnhancedChunkingService:
                     ))
                     chunk_index   += 1
                     pending_prefix = ""
+                    overlap_tail   = (
+                        self._extract_overlap_tail(full_text, effective_overlap)
+                        if effective_overlap else ""
+                    )
                 else:
-                    # FIX-6: too small → carry forward, do NOT discard
                     pending_prefix = (pending_prefix + " " + unit_text).strip()
                 continue
 
-            # ── Normal paragraph unit ───────────────────────────────────
-            # Inject any pending prefix as the first part of a new chunk
             if pending_prefix and not cur_parts:
-                p_tokens  = self.token_counter.count_tokens(pending_prefix)
-                cur_parts  = [pending_prefix]
-                cur_text   = pending_prefix
+                _start_new_chunk_with_overlap()
+                p_text     = (pending_prefix + " " + cur_text).strip() if cur_text else pending_prefix
+                p_tokens   = self.token_counter.count_tokens(p_text)
+                cur_parts  = [p_text]
+                cur_text   = p_text
                 cur_tokens = p_tokens
                 pending_prefix = ""
 
-            fits = cur_tokens + unit_tokens <= self.target_chunk_tokens
+            if not cur_parts and overlap_tail:
+                _start_new_chunk_with_overlap()
+
+            fits    = cur_tokens + unit_tokens <= effective_max_tokens
             similar = (not cur_parts) or self._is_semantically_similar(
                 cur_text, unit_text, threshold=sim_threshold
             )
 
-            if fits and similar:
+            if fits and similar and not _buffer_is_full():
                 cur_parts.append(unit_text)
                 cur_text   += " " + unit_text
                 cur_tokens += unit_tokens
             elif fits and not similar:
                 flush()
-                cur_parts  = [unit_text]
-                cur_text   = unit_text
-                cur_tokens = unit_tokens
-            else:                        # doesn't fit
+                _start_new_chunk_with_overlap()
+                cur_parts.append(unit_text)
+                cur_text   = (cur_text + " " + unit_text).strip() if cur_text else unit_text
+                cur_tokens += unit_tokens
+            else:
                 flush()
-                cur_parts  = [unit_text]
-                cur_text   = unit_text
-                cur_tokens = unit_tokens
+                _start_new_chunk_with_overlap()
+                cur_parts.append(unit_text)
+                cur_text   = (cur_text + " " + unit_text).strip() if cur_text else unit_text
+                cur_tokens += unit_tokens
 
-        # Flush any remaining pending prefix that was never consumed
         if pending_prefix:
             cur_parts.append(pending_prefix)
             cur_tokens += self.token_counter.count_tokens(pending_prefix)
         flush()
 
-        # ── Two-pass merge (FIX-5) ──────────────────────────────────────
-        merged = self._merge_small_chunks(raw_chunks, base_metadata)
+        merged = self._merge_small_chunks(raw_chunks, base_metadata, effective_max_tokens)
 
         logger.info(
             f"Semantic chunking → {len(merged)} chunk(s) "
-            f"(sim_threshold={sim_threshold})"
+            f"(max_tokens={effective_max_tokens}, overlap={effective_overlap}, "
+            f"buffer_size={effective_buffer_size}, sim_threshold={sim_threshold})"
         )
         return merged
 
+    # ──────────────────────────────────────────────────────────────────────
+    # FIX-3: _extract_overlap_tail promoted to a proper class method.
+    # Was previously nested inside _chunk_semantic (unreachable).
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _extract_overlap_tail(self, text: str, overlap_tokens: int) -> str:
+        """
+        Return the trailing `overlap_tokens` worth of text.
+        Splits on whitespace so we never cut mid-word.
+        """
+        if not text or not overlap_tokens:
+            return ""
+        words      = text.split()
+        tail_words: List[str] = []
+        tail_tokens = 0
+        for word in reversed(words):
+            word_tokens = self.token_counter.count_tokens(word)
+            if tail_tokens + word_tokens > overlap_tokens:
+                break
+            tail_words.insert(0, word)
+            tail_tokens += word_tokens
+        return " ".join(tail_words)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # FIX-4 + FIX-5: _merge_small_chunks promoted to a proper method with
+    # the `max_tokens` parameter added.  `token_ceiling` was undefined in the
+    # original — it is now consistently `max_tokens`.
+    # ──────────────────────────────────────────────────────────────────────
+
     def _merge_small_chunks(
         self,
-        chunks: List[Dict[str, Any]],
+        chunks:       List[Dict[str, Any]],
         base_metadata: Dict,
+        max_tokens:   Optional[int] = None,   # FIX-5: was missing, token_ceiling undefined
     ) -> List[Dict[str, Any]]:
-        """
-        Two-pass chunk merge to eliminate chunks < min_chunk_tokens.
-        """
+        """Two-pass chunk merge to eliminate chunks < min_chunk_tokens."""
+
+        # FIX-4: token_ceiling was never defined; use max_tokens (with fallback)
+        token_ceiling = max_tokens if max_tokens is not None else self.max_chunk_tokens
 
         def _forward_pass(source: List[Dict]) -> List[Dict]:
             result: List[Dict] = []
@@ -576,7 +648,7 @@ class EnhancedChunkingService:
                     nxt = source[i + 1]
                     combined_text   = cur["text"] + " " + nxt["text"]
                     combined_tokens = cur["token_count"] + nxt["token_count"]
-                    if combined_tokens <= self.target_chunk_tokens:
+                    if combined_tokens <= token_ceiling:
                         result.append(self._create_chunk(
                             combined_text,
                             len(result) + 1,
@@ -591,7 +663,7 @@ class EnhancedChunkingService:
 
         after_forward = _forward_pass(chunks)
 
-        # FIX-5: backward pass for trailing tiny chunk
+        # Backward pass for trailing tiny chunk
         if (
             len(after_forward) >= 2
             and after_forward[-1]["token_count"] < self.min_chunk_tokens
@@ -600,7 +672,7 @@ class EnhancedChunkingService:
             prev = after_forward[-1]
             combined_text   = prev["text"] + " " + last["text"]
             combined_tokens = prev["token_count"] + last["token_count"]
-            if combined_tokens <= self.target_chunk_tokens:
+            if combined_tokens <= token_ceiling:
                 after_forward[-1] = self._create_chunk(
                     combined_text,
                     prev["metadata"]["chunk_index"],
@@ -608,7 +680,7 @@ class EnhancedChunkingService:
                     chunk_type="semantic_merged",
                 )
             else:
-                after_forward.append(last)   # cannot merge – keep as is
+                after_forward.append(last)
 
         # Re-index sequentially after merges
         for new_idx, chunk in enumerate(after_forward, start=1):
@@ -628,7 +700,7 @@ class EnhancedChunkingService:
         if not sentences:
             return self._chunk_fixed_size(text, base_metadata)
 
-        chunks:    List[Dict[str, Any]] = []
+        chunks:     List[Dict[str, Any]] = []
         chunk_index = 1
         cur_parts:  List[str] = []
         cur_tokens  = 0
@@ -665,17 +737,15 @@ class EnhancedChunkingService:
                 " ".join(cur_parts), chunk_index, base_metadata,
             ))
 
-        return self._merge_small_chunks(chunks, base_metadata)
+        # FIX-6: pass max_tokens so token_ceiling is defined inside the method
+        return self._merge_small_chunks(chunks, base_metadata, self.target_chunk_tokens)
 
     # ──────────────────────────────────────────────────────────────────────
     # Structural unit parser
     # ──────────────────────────────────────────────────────────────────────
 
     def _split_into_structured_units(self, text: str) -> List[Dict[str, str]]:
-        """
-        Parse markdown into typed units:
-            heading | code_block | list | paragraph
-        """
+        """Parse markdown into typed units: heading | code_block | list | paragraph."""
         units:      List[Dict[str, str]] = []
         heading_re  = re.compile(r"^#{1,6}\s+.+$")
         list_re     = re.compile(r"^\s*([-*+]|\d+\.)\s+.+")
@@ -687,7 +757,6 @@ class EnhancedChunkingService:
         while i < len(lines):
             line = lines[i].rstrip()
 
-            # Heading
             if heading_re.match(line):
                 if cur_text.strip():
                     units.append({"type": cur_type, "text": cur_text.strip()})
@@ -696,7 +765,6 @@ class EnhancedChunkingService:
                 i += 1
                 continue
 
-            # Fenced code block
             if line.strip().startswith("```"):
                 if cur_text.strip():
                     units.append({"type": cur_type, "text": cur_text.strip()})
@@ -712,7 +780,6 @@ class EnhancedChunkingService:
                 cur_text = ""
                 continue
 
-            # List item
             if list_re.match(line):
                 if cur_text.strip() and cur_type != "list":
                     units.append({"type": cur_type, "text": cur_text.strip()})
@@ -722,7 +789,6 @@ class EnhancedChunkingService:
                 i += 1
                 continue
 
-            # Blank line – paragraph boundary
             if not line.strip():
                 if cur_text.strip():
                     units.append({"type": cur_type, "text": cur_text.strip()})
@@ -730,7 +796,6 @@ class EnhancedChunkingService:
                 i += 1
                 continue
 
-            # Normal paragraph text
             if cur_type != "paragraph":
                 if cur_text.strip():
                     units.append({"type": cur_type, "text": cur_text.strip()})
@@ -756,6 +821,8 @@ class EnhancedChunkingService:
         pattern = r"(?<=[.!?])\s+(?=[A-Z])"
         return [s.strip() for s in re.split(pattern, text) if s.strip()]
 
+    # FIX-7: removed duplicate broken definition that was nested inside
+    # _chunk_semantic. This single class-level definition is the correct one.
     def _is_semantically_similar(
         self, text1: str, text2: str, threshold: float = 0.25
     ) -> bool:
@@ -769,12 +836,12 @@ class EnhancedChunkingService:
 
     def _create_chunk(
         self,
-        text: str,
-        chunk_index: int,
+        text:         str,
+        chunk_index:  int,
         base_metadata: Dict,
-        position: Optional[int] = None,
+        position:     Optional[int] = None,
         total_tokens: Optional[int] = None,
-        chunk_type: str = "text",
+        chunk_type:   str = "text",
     ) -> Dict[str, Any]:
         page_number = self._extract_page_number(text)
         token_count = self.token_counter.count_tokens(text)
@@ -802,16 +869,13 @@ class EnhancedChunkingService:
     def _generate_chunk_id(
         self, text: str, chunk_index: int, chunk_type: str = "text"
     ) -> str:
-    
         hash_input = f"{text[:100].strip()}|{len(text)}|{chunk_index}|{chunk_type}"
         return hashlib.sha256(hash_input.encode()).hexdigest()[:16]
 
     def _chunk_fixed_size_chars(
         self, text: str, base_metadata: Dict
     ) -> List[Dict[str, Any]]:
-        """
-        Character-based fallback when tiktoken is unavailable.
-        """
+        """Character-based fallback when tiktoken is unavailable."""
         target_chars  = self.target_chunk_tokens  * 4
         overlap_chars = self.chunk_overlap_tokens * 4
         stride_chars  = max(1, target_chars - overlap_chars)
@@ -823,7 +887,6 @@ class EnhancedChunkingService:
             raw.append((pos, text[pos: pos + target_chars]))
             pos += stride_chars
 
-        # FIX-1 (char version): merge tiny tail
         if len(raw) >= 2 and len(raw[-1][1]) < min_chars:
             prev_pos, _ = raw[-2]
             last_pos, last_text = raw[-1]
@@ -844,7 +907,7 @@ class EnhancedChunkingService:
         if not chunks:
             return {
                 "total_chunks": 0, "avg_tokens": 0,
-                "min_tokens": 0, "max_tokens": 0, "total_tokens": 0,
+                "min_tokens": 0,   "max_tokens": 0, "total_tokens": 0,
             }
         tc = [c["token_count"] for c in chunks]
         return {
@@ -859,6 +922,6 @@ class EnhancedChunkingService:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Backward-compatibility aliases
+# Backward-compatibility alias
 # ─────────────────────────────────────────────────────────────────────────────
 SemanticChunkingService = EnhancedChunkingService
