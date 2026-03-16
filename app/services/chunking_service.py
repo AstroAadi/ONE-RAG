@@ -319,16 +319,25 @@ class EnhancedChunkingService:
 
     def _chunk_hierarchical(
         self,
-        text:                 str,
-        base_metadata:        Dict,
-        max_parent_tokens:    Optional[int] = None,
-        max_child_tokens:     Optional[int] = None,
+        text: str,
+        base_metadata: Dict,
+        max_parent_tokens: Optional[int] = None,
+        max_child_tokens: Optional[int] = None,
         child_overlap_tokens: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """Two-level hierarchical chunking — parents first, then children."""
+        """
+        Two-level hierarchical chunking.
+
+        Phase 1 – Create overlapping parent windows over the full token sequence.
+        Phase 2 – Split each parent into fixed-size overlapping child windows.
+
+        Returns a flat list: parent chunks first, then child chunks in order.
+
+        """
         if not text.strip():
             return []
 
+        # ── Defaults ─────────────────────────────────────────────────────
         if max_parent_tokens is None:
             max_parent_tokens = max(600, self.target_chunk_tokens * 4)
         if max_child_tokens is None:
@@ -336,26 +345,29 @@ class EnhancedChunkingService:
         if child_overlap_tokens is None:
             child_overlap_tokens = self.chunk_overlap_tokens
 
+        # Safety guards
         max_parent_tokens    = max(max_parent_tokens, max_child_tokens + 1)
         child_overlap_tokens = min(child_overlap_tokens, max_child_tokens // 2)
         parent_overlap_tokens = min(
             int(max_parent_tokens * 0.20), max_parent_tokens // 2
         )
 
+        # ── Phase 1: parent windows ───────────────────────────────────────
         all_tokens = self.token_counter.get_tokens(text)
         if not all_tokens:
             return self._chunk_fixed_size_chars(text, base_metadata)
 
-        parent_stride   = max(1, max_parent_tokens - parent_overlap_tokens)
+        parent_stride = max(1, max_parent_tokens - parent_overlap_tokens)
         parent_records: List[Dict[str, Any]] = []
-        p_index         = 1
-        position        = 0
+        p_index  = 1
+        position = 0
 
         while position < len(all_tokens):
             end      = min(position + max_parent_tokens, len(all_tokens))
             p_tokens = all_tokens[position:end]
             p_text   = self.token_counter.decode_tokens(p_tokens)
             if p_text.strip():
+                # FIX-4: use hash-based chunk_id (same as _create_chunk does)
                 p_chunk = self._create_chunk(
                     p_text, p_index, base_metadata,
                     position=position, total_tokens=len(all_tokens),
@@ -365,8 +377,9 @@ class EnhancedChunkingService:
                 p_index += 1
             position += parent_stride
 
-        all_output:    List[Dict[str, Any]] = list(parent_records)
-        child_counter  = 1
+        # ── Phase 2: children for each parent ────────────────────────────
+        all_output: List[Dict[str, Any]] = list(parent_records)   # parents first
+        child_counter = 1
 
         for parent in parent_records:
             parent_id   = parent["chunk_id"]
@@ -381,7 +394,9 @@ class EnhancedChunkingService:
                 child_index_start=child_counter,
             )
 
+            # Back-fill child IDs into parent metadata
             parent["metadata"]["child_chunk_ids"] = [c["chunk_id"] for c in children]
+
             all_output.extend(children)
             child_counter += len(children)
 
@@ -396,14 +411,16 @@ class EnhancedChunkingService:
 
     def _split_into_children(
         self,
-        text:               str,
-        max_child_tokens:   int,
+        text: str,
+        max_child_tokens: int,
         child_overlap_tokens: int,
-        base_metadata:      Dict,
-        parent_id:          str,
-        child_index_start:  int = 1,
+        base_metadata: Dict,
+        parent_id: str,
+        child_index_start: int = 1,
     ) -> List[Dict[str, Any]]:
-        """Produce fixed-size overlapping child chunks from one parent's text."""
+        """
+        Produce fixed-size overlapping child chunks from one parent's text.
+        """
         tokens = self.token_counter.get_tokens(text)
         if not tokens:
             return []
@@ -417,6 +434,7 @@ class EnhancedChunkingService:
             raw.append((position, window))
             position += stride
 
+        # FIX-2: merge tiny tail into previous window
         if len(raw) >= 2 and len(raw[-1][1]) < self.min_chunk_tokens:
             prev_pos, _ = raw[-2]
             last_pos, last_toks = raw[-1]
@@ -437,6 +455,7 @@ class EnhancedChunkingService:
                 total_tokens=len(tokens),
                 chunk_type="child",
             )
+            # FIX-3 & FIX-4: always stamp the parent reference
             child["metadata"]["parent_chunk_id"] = parent_id
             children.append(child)
 
