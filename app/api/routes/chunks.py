@@ -64,7 +64,7 @@ Unified chunk creation endpoint. Accepts all chunking strategies.
         "chunking_strategy": "semantic",
         "chunk_size": 1000,
         "chunk_overlap": 100,
-        "max_buffer_size": 256,
+        "max_buffer_size": 20,
         "breakpoint_threshold": 0.8
     }
     4. Hierarchical:
@@ -333,7 +333,7 @@ async def create_chunks(
         "chunking_strategy": "semantic",
         "chunk_size": 1000,
         "chunk_overlap": 100,
-        "max_buffer_size": 256,
+        "max_buffer_size": 20,
         "breakpoint_threshold": 0.8
     }
     4. Hierarchical:
