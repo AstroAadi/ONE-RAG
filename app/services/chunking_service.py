@@ -459,28 +459,28 @@ class EnhancedChunkingService:
             return []
 
             # ── Resolve effective parameters ────────────────────────────────────
-            effective_max_tokens   = max_tokens    if max_tokens    is not None else self.target_chunk_tokens
-            effective_overlap      = overlap_tokens if overlap_tokens is not None else self.chunk_overlap_tokens
-            effective_buffer_size  = max_buffer_size  # None means unlimited
+        effective_max_tokens   = max_tokens    if max_tokens    is not None else self.target_chunk_tokens
+        effective_overlap      = overlap_tokens if overlap_tokens is not None else self.chunk_overlap_tokens
+        effective_buffer_size  = max_buffer_size  # None means unlimited
 
             # FIX: Always default sim_threshold to a concrete float — never pass
             # None into _is_semantically_similar (causes '>= NoneType' TypeError
             # when breakpoint_threshold isn't stored/restored via file_metadata).
-            sim_threshold: float   = breakpoint_threshold if breakpoint_threshold is not None else 0.25
+        sim_threshold: float   = breakpoint_threshold if breakpoint_threshold is not None else 0.25
 
-            units = self._split_into_structured_units(text)
-            if not units:
-                return self._chunk_by_sentence(text, base_metadata)
+        units = self._split_into_structured_units(text)
+        if not units:
+            return self._chunk_by_sentence(text, base_metadata)
 
-            raw_chunks:    List[Dict[str, Any]] = []
-            chunk_index    = 1
-            cur_parts:     List[str] = []
-            cur_text       = ""
-            cur_tokens     = 0
-            pending_prefix = ""           # FIX-6: carries small structural text forward
-            overlap_tail   = ""           # sliding-window text prepended to next chunk
+        raw_chunks:    List[Dict[str, Any]] = []
+        chunk_index    = 1
+        cur_parts:     List[str] = []
+        cur_text       = ""
+        cur_tokens     = 0
+        pending_prefix = ""           # FIX-6: carries small structural text forward
+        overlap_tail   = ""           # sliding-window text prepended to next chunk
 
-            def flush() -> None:
+        def flush() -> None:
                 nonlocal chunk_index, cur_parts, cur_text, cur_tokens, overlap_tail
                 if not cur_parts:
                     return
@@ -500,7 +500,7 @@ class EnhancedChunkingService:
 
                 cur_parts, cur_text, cur_tokens = [], "", 0
 
-            def _start_new_chunk_with_overlap() -> None:
+        def _start_new_chunk_with_overlap() -> None:
                 """Seed cur_parts/cur_text/cur_tokens from overlap_tail if present."""
                 nonlocal cur_parts, cur_text, cur_tokens
                 if overlap_tail:
@@ -511,14 +511,14 @@ class EnhancedChunkingService:
                 else:
                     cur_parts, cur_text, cur_tokens = [], "", 0
 
-            def _buffer_is_full() -> bool:
+        def _buffer_is_full() -> bool:
                 """True when max_buffer_size is set and the buffer has reached it."""
                 return (
                     effective_buffer_size is not None
                     and len(cur_parts) >= effective_buffer_size
                 )
 
-            for unit in units:
+        for unit in units:
                 unit_type   = unit["type"]
                 unit_text   = unit["text"]
                 unit_tokens = self.token_counter.count_tokens(unit_text)
@@ -584,20 +584,20 @@ class EnhancedChunkingService:
                     cur_tokens += unit_tokens
 
             # Flush any remaining pending prefix that was never consumed
-            if pending_prefix:
+        if pending_prefix:
                 cur_parts.append(pending_prefix)
                 cur_tokens += self.token_counter.count_tokens(pending_prefix)
-            flush()
+        flush()
 
             # ── Two-pass merge (FIX-5) ──────────────────────────────────────
-            merged = self._merge_small_chunks(raw_chunks, base_metadata, effective_max_tokens)
+        merged = self._merge_small_chunks(raw_chunks, base_metadata, effective_max_tokens)
 
-            logger.info(
+        logger.info(
                 f"Semantic chunking → {len(merged)} chunk(s) "
                 f"(max_tokens={effective_max_tokens}, overlap={effective_overlap}, "
                 f"buffer_size={effective_buffer_size}, sim_threshold={sim_threshold})"
             )
-            return merged
+        return merged
 
     def _extract_overlap_tail(self, text: str, overlap_tokens: int) -> str:
             """
@@ -627,9 +627,9 @@ class EnhancedChunkingService:
         """
 
         def _forward_pass(source: List[Dict]) -> List[Dict]:
-                result: List[Dict] = []
-                i = 0
-                while i < len(source):
+            result: List[Dict] = []
+            i = 0
+            while i < len(source):
                     cur = source[i]
                     if (
                         cur["token_count"] < self.min_chunk_tokens
@@ -649,27 +649,27 @@ class EnhancedChunkingService:
                             continue
                     result.append(cur)
                     i += 1
-                return result
+            return result
 
-            after_forward = _forward_pass(chunks)
+        after_forward = _forward_pass(chunks)
 
             # FIX-5: backward pass for trailing tiny chunk
-            if (
+        if (
                 len(after_forward) >= 2
                 and after_forward[-1]["token_count"] < self.min_chunk_tokens
             ):
-                last = after_forward.pop()
-                prev = after_forward[-1]
-                combined_text   = prev["text"] + " " + last["text"]
-                combined_tokens = prev["token_count"] + last["token_count"]
-                if combined_tokens <= token_ceiling:
-                    after_forward[-1] = self._create_chunk(
-                        combined_text,
-                        prev["metadata"]["chunk_index"],
-                        base_metadata,
+            last = after_forward.pop()
+            prev = after_forward[-1]
+            combined_text   = prev["text"] + " " + last["text"]
+            combined_tokens = prev["token_count"] + last["token_count"]
+            if combined_tokens <= token_ceiling:
+                after_forward[-1] = self._create_chunk(
+                    combined_text,
+                    prev["metadata"]["chunk_index"],
+                    base_metadata,
                         chunk_type="semantic_merged",
                     )
-                else:
+            else:
                     after_forward.append(last)   # cannot merge – keep as is
 
             # Re-index sequentially after merges
