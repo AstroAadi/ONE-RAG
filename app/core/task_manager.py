@@ -142,10 +142,25 @@ class TaskManager:
             max_workers=max_io_workers,
             thread_name_prefix="io_worker"
         )
-        
-        self.cpu_executor = ProcessPoolExecutor(
-            max_workers=max_cpu_workers
-        )
+        self.cpu_executor_mode = "process"
+        try:
+            self.cpu_executor = ProcessPoolExecutor(
+                max_workers=max_cpu_workers
+            )
+        except Exception as e:
+            # Some Windows-restricted environments cannot create the pipe
+            # required by ProcessPoolExecutor. Fall back to threads so the
+            # API can still start and serve requests.
+            logger.warning(
+                "ProcessPoolExecutor unavailable (%s). Falling back to "
+                "ThreadPoolExecutor for CPU-bound tasks.",
+                e,
+            )
+            self.cpu_executor = ThreadPoolExecutor(
+                max_workers=max_cpu_workers,
+                thread_name_prefix="cpu_worker"
+            )
+            self.cpu_executor_mode = "thread_fallback"
         
         # Task tracking (thread-safe dict)
         self.tasks: Dict[str, TaskInfo] = {}
@@ -153,7 +168,8 @@ class TaskManager:
         
         logger.info(
             f"✅ Task Manager initialized: "
-            f"I/O workers={max_io_workers}, CPU workers={max_cpu_workers}"
+            f"I/O workers={max_io_workers}, CPU workers={max_cpu_workers}, "
+            f"cpu_executor_mode={self.cpu_executor_mode}"
         )
     
     def submit_task(
@@ -400,7 +416,8 @@ class TaskManager:
             "by_status": {k.value: v for k, v in status_counts.items()},
             "by_type": {k.value: v for k, v in type_counts.items()},
             "io_workers": self.io_executor._max_workers,
-            "cpu_workers": self.cpu_executor._max_workers
+            "cpu_workers": self.cpu_executor._max_workers,
+            "cpu_executor_mode": self.cpu_executor_mode,
         }
     
     def shutdown(self, wait: bool = True):
@@ -430,9 +447,11 @@ def get_task_manager() -> TaskManager:
         with _manager_lock:
             # Double-check locking pattern
             if _task_manager is None:
+                from app.core.config import settings
+
                 _task_manager = TaskManager(
-                    max_io_workers=20,
-                    max_cpu_workers=4
+                    max_io_workers=settings.max_io_workers,
+                    max_cpu_workers=settings.max_cpu_workers
                 )
     
     return _task_manager

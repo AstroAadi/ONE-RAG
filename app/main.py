@@ -21,6 +21,7 @@ from app.core.task_manager import get_task_manager, shutdown_task_manager
 
 # Import routes
 from app.api.routes import (
+    cloud_upload,
     upload,
     query,
     task_routes,
@@ -205,10 +206,11 @@ app.include_router(task_routes.router)
 app.include_router(chunk_edit.router)
 app.include_router(markdown_output.router)
 app.include_router(settings_route.router)
+app.include_router(cloud_upload.router)
 
 
 # Root endpoint 
-@app.get("/")
+@app.get("/")  
 async def root():
     """Root endpoint with system information"""
     task_manager = get_task_manager()

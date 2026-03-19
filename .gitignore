@@ -16,3 +16,5 @@ logs/
 rag_system.db
 tejas_code.py
 venv/
+temp_data/
+mongo_db.py/

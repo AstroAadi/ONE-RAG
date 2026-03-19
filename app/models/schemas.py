@@ -7,6 +7,8 @@ from pydantic import BaseModel, Field, field_validator, ConfigDict
 from typing import List, Optional, Dict, Any, Union, Literal,Annotated
 from datetime import datetime
 from enum import Enum
+from pydantic import BaseModel
+from typing import Dict
 
 
 # ==================== Enums ====================
@@ -478,3 +480,28 @@ class HealthCheckResponse(BaseModel):
     vector_store: bool
     llm_service: bool
     details: Optional[Dict[str, Any]] = None
+
+class AWSRequest(BaseModel):
+    access_key: str
+    secret_key: str
+    bucket_name: str
+    s3_prefix: str
+
+class ServiceAccount(BaseModel):
+    type: str
+    project_id: str
+    private_key_id: str
+    private_key: str
+    client_email: str
+    client_id: str
+    auth_uri: str
+    token_uri: str
+    auth_provider_x509_cert_url: str
+    client_x509_cert_url: str
+    universe_domain: str
+
+
+class GCPRequest(BaseModel):
+    service_account_json: ServiceAccount
+    bucket_name: str
+    prefix: str
