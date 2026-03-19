@@ -204,7 +204,7 @@ app.include_router(chunks.router)
 app.include_router(query.router)
 app.include_router(task_routes.router)
 app.include_router(chunk_edit.router)
-app.include_router(markdown_output.router)
+# app.include_router(markdown_output.router)
 app.include_router(settings_route.router)
 app.include_router(cloud_upload.router)
 

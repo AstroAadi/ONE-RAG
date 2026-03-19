@@ -147,6 +147,8 @@ class FileMetadata(Base):
     )
     target_chunk_tokens = Column(Integer, default=512, nullable=False)
     chunk_overlap_tokens = Column(Integer, default=50, nullable=False)
+    # FIX-2: store parent_chunk_size so finalize can reproduce hierarchical chunks exactly
+    parent_chunk_size = Column(Integer, nullable=True)
     
     # Timestamps
     uploaded_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
@@ -226,6 +228,7 @@ class ChunkMetadata(Base):
     chunk_index = Column(Integer, nullable=False)
     chunk_type = Column(String(20), default="text", nullable=False)
     char_count = Column(Integer, nullable=False)
+    token_count = Column(Integer, nullable=True)  # approximate token count for the chunk
     page_number = Column(Integer, default=0, nullable=False)
     
     # Timestamps
@@ -314,5 +317,4 @@ class ConversationHistory(Base):
     def __repr__(self) -> str:
         return f"<ConversationHistory(conversation_id={self.conversation_id}, role={self.role})>"
     
-
     

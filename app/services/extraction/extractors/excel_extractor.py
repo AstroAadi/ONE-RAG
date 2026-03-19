@@ -202,8 +202,16 @@ class ExcelExtractor(BaseExtractor):
             # Create image directory
             image_output_dir = self._create_image_directory(file_path, excel_stem)
             
-            # Load workbook with openpyxl (for images) and pandas (for data)
+            # Load workbook with data_only=True for values, plus a second pass
+            # for formulas (include_formulas=True). Previously formulas were
+            # completely discarded despite the config flag existing.
             wb = load_workbook(file_path, data_only=True)
+            wb_formulas = None
+            if self.include_formulas:
+                try:
+                    wb_formulas = load_workbook(file_path, data_only=False)
+                except Exception as e:
+                    logger.warning(f"Could not load formula workbook: {e}")
             sheet_names = wb.sheetnames
             
             logger.info(f"📑 XLSX has {len(sheet_names)} sheets")
@@ -221,11 +229,14 @@ class ExcelExtractor(BaseExtractor):
                     sheet_idx,
                     file_path,
                     image_output_dir,
-                    excel_stem
+                    excel_stem,
+                    wb_formulas=wb_formulas
                 )
                 sheets_data.append(sheet_data)
             
             wb.close()
+            if wb_formulas:
+                wb_formulas.close()
             
             # Build markdown sheet-by-sheet
             final_markdown = self._build_xlsx_markdown(
@@ -279,26 +290,42 @@ class ExcelExtractor(BaseExtractor):
         sheet_idx: int,
         file_path: str,
         image_output_dir: str,
-        excel_stem: str
+        excel_stem: str,
+        wb_formulas=None
     ) -> Dict:
-        """Process a single sheet (data, images, charts)"""
+        """Process a single sheet (data, images, charts, formulas, statistics)"""
         try:
             sheet = wb[sheet_name]
             
             # Extract data using pandas for better handling
             df = pd.read_excel(file_path, sheet_name=sheet_name)
             
-            # Limit rows for very large sheets
+            # FIX: Use max_rows_per_table (default 100) not max_preview_rows (20).
+            # Previously only 20 rows were written to markdown, so the vector DB
+            # had no data to answer queries against. Now we embed the full table
+            # up to max_rows_per_table so aggregation/retrieval actually works.
             if len(df) > self.max_rows_per_table:
                 logger.warning(
                     f"Sheet '{sheet_name}' has {len(df)} rows, "
-                    f"limiting to first {self.max_preview_rows} for preview"
+                    f"limiting to first {self.max_rows_per_table} for embedding"
                 )
-                df_preview = df.head(self.max_preview_rows)
+                df_preview = df.head(self.max_rows_per_table)
                 truncated = True
             else:
                 df_preview = df
                 truncated = False
+            
+            # FIX: Compute per-column statistics for numeric columns.
+            # These aggregates (sum, mean, min, max, count) are embedded directly
+            # in the markdown so retrieval can answer "what is the total X?" queries.
+            column_stats = self._compute_column_statistics(df)
+            
+            # FIX: Extract formulas from the formula workbook.
+            # Previously include_formulas config was ignored — data_only=True
+            # silently discards all formula text.
+            formula_map = {}
+            if self.include_formulas and wb_formulas and sheet_name in wb_formulas.sheetnames:
+                formula_map = self._extract_formulas(wb_formulas[sheet_name])
             
             # Process images in sheet
             images_data = self._process_sheet_images(
@@ -321,6 +348,8 @@ class ExcelExtractor(BaseExtractor):
                 'dataframe': df_preview,
                 'row_count': len(df),
                 'column_count': len(df.columns),
+                'column_stats': column_stats,
+                'formula_map': formula_map,
                 'images': images_data,
                 'image_count': len(images_data),
                 'chart_count': charts_count,
@@ -336,6 +365,8 @@ class ExcelExtractor(BaseExtractor):
                 'dataframe': pd.DataFrame(),
                 'row_count': 0,
                 'column_count': 0,
+                'column_stats': {},
+                'formula_map': {},
                 'images': [],
                 'image_count': 0,
                 'chart_count': 0,
@@ -343,7 +374,54 @@ class ExcelExtractor(BaseExtractor):
                 'has_data': False,
                 'error': str(e)
             }
-    
+
+    def _compute_column_statistics(self, df: pd.DataFrame) -> Dict:
+        """
+        FIX: Compute per-column numeric statistics so the vector DB can answer
+        aggregation queries like 'total revenue', 'average score', 'min/max price'.
+        Without this, retrieval returns raw rows with no computed values.
+        """
+        stats = {}
+        for col in df.columns:
+            if pd.api.types.is_numeric_dtype(df[col]):
+                series = df[col].dropna()
+                if len(series) == 0:
+                    continue
+                stats[str(col)] = {
+                    'count': int(series.count()),
+                    'sum': float(round(series.sum(), 4)),
+                    'mean': float(round(series.mean(), 4)),
+                    'median': float(round(series.median(), 4)),
+                    'min': float(series.min()),
+                    'max': float(series.max()),
+                    'std': float(round(series.std(), 4)) if len(series) > 1 else 0.0,
+                }
+            elif pd.api.types.is_string_dtype(df[col]) or df[col].dtype == object:
+                # For text columns store unique value count and top values
+                series = df[col].dropna().astype(str)
+                value_counts = series.value_counts()
+                stats[str(col)] = {
+                    'count': int(series.count()),
+                    'unique_values': int(series.nunique()),
+                    'top_values': value_counts.head(10).index.tolist(),
+                }
+        return stats
+
+    def _extract_formulas(self, sheet) -> Dict:
+        """
+        FIX: Extract formula strings from the formula-mode workbook.
+        data_only=True (used for values) silently drops all formula text,
+        so include_formulas config was previously a no-op.
+        Returns {cell_address: formula_string} for cells that contain formulas.
+        """
+        formula_map = {}
+        for row in sheet.iter_rows():
+            for cell in row:
+                val = cell.value
+                if isinstance(val, str) and val.startswith('='):
+                    formula_map[cell.coordinate] = val
+        return formula_map
+
     def _process_sheet_images(
         self,
         sheet,
@@ -445,7 +523,7 @@ class ExcelExtractor(BaseExtractor):
         excel_stem: str,
         file_ext: str
     ) -> str:
-        """Build markdown for CSV/TSV files"""
+        """Build markdown for CSV/TSV files — includes statistics for retrieval"""
         result_lines = []
         
         # Header
@@ -459,10 +537,10 @@ class ExcelExtractor(BaseExtractor):
         # Page marker
         result_lines.append("## Page 1\n")
         
-        # Add data table
-        if len(df) > self.max_preview_rows:
-            result_lines.append(f"**Note**: Showing first {self.max_preview_rows} of {len(df)} rows\n")
-            df_to_show = df.head(self.max_preview_rows)
+        # FIX: Embed all rows up to max_rows_per_table, not just max_preview_rows
+        if len(df) > self.max_rows_per_table:
+            result_lines.append(f"**Note**: Showing first {self.max_rows_per_table} of {len(df)} rows\n")
+            df_to_show = df.head(self.max_rows_per_table)
         else:
             df_to_show = df
         
@@ -478,6 +556,26 @@ class ExcelExtractor(BaseExtractor):
         result_lines.append(f"- **Columns**: {', '.join(df.columns.tolist())}")
         result_lines.append("")
         
+        # FIX: Embed per-column numeric statistics for aggregation queries
+        col_stats = self._compute_column_statistics(df)
+        if col_stats:
+            result_lines.append("### Column Statistics\n")
+            for col_name, stats in col_stats.items():
+                if 'sum' in stats:
+                    result_lines.append(
+                        f"- **{col_name}**: count={stats['count']}, "
+                        f"sum={stats['sum']}, mean={stats['mean']}, "
+                        f"median={stats['median']}, min={stats['min']}, "
+                        f"max={stats['max']}"
+                    )
+                else:
+                    top = ', '.join(str(v) for v in stats.get('top_values', [])[:5])
+                    result_lines.append(
+                        f"- **{col_name}**: {stats['count']} values, "
+                        f"{stats['unique_values']} unique — top: {top}"
+                    )
+            result_lines.append("")
+        
         return '\n'.join(result_lines)
     
     def _build_xls_markdown(
@@ -485,7 +583,7 @@ class ExcelExtractor(BaseExtractor):
         sheets_data: Dict[str, pd.DataFrame],
         excel_stem: str
     ) -> str:
-        """Build markdown for XLS files"""
+        """Build markdown for XLS files — includes statistics for retrieval"""
         result_lines = []
         
         # Header
@@ -502,10 +600,10 @@ class ExcelExtractor(BaseExtractor):
                 result_lines.append("*(Empty sheet)*\n")
                 continue
             
-            # Add data table
-            if len(df) > self.max_preview_rows:
-                result_lines.append(f"**Note**: Showing first {self.max_preview_rows} of {len(df)} rows\n")
-                df_to_show = df.head(self.max_preview_rows)
+            # FIX: Embed all rows up to max_rows_per_table, not max_preview_rows
+            if len(df) > self.max_rows_per_table:
+                result_lines.append(f"**Note**: Showing first {self.max_rows_per_table} of {len(df)} rows\n")
+                df_to_show = df.head(self.max_rows_per_table)
             else:
                 df_to_show = df
             
@@ -516,6 +614,26 @@ class ExcelExtractor(BaseExtractor):
             # Sheet statistics
             result_lines.append(f"**Sheet Statistics**: {len(df)} rows × {len(df.columns)} columns")
             result_lines.append("")
+            
+            # FIX: Embed per-column numeric statistics for aggregation queries
+            col_stats = self._compute_column_statistics(df)
+            if col_stats:
+                result_lines.append("### Column Statistics\n")
+                for col_name, stats in col_stats.items():
+                    if 'sum' in stats:
+                        result_lines.append(
+                            f"- **{col_name}**: count={stats['count']}, "
+                            f"sum={stats['sum']}, mean={stats['mean']}, "
+                            f"median={stats['median']}, min={stats['min']}, "
+                            f"max={stats['max']}"
+                        )
+                    else:
+                        top = ', '.join(str(v) for v in stats.get('top_values', [])[:5])
+                        result_lines.append(
+                            f"- **{col_name}**: {stats['count']} values, "
+                            f"{stats['unique_values']} unique — top: {top}"
+                        )
+                result_lines.append("")
         
         return '\n'.join(result_lines)
     
@@ -525,7 +643,7 @@ class ExcelExtractor(BaseExtractor):
         excel_stem: str,
         total_sheets: int
     ) -> str:
-        """Build markdown for XLSX files"""
+        """Build markdown for XLSX files — includes statistics and formulas for retrieval"""
         result_lines = []
         
         # Header
@@ -567,7 +685,7 @@ class ExcelExtractor(BaseExtractor):
             
             if sheet_data['truncated']:
                 result_lines.append(
-                    f"**Note**: Showing first {self.max_preview_rows} of "
+                    f"**Note**: Showing first {self.max_rows_per_table} of "
                     f"{sheet_data['row_count']} rows\n"
                 )
             
@@ -581,30 +699,62 @@ class ExcelExtractor(BaseExtractor):
                 f"{sheet_data['column_count']} columns"
             )
             result_lines.append("")
+            
+            # FIX: Embed computed column statistics so the vector DB can answer
+            # numeric queries (sum, average, min, max) without seeing all rows.
+            col_stats = sheet_data.get('column_stats', {})
+            if col_stats:
+                result_lines.append("### Column Statistics\n")
+                for col_name, stats in col_stats.items():
+                    if 'sum' in stats:
+                        result_lines.append(
+                            f"- **{col_name}**: count={stats['count']}, "
+                            f"sum={stats['sum']}, mean={stats['mean']}, "
+                            f"median={stats['median']}, min={stats['min']}, "
+                            f"max={stats['max']}, std={stats['std']}"
+                        )
+                    else:
+                        top = ', '.join(str(v) for v in stats.get('top_values', [])[:5])
+                        result_lines.append(
+                            f"- **{col_name}**: {stats['count']} values, "
+                            f"{stats['unique_values']} unique — top: {top}"
+                        )
+                result_lines.append("")
+            
+            # FIX: Embed formulas so the vector DB understands computed columns.
+            formula_map = sheet_data.get('formula_map', {})
+            if formula_map:
+                result_lines.append("### Formulas\n")
+                for cell_addr, formula in list(formula_map.items())[:50]:  # cap at 50
+                    result_lines.append(f"- `{cell_addr}`: `{formula}`")
+                result_lines.append("")
         
         return '\n'.join(result_lines)
     
     def _dataframe_to_markdown(self, df: pd.DataFrame) -> str:
-        """Convert pandas DataFrame to markdown table"""
+        """
+        Convert pandas DataFrame to markdown table.
+        FIX: Removed the raw integer index column — it added noise to embeddings
+        and confused retrieval (e.g. queries for row 0 vs actual data values).
+        """
         if df.empty:
             return "*(No data)*"
         
         # Replace NaN with empty string
         df = df.fillna('')
         
-        # Convert to markdown
         lines = []
         
-        # Header row
-        headers = [''] + df.columns.tolist()  # Add index column
-        lines.append("| " + " | ".join(str(h) for h in headers) + " |")
+        # FIX: Header uses only actual column names — no index prefix column
+        headers = [str(h) for h in df.columns.tolist()]
+        lines.append("| " + " | ".join(headers) + " |")
         
         # Separator
         lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
         
-        # Data rows
-        for idx, row in df.iterrows():
-            row_data = [str(idx)] + [str(val) for val in row.values]
+        # Data rows — values only, no index
+        for _, row in df.iterrows():
+            row_data = [str(val) for val in row.values]
             lines.append("| " + " | ".join(row_data) + " |")
         
         return '\n'.join(lines)

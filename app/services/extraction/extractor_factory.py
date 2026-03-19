@@ -247,12 +247,12 @@ def auto_register_extractors():
     except ImportError as e:
         logger.warning(f"Could not register MDXExtractor: {e}")
     
-    # XLS Extractor
+    # ZIP Extractor
     try:
-        from .extractors.xls_extractor import XLSExtractor
-        ExtractorFactory.register_extractor(XLSExtractor)
+        from .extractors.zip_extractor import ZIPExtractor
+        ExtractorFactory.register_extractor(ZIPExtractor)
     except ImportError as e:
-        logger.warning(f"Could not register XLSExtractor: {e}")
+        logger.warning(f"Could not register ZIPExtractor: {e}")
 
     
     # Log final status

@@ -1,5 +1,4 @@
 """
-GPU-Enabled Configuration - Pydantic v2 Compatible
 Fixed version with proper model separation:
 - AWS Bedrock: Dense embeddings + LLM
 - HuggingFace: SPLADE sparse vectors ONLY
@@ -107,7 +106,7 @@ class Settings(BaseSettings):
     
     # Database URL - supports both SQLite and PostgreSQL
     database_url: str = Field(
-        default="postgresql+psycopg2://postgres:root@localhost:5432/one-rag-db",
+        default="postgresql+psycopg2://postgres:root@localhost:5432/oneragdb3",
         description="Database URL (SQLite or PostgreSQL)"
     )
     
