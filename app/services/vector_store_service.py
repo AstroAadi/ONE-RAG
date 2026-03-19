@@ -293,6 +293,20 @@ class VectorStoreService:
         
         self.embedding_cache.set(text, embedding, embedding_type)
         return embedding
+
+    def _truncate_text_for_embedding(self, text: str) -> str:
+        """
+        Truncate using the configured token budget as an approximate character budget.
+
+        `embedding_max_length` is configured as a token-oriented limit, but the
+        previous implementation sliced raw characters directly. That dropped
+        important content far too early inside large chunks.
+        """
+        if not text:
+            return text
+
+        max_chars = settings.embedding_max_length * 4
+        return text[:max_chars] if len(text) > max_chars else text
     
     def add_document_chunks(
         self,
@@ -362,9 +376,8 @@ class VectorStoreService:
                 logger.warning(f"No valid chunks for {file_id}")
                 return 0
             
-            # Truncate texts
-            max_len = settings.embedding_max_length
-            truncated_texts = [text[:max_len] if len(text) > max_len else text for text in texts_for_embedding]
+            # Truncate texts using an approximate token->character budget.
+            truncated_texts = [self._truncate_text_for_embedding(text) for text in texts_for_embedding]
             
             # Generate embeddings
             logger.info(f"Generating embeddings for {len(truncated_texts)} chunks...")
@@ -829,7 +842,7 @@ class VectorStoreService:
             if existing['knowledge_base_id'] != knowledge_base_id:
                 raise VectorStoreException("Knowledge base ID mismatch")
             
-            truncated_text = new_text[:settings.embedding_max_length] if len(new_text) > settings.embedding_max_length else new_text
+            truncated_text = self._truncate_text_for_embedding(new_text)
             
             # Generate new embeddings
             dense_vector = self._get_cached_embedding(truncated_text, 'dense')

@@ -1,4 +1,3 @@
-
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 from typing import List, Optional, Dict, Any, Union, Literal,Annotated
 from datetime import datetime
@@ -38,6 +37,7 @@ class ChunkingStrategy(str, Enum):
     HIERARCHICAL = "hierarchical"
     SEMANTIC = "semantic"
     NO_CHUNKING = "no_chunking"
+    JSON="json"
 
 
 # ==================== NEW: Knowledge Base Models ====================
@@ -200,6 +200,13 @@ class QueryRequest(BaseModel):
         description="Search type"
     )
 
+    min_relevance_score: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Optional minimum chunk relevance score. Defaults to system setting."
+    )
+
 
 class ConversationQueryRequest(QueryRequest):
     """Conversational query with KB"""
@@ -262,6 +269,50 @@ class NoChunkingRequest(BaseModel):
     chunking_strategy: Literal["no_chunking"] = Field(default="no_chunking", description="Chunking strategy (fixed: no_chunking)")
 
 
+class JsonChunkingRequest(BaseModel):
+    """
+    JSON structural-recursive chunking.
+
+    Produces exactly ONE parent chunk per JSON entry (the full object) and
+    decomposes it into children by recursively walking the JSON tree.
+    Children are never formed by sliding a character/token window — every
+    child boundary aligns with a JSON key or array element boundary.
+
+    Each child is prefixed with a self-describing breadcrumb header, e.g.:
+        Action Network > properties > codex
+        ────────────────────────────────────
+        { "categories": ["Sales", "Marketing"], ... }
+
+    Parameters
+    ──────────
+    child_chunk_size : Maximum tokens per child chunk (default 100).
+                       When a sub-object exceeds this limit the chunker
+                       recurses deeper rather than cutting mid-object.
+    context_prefix   : Include the breadcrumb header in every child chunk
+                       (default True).  Set to False to store raw JSON only.
+    """
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    file_id: str = Field(..., description="File ID to create chunks for")
+    chunking_strategy: Literal["json"] = Field(
+        default="json",
+        description="Chunking strategy (fixed: json)"
+    )
+    child_chunk_size: int = Field(
+        default=100,
+        ge=10,
+        le=2000,
+        description="Maximum tokens per child chunk (default 100)"
+    )
+    context_prefix: bool = Field(
+        default=True,
+        description=(
+            "Prepend a breadcrumb path header to every child chunk. "
+            "Example: 'Action Network > properties > codex'"
+        )
+    )
+
+
 # Union type for all chunking requests
 ChunkingRequest = Annotated[
     Union[
@@ -269,7 +320,8 @@ ChunkingRequest = Annotated[
         FixedSizeChunkingRequest,
         SemanticChunkingRequest,
         HierarchicalChunkingRequest,
-        NoChunkingRequest
+        NoChunkingRequest,
+        JsonChunkingRequest,
     ],
     Field(discriminator="chunking_strategy")
 ]

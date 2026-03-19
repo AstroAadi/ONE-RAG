@@ -33,6 +33,7 @@ import zipfile
 import logging
 import traceback
 import collections
+import tempfile
 from pathlib import Path
 from typing import Tuple, Dict, List, Optional
 
@@ -197,7 +198,196 @@ class ZIPExtractor(BaseExtractor):
             traceback.print_exc()
             return "", False, {'error': str(e)}
 
+    # ── Per-file chunked indexing ─────────────────────────────────────────────
+
+    def extract_chunks(self, file_path: str) -> Tuple[List[Dict], bool, Dict]:
+        """
+        Extract ZIP and return one chunk dict per file entry, ready for indexing.
+
+        Each chunk has:
+          {
+            'content'           : str,   # Markdown content for this file only
+            'source_path'       : str,   # e.g. "docs/report.pdf"
+            'file_name'         : str,   # e.g. "report.pdf"
+            'file_type'         : str,   # e.g. ".pdf"
+            'chunk_index'       : int,   # 0-based position within the archive
+            'archive_name'      : str,   # ZIP stem, e.g. "my_archive"
+            'extraction_method' : str,   # "docling" | "native_text" | "vision_llm" | ...
+          }
+
+        Returns (chunks, success, metadata) — mirrors the extract() contract but
+        replaces the monolithic markdown string with a list of per-file chunks.
+        """
+        is_valid, msg = self.validate_file(file_path)
+        if not is_valid:
+            return [], False, {'error': msg}
+
+        archive_name = Path(file_path).stem
+
+        try:
+            with tempfile.TemporaryDirectory(prefix=f"zip_extract_{archive_name}_") as temp_dir:
+                extract_root = self._extract_archive_to_temp_tree(file_path, temp_dir)
+                chunks = self._build_file_chunks_from_directory(
+                    root_dir=extract_root,
+                    archive_name=archive_name,
+                )
+                metadata = {
+                    'archive_name': archive_name,
+                    'extraction_method': 'temp_dir_per_file',
+                    'file_chunks': chunks,
+                    'files_extracted': len(chunks),
+                }
+                logger.info(
+                    f"extract_chunks: ZIP temp extraction complete for '{archive_name}' "
+                    f"-> {len(chunks)} file chunk(s)"
+                )
+                return chunks, True, metadata
+        except Exception as e:
+            logger.error(f"extract_chunks failed for ZIP '{file_path}': {e}", exc_info=True)
+            return [], False, {'error': str(e)}
+
     # ── Strategy 1: Docling ───────────────────────────────────────────────────
+
+    def _extract_archive_to_temp_tree(self, file_path: str, temp_dir: str) -> Path:
+        """Extract the full ZIP tree into a temporary directory, preserving folders."""
+        archive_root = Path(temp_dir) / Path(file_path).stem
+        archive_root.mkdir(parents=True, exist_ok=True)
+
+        with zipfile.ZipFile(file_path, 'r') as zf:
+            for info in zf.infolist():
+                raw_name = info.filename
+                if not raw_name:
+                    continue
+
+                normalized = Path(raw_name)
+                if normalized.is_absolute() or ".." in normalized.parts:
+                    logger.warning(f"Skipping unsafe ZIP entry path: {raw_name}")
+                    continue
+
+                target_path = archive_root / normalized
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+
+                if info.is_dir():
+                    target_path.mkdir(parents=True, exist_ok=True)
+                    continue
+
+                with zf.open(info, 'r') as src, open(target_path, 'wb') as dst:
+                    dst.write(src.read())
+
+        return archive_root
+
+    def _build_file_chunks_from_directory(
+        self,
+        root_dir: Path,
+        archive_name: str,
+    ) -> List[Dict]:
+        """Process each extracted file independently and return one chunk record per file."""
+        chunks: List[Dict] = []
+
+        for file_path in sorted(p for p in root_dir.rglob('*') if p.is_file()):
+            source_path = file_path.relative_to(root_dir).as_posix()
+
+            if self._should_skip_entry(source_path):
+                continue
+
+            suffix = file_path.suffix.lower()
+            method = "unknown"
+
+            if suffix in TEXT_EXTENSIONS:
+                content, ok = self._read_text_file(file_path)
+                if not ok or not content.strip():
+                    continue
+                method = "native_text"
+                content = self._format_text_file_chunk(source_path, suffix, content)
+
+            elif suffix in IMAGE_EXTENSIONS:
+                content, ok = self._describe_image_file(file_path, source_path, archive_name)
+                if not ok or not content.strip():
+                    continue
+                method = "vision_llm"
+
+            elif suffix in DOC_EXTENSIONS:
+                content = self._delegate_to_sub_extractor(str(file_path), suffix) or ""
+                if not content.strip():
+                    continue
+                method = "sub_extractor"
+
+            else:
+                logger.debug(f"Skipping unsupported ZIP entry for chunking: {source_path}")
+                continue
+
+            chunks.append({
+                'content': content,
+                'source_path': source_path,
+                'file_name': file_path.name,
+                'file_type': suffix,
+                'chunk_index': len(chunks),
+                'archive_name': archive_name,
+                'extraction_method': method,
+            })
+
+        return chunks
+
+    def _read_text_file(self, file_path: Path) -> Tuple[str, bool]:
+        """Read a text file from disk with the same truncation policy as ZIP entries."""
+        try:
+            raw = file_path.read_bytes()
+            if len(raw) > MAX_TEXT_ENTRY_BYTES:
+                logger.warning(
+                    f"  ⚠️ {file_path.name} is {len(raw):,} bytes — truncating to {MAX_TEXT_ENTRY_BYTES:,}"
+                )
+                raw = raw[:MAX_TEXT_ENTRY_BYTES]
+
+            try:
+                return raw.decode('utf-8'), True
+            except UnicodeDecodeError:
+                return raw.decode('latin-1', errors='replace'), True
+        except Exception as e:
+            logger.warning(f"Could not read extracted text file {file_path}: {e}")
+            return "", False
+
+    def _format_text_file_chunk(self, source_path: str, suffix: str, content: str) -> str:
+        """Wrap plain text entries with a small header so chunk content stays self-describing."""
+        lang = suffix.lstrip('.')
+        return f"### `{source_path}`\n\n```{lang}\n{content}\n```"
+
+    def _describe_image_file(
+        self,
+        file_path: Path,
+        source_path: str,
+        archive_name: str,
+    ) -> Tuple[str, bool]:
+        """Describe an extracted image file and return markdown content for chunking."""
+        try:
+            image_bytes = file_path.read_bytes()
+            if not image_bytes:
+                return "", False
+
+            cached_desc = self.image_cache.get(image_bytes)
+            if cached_desc:
+                description = cached_desc
+            else:
+                media_type = self._get_media_type(file_path.suffix.lower().lstrip('.'))
+                base64_img = base64.b64encode(image_bytes).decode('utf-8')
+                success, description = self.image_service.describe_image_from_base64(
+                    base64_img,
+                    media_type,
+                    context=f"ZIP archive: {archive_name}",
+                    page_number=0
+                )
+                if not success:
+                    return "", False
+                self.image_cache.put(image_bytes, description)
+
+            markdown = (
+                f"### `{source_path}`\n\n"
+                f"**[Image Description]**: {description}\n"
+                f"*(File: `{source_path}`)*"
+            )
+            return markdown, True
+        except Exception as e:
+            logger.warning(f"Could not describe extracted image {file_path}: {e}")
+            return "", False
 
     def _try_docling_extraction(
         self, file_path: str, zip_stem: str
@@ -237,6 +427,18 @@ class ZIPExtractor(BaseExtractor):
             entries_processed = 0
             entries_skipped   = 0
             doc_entries: List[Dict] = []   # collect for metadata
+            file_chunks: List[Dict] = []   # one chunk per file, for per-file indexing
+
+            def _make_chunk_docling(entry_name: str, content: str, method: str) -> Dict:
+                return {
+                    'content'           : content,
+                    'source_path'       : entry_name,
+                    'file_name'         : Path(entry_name).name,
+                    'file_type'         : Path(entry_name).suffix.lower(),
+                    'chunk_index'       : len(file_chunks),
+                    'archive_name'      : zip_stem,
+                    'extraction_method' : method,
+                }
 
             with zipfile.ZipFile(file_path, 'r') as zf:
                 all_names = zf.namelist()
@@ -319,6 +521,9 @@ class ZIPExtractor(BaseExtractor):
 
                                         if md_text.strip():
                                             result_lines.append(md_text)
+                                            file_chunks.append(
+                                                _make_chunk_docling(entry_name, md_text, method)
+                                            )
                                             logger.info(f"  {'  ' * depth}✅ {entry_name}: {len(md_text):,} chars")
                                         else:
                                             logger.warning(f"  ⚠️ {entry_name}: no content extracted")
@@ -338,7 +543,11 @@ class ZIPExtractor(BaseExtractor):
                             elif suffix in TEXT_EXTENSIONS:
                                 content, ok = self._read_text_entry(zf, entry_name)
                                 if ok and content:
-                                    result_lines.append(f"```{suffix.lstrip('.')}\n{content}\n```")
+                                    block = f"```{suffix.lstrip('.')}\n{content}\n```"
+                                    result_lines.append(block)
+                                    file_chunks.append(
+                                        _make_chunk_docling(entry_name, content, 'native_text')
+                                    )
                                     entries_processed += 1
                                     doc_entries.append({'name': entry_name, 'suffix': suffix, 'method': 'native_text'})
                                 else:
@@ -353,6 +562,9 @@ class ZIPExtractor(BaseExtractor):
                                     images_extracted += 1
                                     images_described += 1
                                     entries_processed += 1
+                                    file_chunks.append(
+                                        _make_chunk_docling(entry_name, img_md, 'vision_llm')
+                                    )
                                     doc_entries.append({'name': entry_name, 'suffix': suffix, 'method': 'vision_llm'})
 
                             else:
@@ -383,6 +595,7 @@ class ZIPExtractor(BaseExtractor):
                 'image_directory':         str(image_output_dir),
                 'extraction_method':       'docling',
                 'doc_entries':             doc_entries,
+                'file_chunks':             file_chunks,
             })
 
             return final_markdown, True, metadata
@@ -445,6 +658,18 @@ class ZIPExtractor(BaseExtractor):
             result_lines: List[str] = []
             image_data:   Dict[int, Dict] = {}
             doc_entry_meta: List[Dict] = []
+            file_chunks: List[Dict] = []   # one chunk per file, for per-file indexing
+
+            def _make_chunk_native(entry_name: str, content: str, method: str) -> Dict:
+                return {
+                    'content'           : content,
+                    'source_path'       : entry_name,
+                    'file_name'         : Path(entry_name).name,
+                    'file_type'         : Path(entry_name).suffix.lower(),
+                    'chunk_index'       : len(file_chunks),
+                    'archive_name'      : zip_stem,
+                    'extraction_method' : method,
+                }
 
             # ── Document header ───────────────────────────────────────────
             result_lines.append(f"# Archive: {zip_stem}")
@@ -508,6 +733,9 @@ class ZIPExtractor(BaseExtractor):
                                 content, ok = self._read_text_entry(zf, entry_name)
                                 if ok and content:
                                     result_lines.append(f"```{suffix.lstrip('.')}\n{content}\n```")
+                                    file_chunks.append(
+                                        _make_chunk_native(entry_name, content, 'native_text')
+                                    )
                                     logger.info(f"  {'  ' * depth}  ✅ {len(content):,} chars")
                                     doc_entry_meta.append({'name': entry_name, 'type': 'text',
                                                            'chars': len(content), 'method': 'native'})
@@ -525,6 +753,9 @@ class ZIPExtractor(BaseExtractor):
                                 if ok:
                                     img_idx = len(image_data) + 1
                                     image_data[img_idx] = {'name': entry_name, 'success': True}
+                                    file_chunks.append(
+                                        _make_chunk_native(entry_name, img_md, 'vision_llm')
+                                    )
                                     doc_entry_meta.append({'name': entry_name, 'type': 'image',
                                                            'method': 'vision_llm'})
 
@@ -539,6 +770,9 @@ class ZIPExtractor(BaseExtractor):
                                         sub_md = self._delegate_to_sub_extractor(tmp_path, suffix)
                                         if sub_md:
                                             result_lines.append(sub_md)
+                                            file_chunks.append(
+                                                _make_chunk_native(entry_name, sub_md, 'sub_extractor')
+                                            )
                                             doc_entry_meta.append({'name': entry_name, 'type': 'document',
                                                                     'suffix': suffix, 'method': 'sub_extractor'})
                                             logger.info(f"  {'  ' * depth}  ✅ Sub-extractor: {len(sub_md):,} chars")
@@ -590,6 +824,7 @@ class ZIPExtractor(BaseExtractor):
                 'extraction_method':       'native',
                 'folder_aware':            True,
                 'entry_details':           doc_entry_meta,
+                'file_chunks':             file_chunks,
             })
 
             logger.info("✅ Native extraction successful")

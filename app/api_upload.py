@@ -174,6 +174,7 @@ class APISourceInput(BaseModel):
       Authentication    → auth  (discriminated union — see AuthConfig)
       Pagination        → pagination
       JSON Path         → json_path
+      Field Paths       → field_paths  (optional per-entry field projection)
       Request Headers   → headers      (optional extra headers)
       Request Body      → request_body (for POST/PUT/PATCH)
     """
@@ -229,6 +230,14 @@ class APISourceInput(BaseModel):
         ),
         examples=["$.data", "$.results.items"],
     )
+    field_paths: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Optional field paths to keep from each selected JSON entry. "
+            "Examples: ['id', 'title', 'author.name']"
+        ),
+        examples=[["id", "title", "author.name"]],
+    )
 
     # ── Guards ────────────────────────────────────────────────────────────────
     @field_validator("url", mode="before")
@@ -245,6 +254,17 @@ class APISourceInput(BaseModel):
         if self.request_body is not None and self.http_method == HttpMethod.GET:
             raise ValueError("request_body should not be set for GET requests")
         return self
+
+    @field_validator("field_paths", mode="before")
+    @classmethod
+    def _normalise_field_paths(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [part.strip() for part in value.split(",")]
+        if not isinstance(value, list):
+            raise ValueError("field_paths must be a list of strings")
+        return [str(item).strip() for item in value if str(item).strip()]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
