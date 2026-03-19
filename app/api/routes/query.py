@@ -12,10 +12,11 @@ from app.models.schemas import (
 from app.services.vector_store_service import VectorStoreService
 from app.services.llm_service import LLMService
 from app.core.dependencies import get_user_id, get_database_session
+from app.core.config import settings
 from app.core.exceptions import (
     SearchError, LLMGenerationError, RAGException
 )
-from app.db.models import QueryLog, KnowledgeBase
+from app.db.models import QueryLog, KnowledgeBase, FileMetadata, ProcessingStatus
 import time
 import logging
 import uuid
@@ -23,6 +24,7 @@ from datetime import datetime, timedelta
 from typing import Tuple, List, Dict
 from functools import lru_cache
 import hashlib
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -56,14 +58,31 @@ class QueryCache:
         self.cache = {}
         self.ttl = ttl_seconds
     
-    def _make_key(self, user_id: str, kb_id: str, question: str, top_k: int, file_id: str = None) -> str:
+    def _make_key(
+        self,
+        user_id: str,
+        kb_id: str,
+        question: str,
+        top_k: int,
+        file_id: str = None,
+        min_relevance_score: float = None,
+    ) -> str:
         """Generate cache key with KB isolation"""
-        data = f"{user_id}:{kb_id}:{question}:{top_k}:{file_id or 'all'}"
+        score_key = "default" if min_relevance_score is None else f"{min_relevance_score:.3f}"
+        data = f"{user_id}:{kb_id}:{question}:{top_k}:{file_id or 'all'}:{score_key}"
         return hashlib.sha256(data.encode()).hexdigest()
     
-    def get(self, user_id: str, kb_id: str, question: str, top_k: int, file_id: str = None) -> dict:
+    def get(
+        self,
+        user_id: str,
+        kb_id: str,
+        question: str,
+        top_k: int,
+        file_id: str = None,
+        min_relevance_score: float = None,
+    ) -> dict:
         """Get cached result"""
-        key = self._make_key(user_id, kb_id, question, top_k, file_id)
+        key = self._make_key(user_id, kb_id, question, top_k, file_id, min_relevance_score)
         
         if key in self.cache:
             result, timestamp = self.cache[key]
@@ -75,9 +94,18 @@ class QueryCache:
         
         return None
     
-    def set(self, user_id: str, kb_id: str, question: str, top_k: int, result: dict, file_id: str = None):
+    def set(
+        self,
+        user_id: str,
+        kb_id: str,
+        question: str,
+        top_k: int,
+        result: dict,
+        file_id: str = None,
+        min_relevance_score: float = None,
+    ):
         """Cache result"""
-        key = self._make_key(user_id, kb_id, question, top_k, file_id)
+        key = self._make_key(user_id, kb_id, question, top_k, file_id, min_relevance_score)
         self.cache[key] = (result, datetime.utcnow())
     
     def clear_kb(self, kb_id: str):
@@ -114,6 +142,143 @@ def safe_get_score(score: float) -> float:
         return max(0.0, min(1.0, float(score)))
     except (ValueError, TypeError):
         return 0.0
+
+
+def is_greeting_query(question: str) -> bool:
+    """Detect simple greeting-only queries that should not hit retrieval."""
+    normalized = re.sub(r"\s+", " ", (question or "").strip().lower())
+    greeting_patterns = {
+        "hi", "hello", "hey", "hii", "helo", "hola",
+        "good morning", "good afternoon", "good evening",
+        "how are you", "how are you doing", "what's up", "whats up",
+    }
+    return normalized in greeting_patterns
+
+
+def build_fallback_response(
+    question: str,
+    knowledge_base_id: str,
+    conversation_id: str,
+    answer: str,
+    processing_time: float,
+    search_type: SearchType,
+    confidence_score: float,
+) -> Dict:
+    """Return a regular response shape for greeting and no-context cases."""
+    return {
+        "question": question,
+        "answer": answer,
+        "sources": [],
+        "processing_time": round(processing_time, 2),
+        "search_type": search_type,
+        "confidence_score": round(confidence_score, 3),
+        "knowledge_base_id": knowledge_base_id,
+        "conversation_id": conversation_id,
+    }
+
+
+def filter_results_by_relevance(
+    documents: List[str],
+    metadatas: List[Dict],
+    scores: List[float],
+    min_relevance_score: float,
+) -> Tuple[List[str], List[Dict], List[float]]:
+    """Keep only retrieval results that meet the minimum score threshold."""
+    filtered = [
+        (doc, metadata, safe_get_score(score))
+        for doc, metadata, score in zip(documents, metadatas, scores)
+        if safe_get_score(score) >= min_relevance_score
+    ]
+
+    if not filtered:
+        return [], [], []
+
+    docs, metas, filtered_scores = zip(*filtered)
+    return list(docs), list(metas), list(filtered_scores)
+
+
+def extract_query_keywords(question: str) -> List[str]:
+    """Extract simple content-bearing keywords for lexical fallback."""
+    stop_words = {
+        "what", "is", "the", "a", "an", "of", "about", "how", "to", "in",
+        "on", "for", "and", "or", "are", "was", "were", "be", "does", "do",
+        "did", "tell", "me", "please", "can", "you",
+    }
+    words = re.findall(r"\b[a-zA-Z][a-zA-Z0-9_-]{2,}\b", (question or "").lower())
+    return [word for word in words if word not in stop_words]
+
+
+def build_lexical_fallback_sources(
+    db: Session,
+    user_id: str,
+    knowledge_base_id: str,
+    question: str,
+    top_k: int,
+) -> Tuple[List[SourceDocument], str]:
+    """
+    Search markdown files directly when vector retrieval misses.
+    This is a fallback, not a replacement for vector search.
+    """
+    keywords = extract_query_keywords(question)
+    if not keywords:
+        return [], ""
+
+    candidate_files = db.query(FileMetadata).filter(
+        FileMetadata.user_id == user_id,
+        FileMetadata.knowledge_base_id == knowledge_base_id,
+        FileMetadata.status == ProcessingStatus.COMPLETED,
+        FileMetadata.markdown_path.isnot(None),
+    ).all()
+
+    matches: List[Tuple[float, Dict[str, str]]] = []
+    for file_meta in candidate_files:
+        try:
+            with open(file_meta.markdown_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception:
+            continue
+
+        lowered = content.lower()
+        hit_count = sum(lowered.count(keyword) for keyword in keywords)
+        if hit_count <= 0:
+            continue
+
+        best_pos = min(
+            (lowered.find(keyword) for keyword in keywords if lowered.find(keyword) != -1),
+            default=-1,
+        )
+        if best_pos == -1:
+            continue
+
+        snippet_start = max(0, best_pos - 250)
+        snippet_end = min(len(content), best_pos + 750)
+        snippet = content[snippet_start:snippet_end].strip()
+        score = min(0.95, 0.4 + (0.1 * hit_count))
+
+        matches.append((
+            score,
+            {
+                "content": snippet,
+                "filename": file_meta.safe_filename,
+                "file_id": file_meta.file_id,
+                "knowledge_base_id": knowledge_base_id,
+                "chunk_id": f"lexical::{file_meta.file_id}::{best_pos}",
+                "page_number": 0,
+                "chunk_type": "lexical_fallback",
+                "chunk_index": 0,
+            },
+        ))
+
+    if not matches:
+        return [], ""
+
+    matches.sort(key=lambda item: item[0], reverse=True)
+    selected = matches[:top_k]
+
+    documents = [item[1]["content"] for item in selected]
+    metadatas = [item[1] for item in selected]
+    scores = [item[0] for item in selected]
+    return build_source_documents(documents, metadatas, scores, knowledge_base_id)
 
 
 def build_source_documents(
@@ -227,6 +392,13 @@ async def query_knowledge_base(
     start_time = time.time()
     
     try:
+        min_relevance_score = (
+            request.min_relevance_score
+            if request.min_relevance_score is not None
+            else settings.retrieval_min_score
+        )
+        conversation_id = getattr(request, "conversation_id", None) or str(uuid.uuid4())
+
         # CRITICAL: Verify KB ownership
         kb = db.query(KnowledgeBase).filter(
             KnowledgeBase.knowledge_base_id == request.knowledge_base_id,
@@ -250,19 +422,24 @@ async def query_knowledge_base(
             f"user={user_id}, query='{request.question[:50]}...', "
             f"search_type={search_type.value}, top_k={request.top_k}"
         )
-        
-        # Check cache
-        cached_result = query_cache.get(
-            user_id, 
-            request.knowledge_base_id,
-            request.question, 
-            request.top_k,
-            # request.file_id
-        )
-        
-        if cached_result:
-            logger.info("Returning cached result")
-            return QueryResponse(**cached_result)
+
+        if is_greeting_query(request.question):
+            answer = "Hello. How can I help you with the knowledge base?"
+            processing_time = time.time() - start_time
+            response_data = build_fallback_response(
+                question=request.question,
+                knowledge_base_id=request.knowledge_base_id,
+                conversation_id=conversation_id,
+                answer=answer,
+                processing_time=processing_time,
+                search_type=search_type,
+                confidence_score=1.0,
+            )
+            log_query_to_db(
+                db, user_id, request.knowledge_base_id, request.question, answer,
+                request.top_k, 0, processing_time, 1.0, search_type.value, conversation_id
+            )
+            return QueryResponse(**response_data)
         
         # Vector search WITH KB ISOLATION
         try:
@@ -277,12 +454,75 @@ async def query_knowledge_base(
         except Exception as e:
             logger.error(f"Vector search failed: {e}")
             raise SearchError(f"Search failed: {str(e)}")
+
+        documents, metadatas, scores = filter_results_by_relevance(
+            documents,
+            metadatas,
+            scores,
+            min_relevance_score,
+        )
         
         if not documents:
-            raise SearchError(
-                f"No documents found in knowledge base '{kb.knowledge_base_name}'. "
-                f"Please upload and process documents first."
+            sources, context = build_lexical_fallback_sources(
+                db=db,
+                user_id=user_id,
+                knowledge_base_id=request.knowledge_base_id,
+                question=request.question,
+                top_k=request.top_k,
             )
+
+            if sources:
+                try:
+                    answer = get_llm_service().generate_answer(
+                        question=request.question,
+                        context=context,
+                        user_id=user_id,
+                        db=db,
+                        conversation_id=conversation_id,
+                        include_citations=True,
+                        temperature=request.temperature or 0.7
+                    )
+                except Exception as e:
+                    logger.error(f"LLM generation failed on lexical fallback: {e}")
+                    raise LLMGenerationError(f"Failed to generate answer: {str(e)}")
+
+                processing_time = time.time() - start_time
+                response_data = {
+                    "question": request.question,
+                    "answer": answer,
+                    "sources": sources,
+                    "processing_time": round(processing_time, 2),
+                    "search_type": search_type,
+                    "confidence_score": 0.55,
+                    "knowledge_base_id": request.knowledge_base_id,
+                    "conversation_id": conversation_id
+                }
+                log_query_to_db(
+                    db, user_id, request.knowledge_base_id, request.question, answer,
+                    request.top_k, len(sources), processing_time,
+                    0.55, search_type.value, conversation_id
+                )
+                return QueryResponse(**response_data)
+
+            answer = (
+                "I don't have enough information in the knowledge base to answer that. "
+                "Please add relevant documents or ask a question covered by the indexed content."
+            )
+            processing_time = time.time() - start_time
+            response_data = build_fallback_response(
+                question=request.question,
+                knowledge_base_id=request.knowledge_base_id,
+                conversation_id=conversation_id,
+                answer=answer,
+                processing_time=processing_time,
+                search_type=search_type,
+                confidence_score=0.0,
+            )
+            log_query_to_db(
+                db, user_id, request.knowledge_base_id, request.question, answer,
+                request.top_k, 0, processing_time, 0.0, search_type.value, conversation_id
+            )
+            return QueryResponse(**response_data)
         
         # Build context and sources
         sources, context = build_source_documents(
@@ -336,6 +576,7 @@ async def query_knowledge_base(
             request.top_k,
             response_data,
             # request.file_id
+            min_relevance_score=min_relevance_score,
         )
         
         # Log to database
@@ -390,6 +631,13 @@ async def query_with_conversation(
     start_time = time.time()
     
     try:
+        min_relevance_score = (
+            request.min_relevance_score
+            if request.min_relevance_score is not None
+            else settings.retrieval_min_score
+        )
+        conversation_id = request.conversation_id or str(uuid.uuid4())
+
         # Verify KB ownership
         kb = db.query(KnowledgeBase).filter(
             KnowledgeBase.knowledge_base_id == request.knowledge_base_id,
@@ -408,6 +656,7 @@ async def query_with_conversation(
         # Always ensure a conversation_id exists — generate one if not provided
         if not request.conversation_id:
             request.conversation_id = str(uuid.uuid4())
+        request.conversation_id = conversation_id
 
         search_type = request.search_type or SearchType.HYBRID
         
@@ -415,6 +664,24 @@ async def query_with_conversation(
             f"Conversation query: KB='{kb.knowledge_base_name}', "
             f"conv_id={request.conversation_id}, search_type={search_type.value}"
         )
+
+        if is_greeting_query(request.question):
+            answer = "Hello. How can I help you with the knowledge base?"
+            processing_time = time.time() - start_time
+            response_data = build_fallback_response(
+                question=request.question,
+                knowledge_base_id=request.knowledge_base_id,
+                conversation_id=request.conversation_id,
+                answer=answer,
+                processing_time=processing_time,
+                search_type=search_type,
+                confidence_score=1.0,
+            )
+            log_query_to_db(
+                db, user_id, request.knowledge_base_id, request.question, answer,
+                request.top_k, 0, processing_time, 1.0, search_type.value, request.conversation_id
+            )
+            return QueryResponse(**response_data)
         
         # Vector search with KB isolation
         try:
@@ -429,9 +696,75 @@ async def query_with_conversation(
         except Exception as e:
             logger.error(f"Vector search failed: {e}")
             raise SearchError(f"Search failed: {str(e)}")
+
+        documents, metadatas, scores = filter_results_by_relevance(
+            documents,
+            metadatas,
+            scores,
+            min_relevance_score,
+        )
         
         if not documents:
-            raise SearchError(f"No documents found in KB '{kb.knowledge_base_name}'")
+            sources, context = build_lexical_fallback_sources(
+                db=db,
+                user_id=user_id,
+                knowledge_base_id=request.knowledge_base_id,
+                question=request.question,
+                top_k=request.top_k,
+            )
+
+            if sources:
+                try:
+                    answer = get_llm_service().generate_answer(
+                        question=request.question,
+                        context=context,
+                        user_id=user_id,
+                        db=db,
+                        conversation_id=request.conversation_id,
+                        include_citations=True,
+                        temperature=request.temperature or 0.7
+                    )
+                except Exception as e:
+                    logger.error(f"LLM generation failed on lexical fallback: {e}")
+                    raise LLMGenerationError(f"Failed to generate answer: {str(e)}")
+
+                processing_time = time.time() - start_time
+                response_data = {
+                    "question": request.question,
+                    "answer": answer,
+                    "sources": sources,
+                    "processing_time": round(processing_time, 2),
+                    "search_type": search_type,
+                    "confidence_score": 0.55,
+                    "knowledge_base_id": request.knowledge_base_id,
+                    "conversation_id": request.conversation_id
+                }
+                log_query_to_db(
+                    db, user_id, request.knowledge_base_id, request.question, answer,
+                    request.top_k, len(sources), processing_time,
+                    0.55, search_type.value, request.conversation_id
+                )
+                return QueryResponse(**response_data)
+
+            answer = (
+                "I don't have enough information in the knowledge base to answer that. "
+                "Please add relevant documents or ask a question covered by the indexed content."
+            )
+            processing_time = time.time() - start_time
+            response_data = build_fallback_response(
+                question=request.question,
+                knowledge_base_id=request.knowledge_base_id,
+                conversation_id=request.conversation_id,
+                answer=answer,
+                processing_time=processing_time,
+                search_type=search_type,
+                confidence_score=0.0,
+            )
+            log_query_to_db(
+                db, user_id, request.knowledge_base_id, request.question, answer,
+                request.top_k, 0, processing_time, 0.0, search_type.value, request.conversation_id
+            )
+            return QueryResponse(**response_data)
         
         # Build context and sources
         sources, context = build_source_documents(

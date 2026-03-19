@@ -254,6 +254,12 @@ def auto_register_extractors():
     except ImportError as e:
         logger.warning(f"Could not register ZIPExtractor: {e}")
 
+    # JSON Extractor
+    try:
+        from .extractors.json_extractor import JSONExtractor
+        ExtractorFactory.register_extractor(JSONExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register JSONExtractor: {e}")
     
     # Log final status
     supported = ExtractorFactory.get_supported_formats()

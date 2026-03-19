@@ -8,6 +8,9 @@ Strategies:
 3. Semantic     – similarity-guided grouping with structure awareness
 4. Hierarchical – overlapping parent windows → fixed-size child windows
 5. No-chunking  – whole document as one chunk
+6. JSON         – structural-recursive: one parent per JSON entry, children
+                  formed by recursively decomposing the JSON tree (never a
+                  sliding window).  Each child carries a breadcrumb header.
 
 Bugs fixed vs. original
 ────────────────────────
@@ -44,6 +47,7 @@ FIX-8  _is_semantically_similar inner copy compared `>= threshold` where
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 from enum import Enum
@@ -84,6 +88,7 @@ class ChunkingStrategy(str, Enum):
     HIERARCHICAL = "hierarchical"
     SEMANTIC     = "semantic"
     NO_CHUNKING  = "no_chunking"
+    JSON         = "json"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -184,6 +189,19 @@ class EnhancedChunkingService:
         parent_chunk_size:    Optional[int]   = None,
         child_chunk_size:     Optional[int]   = None,
         child_chunk_overlap:  Optional[int]   = None,
+        # ZIP per-file chunking
+        # Pass the `file_chunks` list returned by ZIPExtractor.extract_chunks()
+        # so that each file inside the ZIP is chunked independently.
+        # When provided, every strategy operates on individual files:
+        #   NO_CHUNKING  → exactly 1 chunk per file  (4 files → 4 chunks)
+        #   any other    → strategy applied per file, results concatenated
+        zip_file_chunks:      Optional[List[Dict]] = None,
+        # JSON structural chunking params
+        # Used only when strategy == ChunkingStrategy.JSON.
+        #   json_child_tokens   – max tokens per child chunk  (default: 100)
+        #   json_context_prefix – prepend breadcrumb header to every child
+        json_child_tokens:    Optional[int]  = None,
+        json_context_prefix:  bool           = True,
     ) -> List[Dict[str, Any]]:
         """
         Split *markdown_text* into chunks using *strategy*.
@@ -196,6 +214,13 @@ class EnhancedChunkingService:
             metadata["parent_chunk_id"]  → chunk_id of the owning parent
         Each parent carries:
             metadata["child_chunk_ids"]  → list of its children's chunk_ids
+
+        ZIP behaviour
+        ─────────────
+        When *zip_file_chunks* is supplied (non-empty list of per-file dicts
+        from ZIPExtractor.extract_chunks()), each file inside the archive is
+        chunked independently and the results are combined into a flat list.
+        This guarantees that NO_CHUNKING yields exactly one chunk per file.
         """
         if isinstance(strategy, str):
             try:
@@ -206,12 +231,32 @@ class EnhancedChunkingService:
                 )
                 strategy = ChunkingStrategy.DEFAULT
 
+        if base_metadata is None:
+            base_metadata = {}
+
+        # ── ZIP: per-file chunking ────────────────────────────────────────────
+        if zip_file_chunks:
+            logger.info(
+                f"ZIP mode: chunking {len(zip_file_chunks)} file(s) individually "
+                f"using '{strategy.value}' strategy"
+            )
+            return self._chunk_zip_files(
+                zip_file_chunks=zip_file_chunks,
+                base_metadata=base_metadata,
+                strategy=strategy,
+                max_buffer_size=max_buffer_size,
+                breakpoint_threshold=breakpoint_threshold,
+                parent_chunk_size=parent_chunk_size,
+                child_chunk_size=child_chunk_size,
+                child_chunk_overlap=child_chunk_overlap,
+                json_child_tokens=json_child_tokens,
+                json_context_prefix=json_context_prefix,
+            )
+
+        # ── Normal (non-ZIP) path ─────────────────────────────────────────────
         if not markdown_text or not markdown_text.strip():
             logger.warning("Empty document provided")
             return []
-
-        if base_metadata is None:
-            base_metadata = {}
 
         logger.info(
             f"Chunking document using '{strategy.value}' "
@@ -244,6 +289,14 @@ class EnhancedChunkingService:
         elif strategy == ChunkingStrategy.NO_CHUNKING:
             chunks = self._chunk_no_chunking(markdown_text, base_metadata)
 
+        elif strategy == ChunkingStrategy.JSON:
+            chunks = self._chunk_json(
+                markdown_text,
+                base_metadata,
+                child_tokens=json_child_tokens,
+                context_prefix=json_context_prefix,
+            )
+
         else:
             logger.warning(f"Unknown strategy '{strategy}' – falling back to fixed_size")
             chunks = self._chunk_fixed_size(markdown_text, base_metadata)
@@ -254,6 +307,412 @@ class EnhancedChunkingService:
 
         logger.info(f"✅ Created {len(chunks)} chunk(s) using '{strategy.value}'")
         return chunks
+
+    # ──────────────────────────────────────────────────────────────────────
+    # ZIP per-file dispatcher
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _chunk_zip_files(
+        self,
+        zip_file_chunks:      List[Dict],
+        base_metadata:        Dict,
+        strategy:             ChunkingStrategy,
+        max_buffer_size:      Optional[int]   = None,
+        breakpoint_threshold: Optional[float] = None,
+        parent_chunk_size:    Optional[int]   = None,
+        child_chunk_size:     Optional[int]   = None,
+        child_chunk_overlap:  Optional[int]   = None,
+        json_child_tokens:    Optional[int]   = None,
+        json_context_prefix:  bool            = True,
+    ) -> List[Dict[str, Any]]:
+        """
+        Apply *strategy* independently to each file inside a ZIP archive.
+
+        Each element of *zip_file_chunks* is a dict produced by
+        ZIPExtractor.extract_chunks() and must contain at minimum:
+            'content'           – extracted text / markdown for that file
+            'source_path'       – e.g. "docs/report.pdf"
+            'file_name'         – e.g. "report.pdf"
+            'file_type'         – e.g. ".pdf"
+            'extraction_method' – e.g. "docling"
+            'archive_name'      – ZIP stem
+
+        Every chunk produced here gets extra metadata keys:
+            'zip_source_file'   – source_path of the originating file
+            'zip_file_name'     – file_name of the originating file
+            'zip_archive'       – archive_name
+
+        NO_CHUNKING yields exactly one chunk per file regardless of size.
+        All other strategies apply their normal logic per file.
+        """
+        all_chunks: List[Dict[str, Any]] = []
+        global_chunk_index = 1
+
+        for file_entry in zip_file_chunks:
+            content    = file_entry.get('content', '')
+            source_path = file_entry.get('source_path', '')
+            file_name  = file_entry.get('file_name', '')
+            file_type  = file_entry.get('file_type', '')
+            archive    = file_entry.get('archive_name', '')
+            method     = file_entry.get('extraction_method', '')
+
+            if not content or not content.strip():
+                logger.debug(f"ZIP chunking: skipping empty file '{source_path}'")
+                continue
+
+            # Merge per-file identity into metadata so every chunk knows
+            # which file inside the ZIP it came from.
+            file_metadata = {
+                **base_metadata,
+                'zip_source_file': source_path,
+                'zip_file_name':   file_name,
+                'zip_archive':     archive,
+                'zip_file_type':   file_type,
+                'zip_extraction_method': method,
+            }
+
+            logger.info(
+                f"  ZIP chunk: '{source_path}' "
+                f"({len(content):,} chars, strategy='{strategy.value}')"
+            )
+
+            if strategy == ChunkingStrategy.NO_CHUNKING:
+                file_chunks_out = self._chunk_no_chunking(content, file_metadata)
+
+            elif strategy in (ChunkingStrategy.DEFAULT, ChunkingStrategy.FIXED_SIZE):
+                file_chunks_out = self._chunk_fixed_size(content, file_metadata)
+
+            elif strategy == ChunkingStrategy.HIERARCHICAL:
+                file_chunks_out = self._chunk_hierarchical(
+                    content, file_metadata,
+                    max_parent_tokens=parent_chunk_size,
+                    max_child_tokens=child_chunk_size,
+                    child_overlap_tokens=child_chunk_overlap,
+                )
+
+            elif strategy == ChunkingStrategy.SEMANTIC:
+                file_chunks_out = self._chunk_semantic(
+                    content, file_metadata,
+                    max_buffer_size=max_buffer_size,
+                    breakpoint_threshold=breakpoint_threshold,
+                )
+
+            elif strategy == ChunkingStrategy.JSON:
+                file_chunks_out = self._chunk_json(
+                    content, file_metadata,
+                    child_tokens=json_child_tokens,
+                    context_prefix=json_context_prefix,
+                )
+
+            else:
+                logger.warning(
+                    f"Unknown strategy '{strategy}' for ZIP file '{source_path}' "
+                    f"– falling back to fixed_size"
+                )
+                file_chunks_out = self._chunk_fixed_size(content, file_metadata)
+
+            # Re-index chunk_index values to be globally unique across all files
+            for chunk in file_chunks_out:
+                chunk['metadata']['chunk_index']        = global_chunk_index
+                chunk['metadata']['zip_file_chunk_index'] = chunk['metadata'].get(
+                    'chunk_index', global_chunk_index
+                )
+                global_chunk_index += 1
+
+            all_chunks.extend(file_chunks_out)
+            logger.info(
+                f"  ✅ '{source_path}' → {len(file_chunks_out)} chunk(s)"
+            )
+
+        logger.info(
+            f"✅ ZIP chunking complete: {len(zip_file_chunks)} file(s) → "
+            f"{len(all_chunks)} total chunk(s) using '{strategy.value}'"
+        )
+        return all_chunks
+
+    # ──────────────────────────────────────────────────────────────────────
+    # STRATEGY: JSON  (structural-recursive)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _chunk_json(
+        self,
+        text:           str,
+        base_metadata:  Dict,
+        child_tokens:   Optional[int] = None,
+        context_prefix: bool          = True,
+    ) -> List[Dict[str, Any]]:
+        """
+        JSON structural-recursive chunking.
+
+        Guarantee: exactly ONE parent per JSON entry (the full object).
+        Children are produced by recursively walking the JSON tree —
+        never by sliding a character / token window across serialized text.
+
+        Algorithm per entry
+        ───────────────────
+        1.  The full serialized entry  →  parent chunk
+        2.  Collect top-level key→value pairs (or list elements).
+        3.  For each item:
+              a. item fits (≤ child_tokens)  →  accumulate with siblings.
+              b. accumulated group would overflow  →  flush as one child,
+                 then start a new group.
+              c. item is itself too large  →  flush accumulator, recurse
+                 deeper into the item's sub-keys.
+        4.  Every child is prefixed with a self-describing breadcrumb:
+
+              Action Network > properties > codex
+              ────────────────────────────────────
+              {
+                "categories": ["Sales", "Marketing"],
+                ...
+              }
+
+        Input
+        ─────
+        *text* must be either:
+          • a JSON array    – each element becomes one parent
+          • a JSON object   – treated as a single entry
+          • a JSON string   – serialized version of either of the above
+
+        If *text* cannot be parsed as JSON, falls back to fixed-size chunking.
+        """
+        effective_child_tokens = child_tokens if child_tokens is not None else 100
+
+        # ── Parse ─────────────────────────────────────────────────────────
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            logger.warning(
+                "JSON strategy: input is not valid JSON — "
+                "falling back to fixed_size chunking"
+            )
+            return self._chunk_fixed_size(text, base_metadata)
+
+        # ── Normalise to a flat list of entries ───────────────────────────
+        if isinstance(data, list):
+            entries = data
+        elif isinstance(data, dict):
+            # Check for common envelope keys
+            entries = None
+            for key in ("data", "results", "items", "records",
+                        "entries", "content", "payload", "rows", "list"):
+                val = data.get(key)
+                if isinstance(val, list) and val:
+                    logger.info(f"JSON strategy: envelope key '{key}' detected")
+                    entries = val
+                    break
+            if entries is None:
+                entries = [data]
+        else:
+            entries = [data]
+
+        if not entries:
+            logger.warning("JSON strategy: no entries found in input")
+            return []
+
+        all_chunks: List[Dict[str, Any]] = []
+        parent_index = 1
+
+        for entry in entries:
+            # Derive a human display name for breadcrumbs
+            display_name = self._json_display_name(entry, parent_index)
+
+            # ── Parent: full serialized entry ──────────────────────────────
+            parent_text = json.dumps(entry, indent=2, ensure_ascii=False)
+            if not parent_text.strip():
+                continue
+
+            parent_chunk = self._create_chunk(
+                parent_text,
+                parent_index,
+                base_metadata,
+                chunk_type="parent",
+            )
+
+            # ── Children: recursive structural decomposition ───────────────
+            children: List[Dict[str, Any]] = []
+            child_counter = [parent_index * 10_000]   # mutable via list
+
+            self._json_split_node(
+                node           = entry,
+                path           = [],
+                display_name   = display_name,
+                base_metadata  = base_metadata,
+                children       = children,
+                counter        = child_counter,
+                child_tokens   = effective_child_tokens,
+                context_prefix = context_prefix,
+            )
+
+            # Wire parent ↔ children
+            parent_chunk["metadata"]["child_chunk_ids"] = [
+                c["chunk_id"] for c in children
+            ]
+            for child in children:
+                child["metadata"]["parent_chunk_id"] = parent_chunk["chunk_id"]
+
+            all_chunks.append(parent_chunk)
+            all_chunks.extend(children)
+
+            logger.debug(
+                f"  JSON entry {parent_index} '{display_name}': "
+                f"1 parent + {len(children)} children"
+            )
+            parent_index += 1
+
+        n_parents  = sum(1 for c in all_chunks if c["metadata"].get("chunk_type") == "parent")
+        n_children = len(all_chunks) - n_parents
+        logger.info(
+            f"JSON structural chunking → {n_parents} parent(s) + {n_children} child(ren)  "
+            f"(child_tokens={effective_child_tokens}, "
+            f"context_prefix={context_prefix})"
+        )
+        return all_chunks
+
+    def _json_split_node(
+        self,
+        node:           Any,
+        path:           List[str],
+        display_name:   str,
+        base_metadata:  Dict,
+        children:       List[Dict[str, Any]],
+        counter:        List[int],
+        child_tokens:   int,
+        context_prefix: bool,
+    ) -> None:
+        """
+        Recursively walk a JSON node and emit leaf children.
+
+        Groups consecutive small siblings into one child until adding the
+        next sibling would exceed child_tokens or the sibling is itself
+        too large (in which case we recurse deeper into it).
+        """
+        # Collect items: dict → key/value pairs, list → index/element pairs
+        if isinstance(node, dict):
+            items: List[Tuple[str, Any]] = list(node.items())
+        elif isinstance(node, list):
+            items = [(str(i), v) for i, v in enumerate(node)]
+        else:
+            # Scalar at unexpected depth — emit directly
+            self._json_emit_child(
+                node, path, display_name, base_metadata,
+                children, counter, context_prefix,
+            )
+            return
+
+        if not items:
+            return
+
+        accumulator: List[Tuple[str, Any]] = []
+        acc_tokens = 0
+
+        def flush() -> None:
+            nonlocal acc_tokens
+            if not accumulator:
+                return
+            if len(accumulator) == 1:
+                label, val = accumulator[0]
+                if isinstance(node, dict):
+                    emit_obj  = {label: val}
+                    emit_path = path + [label]
+                else:
+                    emit_obj  = val
+                    emit_path = path
+            else:
+                if isinstance(node, dict):
+                    emit_obj  = {lbl: v for lbl, v in accumulator}
+                else:
+                    emit_obj  = [v for _, v in accumulator]
+                emit_path = path
+            self._json_emit_child(
+                emit_obj, emit_path, display_name, base_metadata,
+                children, counter, context_prefix,
+            )
+            accumulator.clear()
+            acc_tokens = 0
+
+        for label, value in items:
+            serialized   = json.dumps(value, ensure_ascii=False)
+            item_tokens  = self.token_counter.count_tokens(serialized)
+
+            if item_tokens > child_tokens:
+                # Too large for one child — flush current group, recurse deeper
+                flush()
+                self._json_split_node(
+                    node           = value,
+                    path           = path + [str(label)],
+                    display_name   = display_name,
+                    base_metadata  = base_metadata,
+                    children       = children,
+                    counter        = counter,
+                    child_tokens   = child_tokens,
+                    context_prefix = context_prefix,
+                )
+            elif acc_tokens + item_tokens > child_tokens and accumulator:
+                # Adding this would overflow — flush first, then start fresh
+                flush()
+                accumulator.append((str(label), value))
+                acc_tokens = item_tokens
+            else:
+                accumulator.append((str(label), value))
+                acc_tokens += item_tokens
+
+        flush()
+
+    def _json_emit_child(
+        self,
+        obj:            Any,
+        path:           List[str],
+        display_name:   str,
+        base_metadata:  Dict,
+        children:       List[Dict[str, Any]],
+        counter:        List[int],
+        context_prefix: bool,
+    ) -> None:
+        """Serialize obj, optionally prepend breadcrumb, emit as a child chunk."""
+        body = json.dumps(obj, indent=2, ensure_ascii=False)
+        if not body or not body.strip():
+            return
+
+        if context_prefix:
+            breadcrumb = self._json_breadcrumb(display_name, path)
+            if breadcrumb:
+                sep  = "─" * min(len(breadcrumb), 60)
+                body = f"{breadcrumb}\n{sep}\n{body}"
+
+        counter[0] += 1
+        child = self._create_chunk(
+            body,
+            counter[0],
+            base_metadata,
+            chunk_type="child",
+        )
+        child["metadata"]["path"]       = path
+        child["metadata"]["breadcrumb"] = self._json_breadcrumb(display_name, path)
+        children.append(child)
+
+    @staticmethod
+    def _json_breadcrumb(display_name: str, path: List[str]) -> str:
+        """Build a human-readable path like 'Action Network > properties > codex'."""
+        parts = [display_name] if display_name else []
+        parts.extend(str(p) for p in path)
+        return " > ".join(parts)
+
+    @staticmethod
+    def _json_display_name(entry: Any, fallback_index: int) -> str:
+        """Derive a display name from a JSON entry for use in breadcrumbs."""
+        if isinstance(entry, dict):
+            return (
+                (entry.get("properties") or {}).get("displayName")
+                or entry.get("name")
+                or entry.get("title")
+                or entry.get("label")
+                or entry.get("key")
+                or (str(entry.get("id")) if entry.get("id") is not None else None)
+                or (str(entry.get("uuid")) if entry.get("uuid") is not None else None)
+                or f"Entry {fallback_index}"
+            )
+        return f"Entry {fallback_index}"
 
     # ──────────────────────────────────────────────────────────────────────
     # STRATEGY: No-chunking
