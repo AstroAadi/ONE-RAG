@@ -211,6 +211,33 @@ class DatabaseKBRequest(BaseModel):
         return v.strip()
 
 
+class DatabaseKBAddDataRequest(BaseModel):
+    """
+    Request model for PUT /api/upload/database/{kb_id}
+
+    The user provides fresh credentials + a new query each time.
+    Credentials are used in-memory only and are NEVER stored.
+    The new query's rows are APPENDED to the existing KB — nothing is deleted.
+    """
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    database_config: DatabaseConfig = Field(
+        ...,
+        description=(
+            "Connection details and the new query to run. "
+            "Credentials (username/password) are used once and never stored."
+        )
+    )
+    query_label: Optional[str] = Field(
+        default=None,
+        max_length=100,
+        description=(
+            "Optional label for this batch of rows "
+            "(e.g. 'orders_2024'). Auto-generated from timestamp if omitted."
+        )
+    )
+
+
 class APIKBRequest(BaseModel):
     """Request model for creating API knowledge base"""
     knowledge_base_name: str = Field(..., min_length=1, max_length=255)

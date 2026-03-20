@@ -19,7 +19,7 @@ import uuid
 from app.services.data_sources.database_connector import DatabaseConnectorFactory
 from app.services.embedding_service import BedrockEmbeddingService
 from app.services.splade_service import GPUSPLADEEmbedder
-from app.services.vector_store_service import VectorStoreService
+from app.services.vector_store_service import VectorStoreService, string_to_uuid
 
 logger = logging.getLogger(__name__)
 
@@ -29,10 +29,11 @@ class DatabaseSyncService:
 
     def __init__(self):
         self.embedding_service = BedrockEmbeddingService()
-        # Reuse the same VectorStoreService instance (and therefore the same
-        # already-initialised Qdrant client) rather than spinning up a new one.
         self.vector_store = VectorStoreService()
 
+    # ---------------------------------------------------------------------- #
+    # Public: full replace sync (used by POST /database and POST /sync)      #
+    # ---------------------------------------------------------------------- #
     async def sync_database_kb(
         self,
         knowledge_base_id: str,
@@ -41,40 +42,93 @@ class DatabaseSyncService:
         db_session,
     ) -> Tuple[bool, str, Dict[str, Any]]:
         """
-        Sync data from the user's database into the shared vector collection.
+        Full-replace sync: connect → run query → embed rows → upsert into
+        the shared collection, replacing all previously indexed rows for
+        this KB (via deterministic UUIDs, existing rows are overwritten).
+        KB stats are reset to reflect only this query's rows.
+        """
+        return await self._run_query_and_index(
+            knowledge_base_id=knowledge_base_id,
+            user_id=user_id,
+            database_config=database_config,
+            query_label="sync",
+            append=False,
+            db_session=db_session,
+        )
 
-        Each row is stored as a PointStruct with BOTH dense and sparse vectors
-        so it is schema-compatible with file-based chunks already in the
-        collection.  Using only dense would cause _initialize_collection() to
-        detect a schema mismatch on the next request and wipe the collection.
+    # ---------------------------------------------------------------------- #
+    # Public: append sync (used by PUT /database/{kb_id})                    #
+    # ---------------------------------------------------------------------- #
+    async def append_query_to_kb(
+        self,
+        knowledge_base_id: str,
+        user_id: str,
+        database_config: Dict[str, Any],
+        query_label: str,
+        db_session,
+    ) -> Tuple[bool, str, Dict[str, Any]]:
+        """
+        Append sync: connect → run query → embed rows → upsert into the
+        shared collection WITHOUT deleting existing rows.
 
-        Returns:
-            (success, message, metadata_dict)
+        Chunk IDs incorporate query_label so rows from different queries
+        never collide even if row indices overlap.
+        KB stats are incremented by the new row count.
+        """
+        return await self._run_query_and_index(
+            knowledge_base_id=knowledge_base_id,
+            user_id=user_id,
+            database_config=database_config,
+            query_label=query_label,
+            append=True,
+            db_session=db_session,
+        )
+
+    # ---------------------------------------------------------------------- #
+    # Internal: shared implementation                                         #
+    # ---------------------------------------------------------------------- #
+    async def _run_query_and_index(
+        self,
+        knowledge_base_id: str,
+        user_id: str,
+        database_config: Dict[str, Any],
+        query_label: str,
+        append: bool,
+        db_session,
+    ) -> Tuple[bool, str, Dict[str, Any]]:
+        """
+        Core logic shared by both sync modes.
+
+        append=False → chunk count is reset (full replace semantics)
+        append=True  → chunk count is incremented (additive semantics)
         """
         try:
             from app.db.models import KnowledgeBase
             from qdrant_client.models import PointStruct
 
-            logger.info(f"Starting database sync for KB: {knowledge_base_id}")
+            logger.info(
+                f"{'Appending' if append else 'Syncing'} KB {knowledge_base_id} "
+                f"label='{query_label}'"
+            )
 
-            # -------------------------------------------------------------- #
-            # 1. Normalise db_type                                           #
-            # -------------------------------------------------------------- #
+            # ---------------------------------------------------------------- #
+            # 1. Normalise db_type                                             #
+            # ---------------------------------------------------------------- #
             db_type_raw = database_config.get('db_type', '')
             db_type = db_type_raw.value if hasattr(db_type_raw, 'value') else str(db_type_raw)
             db_type = db_type.lower()
 
-            # -------------------------------------------------------------- #
-            # 2. Connect to the user's database                              #
-            # -------------------------------------------------------------- #
+            # ---------------------------------------------------------------- #
+            # 2. Connect to user's database                                    #
+            # ---------------------------------------------------------------- #
             connector = DatabaseConnectorFactory.get_connector(db_type, database_config)
             if not connector.connect():
                 return False, f"Failed to connect to {db_type} database", {}
             logger.info(f"✓ Connected to {db_type} database")
 
-            # -------------------------------------------------------------- #
-            # 3. Execute the user-supplied query                             #
-            # -------------------------------------------------------------- #
+            # ---------------------------------------------------------------- #
+            # 3. Execute query                                                  #
+            # ---------------------------------------------------------------- #
             query = database_config.get('query', '')
             if not query:
                 connector.disconnect()
@@ -91,9 +145,9 @@ class DatabaseSyncService:
             row_count = len(result_df)
             logger.info(f"✓ Query returned {row_count} rows")
 
-            # -------------------------------------------------------------- #
-            # 4. Convert rows to text and build text list for batch embed    #
-            # -------------------------------------------------------------- #
+            # ---------------------------------------------------------------- #
+            # 4. Build text list for batch embedding                           #
+            # ---------------------------------------------------------------- #
             row_texts: List[str] = []
             row_meta: List[Dict[str, Any]] = []
 
@@ -101,10 +155,15 @@ class DatabaseSyncService:
                 try:
                     row_json = self._clean_json(row.to_dict())
                     text_content = self._row_to_text(row_json)
+
+                    # Chunk ID is deterministic and scoped to (kb, label, row_index)
+                    # so rows from different query_labels never overwrite each other
+                    # but re-running the same label+query does upsert (idempotent).
                     chunk_id = str(uuid.uuid5(
                         uuid.NAMESPACE_URL,
-                        f"{knowledge_base_id}/{db_type}/row/{idx}",
+                        f"{knowledge_base_id}/{query_label}/row/{idx}",
                     ))
+
                     row_texts.append(text_content)
                     row_meta.append({
                         'chunk_id': chunk_id,
@@ -119,14 +178,10 @@ class DatabaseSyncService:
             if not row_texts:
                 return False, "No rows were successfully prepared", {}
 
-            # -------------------------------------------------------------- #
-            # 5. Generate dense + sparse embeddings (batch)                  #
-            # FIX: rows must carry BOTH vectors so the collection schema     #
-            # stays consistent with file-based chunks.  Dense-only points    #
-            # caused _initialize_collection() to detect a mismatch on the   #
-            # next request and delete the entire collection.                 #
-            # -------------------------------------------------------------- #
-            max_len = 2048  # safe truncation before embedding
+            # ---------------------------------------------------------------- #
+            # 5. Generate dense + sparse embeddings (batch)                    #
+            # ---------------------------------------------------------------- #
+            max_len = 2048
             truncated = [t[:max_len] for t in row_texts]
 
             logger.info(f"Generating dense embeddings for {len(truncated)} rows...")
@@ -136,18 +191,15 @@ class DatabaseSyncService:
             if sparse_embedder is None:
                 return False, (
                     "SPLADE sparse embeddings are not available. "
-                    "Cannot store database rows without sparse vectors — "
-                    "they would be incompatible with the collection schema."
+                    "Cannot store rows without sparse vectors."
                 ), {}
 
             logger.info(f"Generating sparse embeddings for {len(truncated)} rows...")
             sparse_vectors = sparse_embedder.embed_documents(truncated)
 
-            # -------------------------------------------------------------- #
-            # 6. Build PointStructs                                          #
-            # -------------------------------------------------------------- #
-            from app.services.vector_store_service import string_to_uuid
-
+            # ---------------------------------------------------------------- #
+            # 6. Build PointStructs                                            #
+            # ---------------------------------------------------------------- #
             qdrant_points: List[PointStruct] = []
             for i, meta in enumerate(row_meta):
                 payload = {
@@ -163,6 +215,7 @@ class DatabaseSyncService:
                     'page_number': 0,
                     'source_type': 'database',
                     'database_type': db_type,
+                    'query_label': query_label,
                     'row_index': meta['row_index'],
                     'row_data': meta['row_json'],
                     'synced_at': datetime.utcnow().isoformat(),
@@ -176,9 +229,9 @@ class DatabaseSyncService:
                     )
                 )
 
-            # -------------------------------------------------------------- #
-            # 7. Upsert into the shared collection in batches                #
-            # -------------------------------------------------------------- #
+            # ---------------------------------------------------------------- #
+            # 7. Upsert into shared collection                                 #
+            # ---------------------------------------------------------------- #
             collection_name = self.vector_store.collection_name
             try:
                 batch_size = 100
@@ -194,32 +247,44 @@ class DatabaseSyncService:
                 logger.error(f"Vector DB upsert failed: {vec_err}")
                 return False, f"Failed to store in vector database: {vec_err}", {}
 
-            # -------------------------------------------------------------- #
-            # 8. Update KB stats                                             #
-            # -------------------------------------------------------------- #
+            # ---------------------------------------------------------------- #
+            # 8. Update KB stats                                               #
+            # ---------------------------------------------------------------- #
             kb = db_session.query(KnowledgeBase).filter(
                 KnowledgeBase.knowledge_base_id == knowledge_base_id
             ).first()
+
             if kb:
-                kb.total_chunks = len(qdrant_points)
-                kb.document_count = 1
+                if append:
+                    # Accumulate: add new rows on top of existing count
+                    kb.total_chunks = (kb.total_chunks or 0) + len(qdrant_points)
+                    kb.document_count = (kb.document_count or 0) + 1
+                else:
+                    # Full replace: reflect only this sync's rows
+                    kb.total_chunks = len(qdrant_points)
+                    kb.document_count = 1
                 kb.last_sync_at = datetime.utcnow()
                 kb.updated_at = datetime.utcnow()
                 db_session.commit()
 
-            logger.info("✓ Updated KB stats")
+            logger.info(f"✓ Updated KB stats (append={append})")
 
             metadata = {
                 'rows_retrieved': row_count,
                 'rows_embedded': len(qdrant_points),
                 'columns': list(result_df.columns),
                 'collection_name': collection_name,
-                'chunks_created': len(qdrant_points),
+                # Naming differs slightly so callers can read either key
+                'chunks_created': len(qdrant_points),   # for sync callers
+                'chunks_added': len(qdrant_points),      # for append callers
+                'total_chunks_in_kb': kb.total_chunks if kb else len(qdrant_points),
             }
+
+            action = "appended to" if append else "synced into"
             return (
                 True,
-                f"Successfully synced {len(qdrant_points)} rows from "
-                f"{db_type} database into '{collection_name}'",
+                f"Successfully {action} '{collection_name}': "
+                f"{len(qdrant_points)} rows from {db_type} (label='{query_label}')",
                 metadata,
             )
 
