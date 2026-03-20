@@ -16,3 +16,5 @@ logs/
 rag_system.db
 tejas_code.py
 venv/
+docs/
+model_test.py

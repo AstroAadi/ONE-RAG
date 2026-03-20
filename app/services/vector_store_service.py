@@ -117,6 +117,9 @@ class VectorStoreService:
             embedding_model_id: Optional AWS Bedrock embedding model ID.
                               If not provided, uses default from settings.
         """
+        self._initialized = False
+        self._init_error = None
+
         try:
             self.client = QdrantClient(
                 url=settings.qdrant_url,
@@ -189,20 +192,31 @@ class VectorStoreService:
                     "sparse": SparseVectorParams(index=SparseIndexParams())
                 }
             
-            try:
-                # Try to get existing collection
+            # FIX: Previously used get_collection() inside a try/except to detect
+            # existence, then accessed col.config.sparse_vectors_config directly.
+            # That attribute does not exist on all qdrant-client versions and raised:
+            #   AttributeError: 'CollectionConfig' object has no attribute 'sparse_vectors_config'
+            # which fell into the except block and tried create_collection() again,
+            # producing a 409 Conflict error.
+            #
+            # Fix: use get_collections() to check existence first (no exception),
+            # then probe sparse_vectors_config safely with getattr(..., None).
+            existing_collections = [c.name for c in self.client.get_collections().collections]
+            collection_exists = self.collection_name in existing_collections
+
+            if collection_exists:
                 col = self.client.get_collection(self.collection_name)
-                
-                # Check if it has sparse when we need it
-                has_sparse_field = col.config.sparse_vectors_config is not None and 'sparse' in col.config.sparse_vectors_config
+                # getattr guards against AttributeError on older qdrant-client builds
+                sparse_cfg = getattr(col.config, 'sparse_vectors_config', None)
+                has_sparse_field = sparse_cfg is not None and 'sparse' in sparse_cfg
                 needs_sparse = self.sparse_embeddings is not None
-                
+
                 if needs_sparse and not has_sparse_field:
-                    logger.warning(f"⚠️  Collection '{self.collection_name}' exists but lacks sparse vectors")
-                    logger.info(f"Deleting collection to recreate with both dense + sparse...")
+                    logger.warning(
+                        f"⚠️  Collection '{self.collection_name}' exists but lacks sparse vectors. "
+                        f"Recreating with dense + sparse support..."
+                    )
                     self.client.delete_collection(self.collection_name)
-                    
-                    # Create fresh collection with sparse
                     self.client.create_collection(
                         collection_name=self.collection_name,
                         vectors_config=vectors_config,
@@ -211,11 +225,10 @@ class VectorStoreService:
                     self._create_payload_indexes()
                     logger.info(f"✅ Recreated collection '{self.collection_name}' with sparse support")
                 else:
-                    logger.info(f"✓ Collection '{self.collection_name}' has correct schema")
-                    
-            except Exception as col_error:
-                # Collection doesn't exist, create it
-                logger.debug(f"Collection doesn't exist ({str(col_error)}), creating new")
+                    # Collection already has the right schema — nothing to do
+                    logger.info(f"✓ Collection '{self.collection_name}' already exists with correct schema")
+            else:
+                # First run — create the collection fresh
                 self.client.create_collection(
                     collection_name=self.collection_name,
                     vectors_config=vectors_config,
@@ -293,6 +306,59 @@ class VectorStoreService:
         
         self.embedding_cache.set(text, embedding, embedding_type)
         return embedding
+
+    def create_collection_if_not_exists(self, collection_name: str):
+        """
+        Ensure a named collection exists in Qdrant.
+        Used by DatabaseSyncService to create per-KB collections.
+        Creates with dense-only vectors (no sparse) since database rows
+        are indexed with a single dense embedding per row.
+        """
+        try:
+            existing = [c.name for c in self.client.get_collections().collections]
+            if collection_name in existing:
+                logger.debug(f"Collection '{collection_name}' already exists")
+                return
+
+            dense_dim = self.dense_embeddings.get_embedding_dimension()
+            self.client.create_collection(
+                collection_name=collection_name,
+                vectors_config=VectorParams(size=dense_dim, distance=Distance.COSINE)
+            )
+            # Basic payload indexes for filtering
+            for field in ("knowledge_base_id", "user_id", "source_type"):
+                try:
+                    self.client.create_payload_index(
+                        collection_name=collection_name,
+                        field_name=field,
+                        field_schema="keyword"
+                    )
+                except Exception:
+                    pass
+            logger.info(f"✅ Created collection '{collection_name}'")
+        except Exception as e:
+            logger.error(f"Failed to create collection '{collection_name}': {e}")
+            raise VectorStoreException(f"Failed to create collection: {str(e)}")
+
+    def upsert_points(self, collection_name: str, points: List[Dict[str, Any]]):
+        """
+        Upsert a list of point dicts into the named collection.
+        Each dict must have: id (UUID str), vector (List[float]), payload (dict).
+        Used by DatabaseSyncService.
+        """
+        try:
+            qdrant_points = [
+                PointStruct(
+                    id=p['id'],
+                    vector=p['vector'],
+                    payload=p['payload']
+                )
+                for p in points
+            ]
+            self.client.upsert(collection_name=collection_name, points=qdrant_points)
+        except Exception as e:
+            logger.error(f"Upsert failed for collection '{collection_name}': {e}")
+            raise VectorStoreException(f"Upsert failed: {str(e)}")
     
     def add_document_chunks(
         self,
@@ -560,18 +626,6 @@ class VectorStoreService:
         """
         Post-process raw search results to handle a KB whose files were indexed
         with different chunking strategies.
-
-        Rules:
-          - chunk_type in (text, semantic, semantic_merged, full_document)
-                → pass through unchanged (fixed-size / semantic / no-chunking files)
-          - chunk_type == 'child'
-                → collect parent_chunk_id; inherit the highest child score seen
-          - chunk_type == 'parent'
-                → discard from raw results (will be fetched by ID via child promotion)
-
-        After collecting all unique parent IDs, fetch their payloads in one
-        batch retrieve() call, then merge + deduplicate + re-rank everything
-        by score before returning the final top_k results.
         """
         regular: List[Tuple[str, Dict, float]] = []
         parent_id_to_best_score: Dict[str, float] = {}
@@ -582,26 +636,19 @@ class VectorStoreService:
             if chunk_type == 'child':
                 parent_id = meta.get('parent_chunk_id')
                 if parent_id:
-                    # Track the highest relevance score pointing at this parent
                     if parent_id not in parent_id_to_best_score or score > parent_id_to_best_score[parent_id]:
                         parent_id_to_best_score[parent_id] = score
                 else:
-                    # Orphan child (no parent_chunk_id stored) — surface as-is
                     regular.append((doc, meta, score))
 
             elif chunk_type == 'parent':
-                # Skip raw parent hits; they will be fetched cleanly via child promotion.
-                # If somehow a parent surfaced with no children in this result set,
-                # still include it so we don't silently lose relevant content.
                 parent_id = meta.get('chunk_id')
                 if parent_id and parent_id not in parent_id_to_best_score:
                     parent_id_to_best_score[parent_id] = score
 
             else:
-                # text / semantic / semantic_merged / full_document
                 regular.append((doc, meta, score))
 
-        # ── Batch-fetch all needed parent chunks from Qdrant ─────────────
         promoted: List[Tuple[str, Dict, float]] = []
         if parent_id_to_best_score:
             parent_uuids = [string_to_uuid(pid) for pid in parent_id_to_best_score]
@@ -621,20 +668,12 @@ class VectorStoreService:
                         {k: v for k, v in payload.items() if k != 'text'},
                         best_score
                     ))
-                logger.debug(
-                    f"Hierarchical resolution: promoted {len(promoted)} parent(s) "
-                    f"from {len(parent_id_to_best_score)} child reference(s)"
-                )
             except Exception as e:
-                logger.warning(
-                    f"Parent batch-fetch failed — falling back to raw child text. Error: {e}"
-                )
-                # Graceful degradation: re-add the child results we had dropped
+                logger.warning(f"Parent batch-fetch failed: {e}")
                 for doc, meta, score in zip(documents, metadatas, scores):
                     if meta.get('chunk_type') == 'child':
                         regular.append((doc, meta, score))
 
-        # ── Merge, deduplicate by chunk_id, sort by score, take top_k ────
         all_results = regular + promoted
         seen_ids: set = set()
         deduped: List[Tuple[str, Dict, float]] = []
@@ -650,10 +689,7 @@ class VectorStoreService:
         if not deduped:
             return [], [], []
 
-        docs_out   = [r[0] for r in deduped]
-        metas_out  = [r[1] for r in deduped]
-        scores_out = [r[2] for r in deduped]
-        return docs_out, metas_out, scores_out
+        return [r[0] for r in deduped], [r[1] for r in deduped], [r[2] for r in deduped]
 
     def _reciprocal_rank_fusion(
         self,
@@ -667,35 +703,21 @@ class VectorStoreService:
         for rank, (doc, meta, score) in enumerate(dense_results, start=1):
             chunk_id = meta.get('chunk_id', '')
             if chunk_id not in rrf_scores:
-                rrf_scores[chunk_id] = {
-                    'doc': doc,
-                    'meta': meta,
-                    'rrf_score': 0.0
-                }
+                rrf_scores[chunk_id] = {'doc': doc, 'meta': meta, 'rrf_score': 0.0}
             rrf_scores[chunk_id]['rrf_score'] += 1.0 / (k + rank)
         
         for rank, (doc, meta, score) in enumerate(sparse_results, start=1):
             chunk_id = meta.get('chunk_id', '')
             if chunk_id not in rrf_scores:
-                rrf_scores[chunk_id] = {
-                    'doc': doc,
-                    'meta': meta,
-                    'rrf_score': 0.0
-                }
+                rrf_scores[chunk_id] = {'doc': doc, 'meta': meta, 'rrf_score': 0.0}
             rrf_scores[chunk_id]['rrf_score'] += 1.0 / (k + rank)
         
-        sorted_results = sorted(
-            rrf_scores.values(),
-            key=lambda x: x['rrf_score'],
-            reverse=True
-        )
+        sorted_results = sorted(rrf_scores.values(), key=lambda x: x['rrf_score'], reverse=True)
         
-        fused = []
-        for item in sorted_results:
-            normalized_score = min(item['rrf_score'] / 0.05, 1.0)
-            fused.append((item['doc'], item['meta'], normalized_score))
-        
-        return fused
+        return [
+            (item['doc'], item['meta'], min(item['rrf_score'] / 0.05, 1.0))
+            for item in sorted_results
+        ]
     
     def search(
         self,
@@ -713,8 +735,6 @@ class VectorStoreService:
         Sparse: HuggingFace SPLADE
         """
         try:
-            # Fetch extra candidates so that after child→parent promotion and
-            # deduplication we still end up with at least top_k final results.
             fetch_k = top_k * 3
 
             if search_type == "dense":
@@ -726,13 +746,10 @@ class VectorStoreService:
             
             documents, metadatas, scores = results
 
-            # Resolve mixed chunk types (hierarchical child→parent promotion,
-            # pass-through for fixed-size / semantic / no-chunking chunks).
             documents, metadatas, scores = self._resolve_hierarchical_chunks(
                 documents, metadatas, scores, top_k
             )
             
-            # Ensure metadata completeness
             for meta in metadatas:
                 if 'chunk_id' not in meta:
                     meta['chunk_id'] = 'unknown'
@@ -752,7 +769,7 @@ class VectorStoreService:
             logger.error(f"Search error: {e}", exc_info=True)
             raise SearchError(f"Search failed: {str(e)}")
     
-    # ==================== OTHER METHODS (unchanged from original) ====================
+    # ==================== OTHER METHODS ====================
     
     def get_chunk_by_id(
         self,
@@ -776,12 +793,10 @@ class VectorStoreService:
             
             payload = points[0].payload
             
-            # Verify user ownership
             if payload.get('user_id') != user_id:
                 logger.warning(f"Access denied: chunk {chunk_id} belongs to different user")
                 return None
             
-            # Verify KB ownership if provided
             if knowledge_base_id and payload.get('knowledge_base_id') != knowledge_base_id:
                 logger.warning(f"Access denied: chunk {chunk_id} belongs to different KB")
                 return None
@@ -831,17 +846,13 @@ class VectorStoreService:
             
             truncated_text = new_text[:settings.embedding_max_length] if len(new_text) > settings.embedding_max_length else new_text
             
-            # Generate new embeddings
             dense_vector = self._get_cached_embedding(truncated_text, 'dense')
             
             if not self.sparse_embeddings:
-                raise VectorStoreException(
-                    "SPLADE (sparse embeddings) is not available for chunk updates."
-                )
+                raise VectorStoreException("SPLADE (sparse embeddings) is not available for chunk updates.")
             
             sparse_vector = self._get_cached_embedding(truncated_text, 'sparse')
             
-            # Prepare payload
             if preserve_metadata:
                 updated_payload = existing['metadata'].copy()
                 updated_payload.update({
@@ -880,7 +891,6 @@ class VectorStoreService:
             )
             
             logger.info(f"✓ Updated chunk: {chunk_id} in KB {knowledge_base_id}")
-            
             return True
             
         except VectorStoreException:
@@ -922,7 +932,6 @@ class VectorStoreService:
             self.client.delete(collection_name=self.collection_name, points_selector=point_ids)
             
             logger.info(f"Deleted {len(point_ids)} chunks for file {file_id} in KB {knowledge_base_id}")
-            
             return True
             
         except Exception as e:
@@ -960,7 +969,6 @@ class VectorStoreService:
             self.client.delete(collection_name=self.collection_name, points_selector=point_ids)
             
             logger.info(f"Deleted {len(point_ids)} chunks for KB {knowledge_base_id}")
-            
             return len(point_ids)
             
         except Exception as e:
@@ -974,7 +982,6 @@ class VectorStoreService:
     ) -> Dict[str, Any]:
         """Get collection statistics with optional KB filter"""
         try:
-            query_filter = None
             must_conditions = []
             
             if user_id:
@@ -983,8 +990,7 @@ class VectorStoreService:
             if knowledge_base_id:
                 must_conditions.append(FieldCondition(key="knowledge_base_id", match=MatchValue(value=knowledge_base_id)))
             
-            if must_conditions:
-                query_filter = Filter(must=must_conditions)
+            query_filter = Filter(must=must_conditions) if must_conditions else None
             
             all_points = []
             offset = None

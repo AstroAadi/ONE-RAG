@@ -6,7 +6,7 @@ No granular tracking - keeps it simple!
 
 from sqlalchemy import (
     Column, String, Integer, DateTime, Boolean, Float, Text, ForeignKey, Enum,
-    Index, UniqueConstraint
+    Index, UniqueConstraint, JSON
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
@@ -43,10 +43,33 @@ class ChunkingStrategyEnum(str, enum.Enum):
     NO_CHUNKING = "no_chunking"
 
 
+class DataSourceType(str, enum.Enum):
+    """Data source types"""
+    FILE_UPLOAD = "file_upload"
+    DATABASE = "database"
+    API = "api"
+    CLOUD_STORAGE = "cloud_storage"
+
+
+class DatabaseType(str, enum.Enum):
+    """Supported database types"""
+    MYSQL = "mysql"
+    POSTGRESQL = "postgresql"
+    MSSQL = "mssql"
+    MONGODB = "mongodb"
+
+
+class CloudStorageProvider(str, enum.Enum):
+    """Supported cloud storage providers"""
+    AWS_S3 = "aws_s3"
+    AZURE_BLOB = "azure_blob"
+    GOOGLE_CLOUD = "google_cloud"
+
+
 # ==================== KNOWLEDGE BASE MODEL ====================
 
 class KnowledgeBase(Base):
-    """Knowledge Base Model - Multi-tenant Isolation"""
+    """Knowledge Base Model - Multi-tenant Isolation with Multi-Source Support"""
     __tablename__ = "knowledge_bases"
     
     # Primary identifiers
@@ -57,6 +80,18 @@ class KnowledgeBase(Base):
     knowledge_base_name = Column(String(255), nullable=False)
     knowledge_base_name_normalized = Column(String(255), nullable=False, index=True)
     description = Column(Text, nullable=True)
+    
+    # Data source configuration (NEW)
+    data_source_type = Column(
+        Enum(DataSourceType),
+        nullable=False,
+        default=DataSourceType.FILE_UPLOAD,
+        index=True
+    )
+    data_source_config = Column(JSON, nullable=True)  # Encrypted connection details
+    last_sync_at = Column(DateTime, nullable=True)
+    auto_sync_enabled = Column(Boolean, default=False, nullable=False)
+    sync_interval_hours = Column(Integer, nullable=True)
     
     # Statistics
     document_count = Column(Integer, default=0, nullable=False)
@@ -80,10 +115,11 @@ class KnowledgeBase(Base):
     __table_args__ = (
         UniqueConstraint('user_id', 'knowledge_base_name_normalized', name='uix_user_kb_name'),
         Index('idx_user_kb', 'user_id', 'knowledge_base_id'),
+        Index('idx_data_source_type', 'data_source_type'),
     )
     
     def __repr__(self) -> str:
-        return f"<KnowledgeBase(id={self.knowledge_base_id}, user={self.user_id}, name={self.knowledge_base_name})>"
+        return f"<KnowledgeBase(id={self.knowledge_base_id}, user={self.user_id}, name={self.knowledge_base_name}, source={self.data_source_type.value if self.data_source_type else 'file_upload'})>"
     
     def to_dict(self) -> dict:
         """Convert to dictionary"""
@@ -92,6 +128,10 @@ class KnowledgeBase(Base):
             "user_id": self.user_id,
             "knowledge_base_name": self.knowledge_base_name,
             "description": self.description,
+            "data_source_type": self.data_source_type.value if self.data_source_type else "file_upload",
+            "last_sync_at": self.last_sync_at.isoformat() if self.last_sync_at else None,
+            "auto_sync_enabled": self.auto_sync_enabled,
+            "sync_interval_hours": self.sync_interval_hours,
             "document_count": self.document_count,
             "total_chunks": self.total_chunks,
             "total_size_bytes": self.total_size_bytes,

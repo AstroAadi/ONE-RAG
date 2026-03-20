@@ -7,7 +7,6 @@ Extraction → completed (no chunking/indexing in upload flow)
 from typing import Optional
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Query, Form
 from sqlalchemy.orm import Session
-from sqlalchemy import func
 from pathlib import Path
 import uuid
 import shutil
@@ -30,7 +29,8 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/upload", tags=["Upload"])
 
 
-@router.post("/", response_model=FileUploadResponse)
+
+@router.post("/file-upload", response_model=FileUploadResponse)
 async def upload_file(
     file: UploadFile = File(...),
     knowledge_base_name: str = Form(...),
