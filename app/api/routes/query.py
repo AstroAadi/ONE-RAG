@@ -177,24 +177,133 @@ def build_fallback_response(
     }
 
 
+def extract_query_identifiers(question: str) -> List[str]:
+    """Extract exact identifiers such as bk-110, wh-001-east, UUID-like tokens."""
+    candidates = re.findall(r"\b[a-zA-Z0-9]+(?:[-_:][a-zA-Z0-9]+)+\b", (question or "").lower())
+    identifiers = []
+    for token in candidates:
+        if any(ch.isdigit() for ch in token):
+            identifiers.append(token)
+    return list(dict.fromkeys(identifiers))
+
+
+def extract_query_phrases(question: str) -> List[str]:
+    """Extract likely exact title/name phrases from the user's question."""
+    question = question or ""
+    phrases: List[str] = []
+
+    # Quoted phrases are the strongest signal.
+    for match in re.finditer(r'"([^"]{2,})"|\'([^\']{2,})\'', question):
+        phrase = next((group for group in match.groups() if group), "").strip()
+        if len(phrase.split()) >= 2:
+            phrases.append(phrase.lower())
+
+    # Also capture title-cased runs such as "The Glass Castle".
+    tokens = re.findall(r"[A-Za-z0-9'*_-]+", question)
+    connectors = {"of", "the", "and", "a", "an", "in", "to", "for", "with", "on", "at"}
+
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if not token or not token[0].isupper():
+            i += 1
+            continue
+
+        phrase_tokens = [token]
+        uppercase_count = 1
+        j = i + 1
+        while j < len(tokens):
+            candidate = tokens[j]
+            if candidate and candidate[0].isupper():
+                phrase_tokens.append(candidate)
+                uppercase_count += 1
+                j += 1
+                continue
+
+            lower_candidate = candidate.lower()
+            if (
+                lower_candidate in connectors and
+                j + 1 < len(tokens) and
+                tokens[j + 1] and
+                tokens[j + 1][0].isupper()
+            ):
+                phrase_tokens.append(candidate)
+                j += 1
+                continue
+
+            break
+
+        if uppercase_count >= 2:
+            while phrase_tokens and phrase_tokens[-1].lower() in connectors:
+                phrase_tokens.pop()
+            if phrase_tokens:
+                phrases.append(" ".join(phrase_tokens).lower())
+
+        i = max(j, i + 1)
+
+    return list(dict.fromkeys(phrases))
+
+
+def _metadata_text(metadata: Dict) -> str:
+    """Flatten simple metadata values for exact-match checks."""
+    parts: List[str] = []
+    for value in (metadata or {}).values():
+        if isinstance(value, (str, int, float, bool)):
+            parts.append(str(value))
+        elif isinstance(value, list):
+            parts.extend(str(item) for item in value if isinstance(item, (str, int, float, bool)))
+    return " ".join(parts).lower()
+
+
 def filter_results_by_relevance(
     documents: List[str],
     metadatas: List[Dict],
     scores: List[float],
     min_relevance_score: float,
+    question: str = "",
 ) -> Tuple[List[str], List[Dict], List[float]]:
-    """Keep only retrieval results that meet the minimum score threshold."""
+    """Keep only strong results, but rescue exact matches when present."""
     filtered = [
         (doc, metadata, safe_get_score(score))
         for doc, metadata, score in zip(documents, metadatas, scores)
         if safe_get_score(score) >= min_relevance_score
     ]
 
-    if not filtered:
+    if filtered:
+        docs, metas, filtered_scores = zip(*filtered)
+        return list(docs), list(metas), list(filtered_scores)
+
+    identifiers = extract_query_identifiers(question)
+    phrases = extract_query_phrases(question)
+    exact_terms = identifiers + phrases
+    if not exact_terms:
         return [], [], []
 
-    docs, metas, filtered_scores = zip(*filtered)
-    return list(docs), list(metas), list(filtered_scores)
+    relaxed_floor = min(min_relevance_score, 0.35)
+    rescued = []
+    for doc, metadata, score in zip(documents, metadatas, scores):
+        normalized_score = safe_get_score(score)
+        if normalized_score < relaxed_floor:
+            continue
+
+        haystacks = [str(doc or "").lower(), _metadata_text(metadata)]
+        exact_hits = sum(
+            1 for term in exact_terms
+            if any(term in haystack for haystack in haystacks)
+        )
+        if exact_hits <= 0:
+            continue
+
+        rescued.append((exact_hits, normalized_score, doc, metadata))
+
+    if not rescued:
+        return [], [], []
+
+    rescued.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    docs = [item[2] for item in rescued]
+    metas = [item[3] for item in rescued]
+    rescued_scores = [item[1] for item in rescued]
+    return docs, metas, rescued_scores
 
 
 def extract_query_keywords(question: str) -> List[str]:
@@ -203,6 +312,9 @@ def extract_query_keywords(question: str) -> List[str]:
         "what", "is", "the", "a", "an", "of", "about", "how", "to", "in",
         "on", "for", "and", "or", "are", "was", "were", "be", "does", "do",
         "did", "tell", "me", "please", "can", "you",
+        "name", "title", "book", "books", "having", "have",
+        "book_id", "id",
+        "which", "who", "whom", "whose", "much", "many",
     }
     words = re.findall(r"\b[a-zA-Z][a-zA-Z0-9_-]{2,}\b", (question or "").lower())
     return [word for word in words if word not in stop_words]
@@ -219,8 +331,10 @@ def build_lexical_fallback_sources(
     Search markdown files directly when vector retrieval misses.
     This is a fallback, not a replacement for vector search.
     """
+    identifiers = extract_query_identifiers(question)
+    phrases = extract_query_phrases(question)
     keywords = extract_query_keywords(question)
-    if not keywords:
+    if not identifiers and not phrases and not keywords:
         return [], ""
 
     candidate_files = db.query(FileMetadata).filter(
@@ -239,12 +353,28 @@ def build_lexical_fallback_sources(
             continue
 
         lowered = content.lower()
-        hit_count = sum(lowered.count(keyword) for keyword in keywords)
+        phrase_hits = sum(lowered.count(phrase) for phrase in phrases)
+        identifier_hits = sum(lowered.count(identifier) for identifier in identifiers)
+        keyword_hits = sum(lowered.count(keyword) for keyword in keywords)
+
+        # If the user asked for an exact phrase or identifier, require it in the file.
+        if phrases and phrase_hits <= 0:
+            continue
+        if identifiers and identifier_hits <= 0:
+            continue
+
+        hit_count = (phrase_hits * 30) + (identifier_hits * 20) + keyword_hits
         if hit_count <= 0:
             continue
 
+        if phrase_hits > 0:
+            search_terms = phrases
+        elif identifier_hits > 0:
+            search_terms = identifiers
+        else:
+            search_terms = keywords
         best_pos = min(
-            (lowered.find(keyword) for keyword in keywords if lowered.find(keyword) != -1),
+            (lowered.find(term) for term in search_terms if lowered.find(term) != -1),
             default=-1,
         )
         if best_pos == -1:
@@ -253,7 +383,7 @@ def build_lexical_fallback_sources(
         snippet_start = max(0, best_pos - 250)
         snippet_end = min(len(content), best_pos + 750)
         snippet = content[snippet_start:snippet_end].strip()
-        score = min(0.95, 0.4 + (0.1 * hit_count))
+        score = min(0.99, 0.35 + (0.25 * phrase_hits) + (0.2 * identifier_hits) + (0.03 * keyword_hits))
 
         matches.append((
             score,
@@ -460,6 +590,7 @@ async def query_knowledge_base(
             metadatas,
             scores,
             min_relevance_score,
+            request.question,
         )
         
         if not documents:
@@ -702,6 +833,7 @@ async def query_with_conversation(
             metadatas,
             scores,
             min_relevance_score,
+            request.question,
         )
         
         if not documents:

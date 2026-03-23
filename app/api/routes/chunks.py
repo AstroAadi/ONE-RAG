@@ -226,8 +226,13 @@ async def preview_chunks(
 
     if strategy in ("hierarchical", "json"):
         parent_map = {}  # chunk_id → preview parent dict
+        all_parent_ids = {
+            chunk["chunk_id"]
+            for chunk in all_chunks
+            if chunk["metadata"].get("chunk_type") == "parent"
+        }
         MAX_PARENTS = 4
-        MAX_TOTAL_FLAT = 25   # parents + children safety
+        MAX_CHILDREN_PER_PARENT = 10
 
         # Step 1: Collect parents (first N parents)
         parent_count = 0
@@ -251,16 +256,21 @@ async def preview_chunks(
             preview_data.append(item)
             parent_count += 1
 
-        # Step 2: Attach children to the correct parent using parent_chunk_id
+        # Step 2: Attach children to the correct parent using parent_chunk_id.
+        # Limit children per parent so preview stays readable without cutting a
+        # parent off halfway through its child list.
         for chunk in all_chunks:
-            if len(preview_data) + sum(len(p["children"]) for p in preview_data) >= MAX_TOTAL_FLAT:
-                break
-
             if chunk["metadata"].get("chunk_type") != "child":
                 continue
 
             parent_id = chunk["metadata"].get("parent_chunk_id")
             if parent_id in parent_map:
+                parent_item = parent_map[parent_id]
+                if len(parent_item["children"]) >= MAX_CHILDREN_PER_PARENT:
+                    parent_item["children_truncated"] = True
+                    parent_item["omitted_children_count"] = parent_item.get("omitted_children_count", 0) + 1
+                    continue
+
                 child_item = {
                     "chunk_index": chunk["metadata"]["chunk_index"],
                     "chunk_id": chunk["chunk_id"],
@@ -274,17 +284,21 @@ async def preview_chunks(
                 if strategy == "json":
                     child_item["breadcrumb"] = chunk["metadata"].get("breadcrumb", "")
                     child_item["path"] = chunk["metadata"].get("path", [])
-                parent_map[parent_id]["children"].append(child_item)
+                parent_item["children"].append(child_item)
 
-        # Optional: show orphans if any (should be rare)
-        shown_parent_ids = set(parent_map.keys())
+        # Optional: show true orphans only. If a parent exists in the full
+        # chunk set but was omitted from the limited preview, that child is
+        # not actually orphaned.
         for chunk in all_chunks:
-            if (chunk["metadata"].get("chunk_type") == "child" and
-                chunk["metadata"].get("parent_chunk_id") not in shown_parent_ids):
+            parent_id = chunk["metadata"].get("parent_chunk_id")
+            if (
+                chunk["metadata"].get("chunk_type") == "child" and
+                parent_id not in all_parent_ids
+            ):
                 preview_data.append({
-                    "warning": "orphan child - parent not included in preview",
+                    "warning": "orphan child - parent missing from chunk set",
                     "chunk_id": chunk["chunk_id"],
-                    "parent_chunk_id": chunk["metadata"].get("parent_chunk_id"),
+                    "parent_chunk_id": parent_id,
                     "chunk_index": chunk["metadata"]["chunk_index"],
                     "char_count": chunk["char_count"],
                     "content_preview": chunk["text"][:500] + " …"
