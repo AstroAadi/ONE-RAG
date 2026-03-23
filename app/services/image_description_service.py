@@ -5,16 +5,35 @@ Supports both individual and batch image description
 
 import os
 import base64
+import io
 import logging
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 import boto3
 import json
 import re
+import requests
+from PIL import Image
 
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+MAX_BEDROCK_IMAGE_BYTES = 5 * 1024 * 1024
+TARGET_BEDROCK_IMAGE_BYTES = int(MAX_BEDROCK_IMAGE_BYTES * 0.9)
+MIN_BEDROCK_IMAGE_DIMENSION = 256
+JPEG_QUALITY_STEPS = (90, 80, 70, 60, 50, 40, 30)
+BEDROCK_SUPPORTED_MEDIA_TYPES = {
+    "image/jpeg",
+    "image/png",
+    "image/gif",
+    "image/webp",
+}
+DEFAULT_VISION_API_URL = "http://103.207.149.25:8003/v2/models/kimi_vl/infer"
+# VISION_REQUEST_TIMEOUT_SECONDS = 60
+VISION_SYSTEM_PROMPT = (
+    "Describe the image in detail for semantic search and RAG context"
+)
 
 
 class ImageDescriptionService:
@@ -29,6 +48,13 @@ class ImageDescriptionService:
     
     def __init__(self):
         """Initialize Bedrock client for vision model"""
+        self.vision_api_url = (
+            getattr(settings, "vision_api_url", DEFAULT_VISION_API_URL)
+            or os.getenv("VISION_API_URL", DEFAULT_VISION_API_URL)
+        ).strip()
+        # self.request_timeout = VISION_REQUEST_TIMEOUT_SECONDS
+        self.bedrock_runtime = None
+
         try:
             if settings.aws_profile_name:
                 session = boto3.Session(
@@ -48,15 +74,19 @@ class ImageDescriptionService:
             self.max_tokens = settings.vision_max_tokens
             self.temperature = settings.vision_temperature
             
-            logger.info(f"Image Description Service initialized with model: {self.vision_model_id}")
+            logger.info(
+                "Image Description Service initialized with model=%s vision_api_url=%s",
+                self.vision_model_id,
+                self.vision_api_url,
+            )
             
         except Exception as e:
-            logger.error(f"Failed to initialize Bedrock client: {e}")
+            logger.warning(f"Failed to initialize Bedrock client: {e}")
             self.bedrock_runtime = None
     
     def is_available(self) -> bool:
         """Check if vision service is available"""
-        return self.bedrock_runtime is not None
+        return bool(self.vision_api_url) or self.bedrock_runtime is not None
     
     # ========== INDIVIDUAL IMAGE DESCRIPTION ==========
     
@@ -78,18 +108,15 @@ class ImageDescriptionService:
             Tuple of (success: bool, description: str)
         """
         try:
-            # Read and encode image
+            # Read image bytes
             with open(image_path, 'rb') as f:
                 image_bytes = f.read()
-            
-            base64_image = base64.b64encode(image_bytes).decode('utf-8')
-            
-            # Determine image format
+
             ext = Path(image_path).suffix.lstrip('.').lower()
             media_type = self._get_media_type(ext)
-            
-            return self.describe_image_from_base64(
-                base64_image,
+
+            return self.describe_image_from_bytes(
+                image_bytes,
                 media_type,
                 context=context,
                 page_number=page_number,
@@ -102,11 +129,70 @@ class ImageDescriptionService:
         except Exception as e:
             logger.error(f"Error reading image {image_path}: {e}")
             return False, f"[Error reading image: {str(e)}]"
-    
+
+    def describe_image_from_bytes(
+        self,
+        image_bytes: bytes,
+        media_type: str,
+        context: Optional[str] = None,
+        page_number: Optional[int] = None,
+        filename: Optional[str] = None
+    ) -> Tuple[bool, str]:
+        """
+        Generate textual description of an image from raw bytes.
+
+        This method is the central entry point for image payload preparation so
+        all callers benefit from size guarding before invoking Bedrock.
+        """
+        if not self.is_available():
+            logger.warning("Vision service not available")
+            return False, "[Vision service unavailable - image description could not be generated]"
+
+        try:
+            prepared_bytes, prepared_media_type = self._prepare_image_for_bedrock(
+                image_bytes,
+                media_type,
+                filename=filename,
+            )
+
+            if len(prepared_bytes) > MAX_BEDROCK_IMAGE_BYTES:
+                logger.warning(
+                    "Image still exceeds Bedrock limit after optimization: filename=%s size=%s",
+                    filename or "<memory>",
+                    self._format_bytes(len(prepared_bytes)),
+                )
+                return False, self._build_size_limit_fallback(filename)
+
+            base64_image = base64.b64encode(prepared_bytes).decode('utf-8')
+            if self.vision_api_url:
+                return self._describe_image_with_vision_api(
+                    base64_image,
+                    context=context,
+                    page_number=page_number,
+                    filename=filename,
+                )
+
+            return self._describe_image_with_bedrock(
+                prepared_bytes,
+                prepared_media_type,
+                context=context,
+                page_number=page_number,
+                filename=filename,
+            )
+
+        except Exception as e:
+            logger.warning(f"Vision description error: {e}")
+
+            fallback = f"[Image description unavailable: {str(e)}]"
+            if filename:
+                fallback = f"[Image: {filename} - description unavailable]"
+
+            return False, fallback
+
     def describe_image_from_base64(
         self,
         base64_image: str,
-        media_type: str,
+        media_type: Optional[str] = None,
         context: Optional[str] = None,
         page_number: Optional[int] = None,
         filename: Optional[str] = None
@@ -127,63 +213,23 @@ class ImageDescriptionService:
         if not self.is_available():
             logger.warning("Vision service not available")
             return False, "[Vision service unavailable - image description could not be generated]"
-        
+
         try:
-            # Build prompt for image description
-            prompt = self._build_description_prompt(context, page_number)
-            
-            # Prepare request
-            content_parts = [
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": media_type,
-                        "data": base64_image
-                    }
-                },
-                {
-                    "type": "text",
-                    "text": prompt
-                }
-            ]
-            
-            request_body = {
-                "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": self.max_tokens,
-                "temperature": self.temperature,
-                "messages": [{
-                    "role": "user",
-                    "content": content_parts
-                }]
-            }
-            
-            # Call Bedrock
-            response = self.bedrock_runtime.invoke_model(
-                modelId=self.vision_model_id,
-                body=json.dumps(request_body)
+            image_bytes = base64.b64decode(base64_image, validate=True)
+            return self.describe_image_from_bytes(
+                image_bytes,
+                media_type or "image/jpeg",
+                context=context,
+                page_number=page_number,
+                filename=filename,
             )
-            
-            response_body = json.loads(response['body'].read())
-            
-            if 'content' in response_body and response_body['content']:
-                description = response_body['content'][0]['text'].strip()
-                logger.debug(f"Generated description: {description[:100]}...")
-                return True, description
-            else:
-                logger.warning("No content in vision response")
-                return False, "[Image description generation failed - no response]"
-                
         except Exception as e:
-            logger.error(f"Vision API error: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            fallback = f"[Image description unavailable: {str(e)}]"
-            if filename:
-                fallback = f"[Image: {filename} - description unavailable]"
-            
-            return False, fallback
+            logger.warning(f"Error decoding base64 image payload: {e}")
+            return False, self.generate_fallback_description(
+                filename or "unknown-image",
+                page_number=page_number,
+                image_type="image",
+            )
     
     # ========== BATCH IMAGE DESCRIPTION ==========
     
@@ -216,6 +262,13 @@ class ImageDescriptionService:
         
         if not images:
             return []
+
+        if not self.bedrock_runtime:
+            logger.info(
+                "Batch image description falling back to sequential requests "
+                "because Bedrock batch mode is unavailable"
+            )
+            return self._fallback_individual(images, context, page_number)
         
         # Split into batches if needed
         if len(images) > max_batch_size:
@@ -256,12 +309,25 @@ class ImageDescriptionService:
             content_parts = []
             
             for img_data in images:
+                image_bytes = base64.b64decode(img_data['base64'])
+                prepared_bytes, prepared_media_type = self._prepare_image_for_bedrock(
+                    image_bytes,
+                    img_data['media_type'],
+                    filename=img_data.get('filename'),
+                )
+
+                if len(prepared_bytes) > MAX_BEDROCK_IMAGE_BYTES:
+                    raise ValueError(
+                        f"Image exceeds {MAX_BEDROCK_IMAGE_BYTES} byte Bedrock limit "
+                        f"after optimization"
+                    )
+
                 content_parts.append({
                     "type": "image",
                     "source": {
                         "type": "base64",
-                        "media_type": img_data['media_type'],
-                        "data": img_data['base64']
+                        "media_type": prepared_media_type,
+                        "data": base64.b64encode(prepared_bytes).decode('utf-8')
                     }
                 })
             
@@ -344,7 +410,8 @@ class ImageDescriptionService:
                     img_data['base64'],
                     img_data['media_type'],
                     context=context,
-                    page_number=page_number
+                    page_number=page_number,
+                    filename=img_data.get('filename'),
                 )
                 
                 results.append({
@@ -541,6 +608,243 @@ class ImageDescriptionService:
         ])
         
         return "\n".join(prompt_parts)
+
+    def _describe_image_with_bedrock(
+        self,
+        image_bytes: bytes,
+        media_type: str,
+        context: Optional[str] = None,
+        page_number: Optional[int] = None,
+        filename: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        """Legacy Bedrock-backed image description path used as a fallback."""
+        if not self.bedrock_runtime:
+            logger.warning("Bedrock vision runtime not available")
+            return False, self.generate_fallback_description(
+                filename or "unknown-image",
+                page_number=page_number,
+                image_type="image",
+            )
+
+        try:
+            prompt = self._build_description_prompt(context, page_number)
+
+            content_parts = [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": base64.b64encode(image_bytes).decode('utf-8')
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": prompt
+                }
+            ]
+
+            request_body = {
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": self.max_tokens,
+                "temperature": self.temperature,
+                "messages": [{
+                    "role": "user",
+                    "content": content_parts
+                }]
+            }
+
+            response = self.bedrock_runtime.invoke_model(
+                modelId=self.vision_model_id,
+                body=json.dumps(request_body)
+            )
+
+            response_body = json.loads(response['body'].read())
+
+            if 'content' in response_body and response_body['content']:
+                description = response_body['content'][0]['text'].strip()
+                logger.debug(f"Generated description: {description[:100]}...")
+                return True, description
+
+            logger.warning("No content in Bedrock vision response")
+            return False, "[Image description generation failed - no response]"
+
+        except Exception as e:
+            logger.warning(f"Bedrock vision API error: {e}")
+            fallback = f"[Image description unavailable: {str(e)}]"
+            if filename:
+                fallback = f"[Image: {filename} - description unavailable]"
+            return False, fallback
+
+    def _describe_image_with_vision_api(
+        self,
+        base64_image: str,
+        context: Optional[str] = None,
+        page_number: Optional[int] = None,
+        filename: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        """Call the external multimodal Vision API with a base64 image payload."""
+        if not self.vision_api_url:
+            logger.warning("VISION_API_URL is not configured")
+            return False, self.generate_fallback_description(
+                filename or "unknown-image",
+                page_number=page_number,
+                image_type="image",
+            )
+
+        payload = {
+            "inputs": [
+                {
+                    "name": "PROMPT",
+                    "shape": [1],
+                    "datatype": "BYTES",
+                    "data": [self._build_vision_api_prompt(context, page_number, filename)],
+                },
+                {
+                    "name": "SYSTEM_PROMPT",
+                    "shape": [1],
+                    "datatype": "BYTES",
+                    "data": [VISION_SYSTEM_PROMPT],
+                },
+                {
+                    "name": "IMAGE",
+                    "shape": [1],
+                    "datatype": "BYTES",
+                    "data": [base64_image],
+                },
+            ]
+        }
+
+        try:
+            response = requests.post(
+                self.vision_api_url,
+                json=payload,
+                # timeout=self.request_timeout,
+            )
+            response.raise_for_status()
+        except requests.RequestException as e:
+            logger.warning(
+                "Vision API request failed for %s: %s",
+                filename or "unknown-image",
+                e,
+            )
+            return False, self.generate_fallback_description(
+                filename or "unknown-image",
+                page_number=page_number,
+                image_type="image",
+            )
+
+        try:
+            response_payload = response.json()
+        except ValueError:
+            response_text = response.text.strip()
+            if response_text:
+                return True, response_text
+
+            logger.warning(
+                "Vision API returned a non-JSON empty response for %s",
+                filename or "unknown-image",
+            )
+            return False, self.generate_fallback_description(
+                filename or "unknown-image",
+                page_number=page_number,
+                image_type="image",
+            )
+
+        description = self._extract_vision_api_description(response_payload)
+        if not description:
+            logger.warning(
+                "Vision API returned no description for %s",
+                filename or "unknown-image",
+            )
+            return False, self.generate_fallback_description(
+                filename or "unknown-image",
+                page_number=page_number,
+                image_type="image",
+            )
+
+        return True, description
+
+    def _build_vision_api_prompt(
+        self,
+        context: Optional[str] = None,
+        page_number: Optional[int] = None,
+        filename: Optional[str] = None,
+    ) -> str:
+        """Build the user prompt for the external Vision API."""
+        prompt_parts = [
+            "Describe this image in detail for semantic search, retrieval, and RAG.",
+            "Include visible text, tables, charts, diagrams, objects, and any important context.",
+        ]
+
+        if filename:
+            prompt_parts.append(f"Filename: {filename}")
+        if context:
+            prompt_parts.append(f"Context: {context}")
+        if page_number is not None:
+            prompt_parts.append(f"Page: {page_number}")
+
+        return "\n".join(prompt_parts)
+
+    def _extract_vision_api_description(self, payload) -> str:
+        """Extract generated text from a flexible Vision API response shape."""
+        if isinstance(payload, str):
+            return payload.strip()
+
+        if isinstance(payload, list):
+            parts = [
+                self._extract_vision_api_description(item)
+                for item in payload
+            ]
+            parts = [part for part in parts if part]
+            return "\n".join(parts).strip()
+
+        if not isinstance(payload, dict):
+            return ""
+
+        preferred_keys = (
+            "description",
+            "generated_text",
+            "generated_output",
+            "text",
+            "output_text",
+            "output",
+            "response",
+            "result",
+            "content",
+            "message",
+        )
+        for key in preferred_keys:
+            value = payload.get(key)
+            text_value = self._extract_vision_api_description(value)
+            if text_value:
+                return text_value
+
+        outputs = payload.get("outputs")
+        if isinstance(outputs, list):
+            for output in outputs:
+                text_value = self._extract_vision_api_description(output)
+                if text_value:
+                    return text_value
+
+        data = payload.get("data")
+        if isinstance(data, list):
+            parts = [
+                self._extract_vision_api_description(item)
+                for item in data
+            ]
+            parts = [part for part in parts if part]
+            if parts:
+                return "\n".join(parts).strip()
+
+        nested_keys = ("predictions", "results", "items", "choices")
+        for key in nested_keys:
+            value = payload.get(key)
+            text_value = self._extract_vision_api_description(value)
+            if text_value:
+                return text_value
+
+        return ""
     
     def _parse_batch_response(
         self,
@@ -610,6 +914,121 @@ class ImageDescriptionService:
             'tif': 'image/tiff'
         }
         return media_types.get(extension.lower(), 'image/jpeg')
+
+    def _prepare_image_for_bedrock(
+        self,
+        image_bytes: bytes,
+        media_type: str,
+        filename: Optional[str] = None,
+    ) -> Tuple[bytes, str]:
+        """
+        Ensure the image payload is acceptable for Bedrock vision calls.
+
+        Large or unsupported images are re-encoded as JPEG and progressively
+        downscaled until they fit under the request limit or we run out of room.
+        """
+        if (
+            len(image_bytes) <= MAX_BEDROCK_IMAGE_BYTES
+            and media_type in BEDROCK_SUPPORTED_MEDIA_TYPES
+        ):
+            return image_bytes, media_type
+
+        label = filename or "<memory>"
+        logger.warning(
+            "Optimizing image for Bedrock: filename=%s original_size=%s media_type=%s",
+            label,
+            self._format_bytes(len(image_bytes)),
+            media_type,
+        )
+
+        try:
+            with Image.open(io.BytesIO(image_bytes)) as img:
+                original_size = img.size
+                working_image = self._normalize_image_for_bedrock(img)
+
+            best_bytes = image_bytes
+            best_media_type = media_type
+            current_image = working_image
+
+            for _ in range(8):
+                for quality in JPEG_QUALITY_STEPS:
+                    encoded_bytes = self._encode_image_as_jpeg(current_image, quality)
+                    if len(encoded_bytes) < len(best_bytes):
+                        best_bytes = encoded_bytes
+                        best_media_type = "image/jpeg"
+
+                    if len(encoded_bytes) <= TARGET_BEDROCK_IMAGE_BYTES:
+                        logger.info(
+                            "Optimized image for Bedrock: filename=%s size=%s -> %s dimensions=%sx%s -> %sx%s quality=%s",
+                            label,
+                            self._format_bytes(len(image_bytes)),
+                            self._format_bytes(len(encoded_bytes)),
+                            original_size[0],
+                            original_size[1],
+                            current_image.size[0],
+                            current_image.size[1],
+                            quality,
+                        )
+                        return encoded_bytes, "image/jpeg"
+
+                next_width = max(int(current_image.size[0] * 0.8), MIN_BEDROCK_IMAGE_DIMENSION)
+                next_height = max(int(current_image.size[1] * 0.8), MIN_BEDROCK_IMAGE_DIMENSION)
+                if (next_width, next_height) == current_image.size:
+                    break
+                current_image = current_image.resize((next_width, next_height), Image.LANCZOS)
+
+            if best_bytes is not image_bytes:
+                logger.warning(
+                    "Using best-effort optimized image for Bedrock: filename=%s optimized_size=%s",
+                    label,
+                    self._format_bytes(len(best_bytes)),
+                )
+            return best_bytes, best_media_type
+
+        except Exception as e:
+            logger.warning(
+                "Image optimization failed for filename=%s: %s",
+                label,
+                e,
+            )
+            return image_bytes, media_type
+
+    def _normalize_image_for_bedrock(self, img: Image.Image) -> Image.Image:
+        """Convert images into a safe RGB representation for JPEG encoding."""
+        if img.mode in ("RGBA", "LA") or (
+            img.mode == "P" and "transparency" in img.info
+        ):
+            rgba_image = img.convert("RGBA")
+            background = Image.new("RGBA", rgba_image.size, (255, 255, 255, 255))
+            background.alpha_composite(rgba_image)
+            return background.convert("RGB")
+
+        if img.mode != "RGB":
+            return img.convert("RGB")
+
+        return img.copy()
+
+    def _encode_image_as_jpeg(self, img: Image.Image, quality: int) -> bytes:
+        """JPEG-encode an image with deterministic settings for payload reduction."""
+        buffer = io.BytesIO()
+        img.save(buffer, format="JPEG", quality=quality, optimize=True)
+        return buffer.getvalue()
+
+    def _build_size_limit_fallback(self, filename: Optional[str]) -> str:
+        """Fallback description used when the image cannot be reduced enough."""
+        if filename:
+            return f"[Image: {filename} - skipped because it exceeds the Bedrock 5 MB image limit]"
+        return "[Image skipped because it exceeds the Bedrock 5 MB image limit]"
+
+    def _format_bytes(self, size_bytes: int) -> str:
+        """Human-readable byte formatter for vision payload logs."""
+        units = ["B", "KB", "MB", "GB"]
+        size = float(size_bytes)
+        for unit in units:
+            if size < 1024 or unit == units[-1]:
+                return f"{size:.2f} {unit}"
+            size /= 1024
+        return f"{size_bytes} B"
     
     def generate_fallback_description(
         self,

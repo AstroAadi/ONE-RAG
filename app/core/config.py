@@ -101,12 +101,16 @@ class Settings(BaseSettings):
     max_tokens: int = Field(default=4000, ge=100, le=100000)
     vision_max_tokens: int = Field(default=2000, ge=100, le=10000)
     vision_temperature: float = Field(default=0.6, ge=0.0, le=1.0)
+    vision_api_url: str = Field(
+        default="http://103.207.149.25:8003/v2/models/kimi_vl/infer",
+        description="External vision API URL for multimodal image descriptions"
+    )
     
     # ==================== DATABASE CONFIGURATION ====================
     
     # Database URL - supports both SQLite and PostgreSQL
     database_url: str = Field(
-        default="postgresql+psycopg2://postgres:root@localhost:5432/oneragdb",
+        default="postgresql+psycopg2://postgres:root@localhost:5432/one-rag-db",
         description="Database URL (SQLite or PostgreSQL)"
     )
     

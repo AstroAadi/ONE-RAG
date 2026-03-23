@@ -3,7 +3,7 @@ Database Configuration with Connection Pooling
 PostgreSQL and SQLite Support with proper pooling
 """
 
-from sqlalchemy import create_engine, event, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.pool import QueuePool, NullPool
 from contextlib import contextmanager
@@ -120,10 +120,40 @@ def create_all_tables():
     """Create all database tables using the models Base"""
     try:
         Base.metadata.create_all(bind=engine)
+        _ensure_file_metadata_schema_compatibility()
         logger.info("✅ Database tables created/verified")
     except Exception as e:
         logger.error(f"❌ Failed to create database tables: {e}")
         raise
+
+
+def _ensure_file_metadata_schema_compatibility():
+    """
+    Backfill columns that were added to the SQLAlchemy model after the
+    underlying database table already existed.
+
+    `create_all()` only creates missing tables; it does not alter existing ones.
+    """
+    inspector = inspect(engine)
+
+    if not inspector.has_table("file_metadata"):
+        return
+
+    existing_columns = {
+        column_info["name"]
+        for column_info in inspector.get_columns("file_metadata")
+    }
+
+    if "parent_chunk_size" not in existing_columns:
+        logger.warning(
+            "Schema drift detected: file_metadata.parent_chunk_size is missing. "
+            "Applying compatibility patch."
+        )
+        with engine.begin() as connection:
+            connection.execute(
+                text("ALTER TABLE file_metadata ADD COLUMN parent_chunk_size INTEGER")
+            )
+        logger.info("✅ Added file_metadata.parent_chunk_size column")
 
 
 def drop_all_tables():

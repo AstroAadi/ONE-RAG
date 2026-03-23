@@ -18,6 +18,7 @@ load_dotenv()
 from app.core.config import settings
 from app.core.database import create_all_tables, close_database_connections, check_database_health
 from app.core.task_manager import get_task_manager, shutdown_task_manager
+from app.services.extraction import ExtractorFactory
 
 # Import routes
 from app.api.routes import (
@@ -102,6 +103,18 @@ async def lifespan(app: FastAPI):
         logger.info(f"✅ {db_message}")
     else:
         logger.warning(f"⚠️  {db_message}")
+
+    extractor_report = ExtractorFactory.validate_registered_extractors()
+    logger.info(
+        f"Extractor readiness: {extractor_report['available_count']} available, "
+        f"{extractor_report['unavailable_count']} unavailable"
+    )
+    if extractor_report["unavailable_formats"]:
+        for ext, info in extractor_report["unavailable_formats"].items():
+            logger.warning(
+                f"Extractor unavailable for .{ext}: "
+                f"{info['extractor']} ({info['reason']})"
+            )
     
     logger.info("=" * 70)
     logger.info("RAG SYSTEM READY - Accepting requests")
@@ -263,6 +276,7 @@ async def health_check():
     # Determine overall health
     is_healthy = db_healthy
     status = "healthy" if is_healthy else "unhealthy"
+    extractor_report = ExtractorFactory.get_availability_report()
     
     return {
         "status": status,
@@ -275,6 +289,13 @@ async def health_check():
             "task_manager": {
                 "healthy": True,
                 "stats": task_stats
+            },
+            "extractors": {
+                "healthy": extractor_report["unavailable_count"] == 0,
+                "available_count": extractor_report["available_count"],
+                "unavailable_count": extractor_report["unavailable_count"],
+                "available_formats": extractor_report["available_formats"],
+                "unavailable_formats": extractor_report["unavailable_formats"],
             }
         },
         "system": {

@@ -7,8 +7,14 @@ import logging
 from typing import Dict, Optional, Tuple
 import io
 from PIL import Image
-import imagehash
 import hashlib
+
+try:
+    import imagehash
+    IMAGEHASH_AVAILABLE = True
+except ImportError:
+    imagehash = None
+    IMAGEHASH_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +44,10 @@ class ImageCacheManager:
         self.misses = 0
         
         logger.debug(f"Image cache initialized (hash_size={hash_size})")
+        if not IMAGEHASH_AVAILABLE:
+            logger.warning(
+                "imagehash not available; falling back to MD5-based image deduplication"
+            )
     
     def compute_hash(self, image_bytes: bytes) -> str:
         """
@@ -55,6 +65,9 @@ class ImageCacheManager:
         Returns:
             Hash string
         """
+        if not IMAGEHASH_AVAILABLE:
+            return f"md5_{hashlib.md5(image_bytes).hexdigest()}"
+
         try:
             # Try perceptual hash (best for visual similarity)
             img = Image.open(io.BytesIO(image_bytes))

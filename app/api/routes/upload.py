@@ -249,6 +249,12 @@ def extract_document_background(
             extractor = ExtractorFactory.get_extractor(file_extension)
             
             if not extractor:
+                format_status = ExtractorFactory.get_format_status(file_extension)
+                if format_status["status"] == "unavailable":
+                    raise ValueError(
+                        f"Extractor for .{file_extension} is unavailable: "
+                        f"{format_status['reason']}"
+                    )
                 raise ValueError(f"No extractor for .{file_extension}")
             
             logger.info(f"⚙️  [Task {task_id}] Running extraction...")
