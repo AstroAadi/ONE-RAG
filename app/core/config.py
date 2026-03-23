@@ -12,6 +12,7 @@ from typing import Literal, Optional
 from dotenv import load_dotenv
 import os
 import logging
+import sys
 
 load_dotenv()
 
@@ -110,7 +111,7 @@ class Settings(BaseSettings):
     
     # Database URL - supports both SQLite and PostgreSQL
     database_url: str = Field(
-        default="postgresql+psycopg2://postgres:root@localhost:5432/one-rag-db",
+        default="postgresql+psycopg2://postgres:root@localhost:5432/oneragdb",
         description="Database URL (SQLite or PostgreSQL)"
     )
     
@@ -382,53 +383,63 @@ def get_settings() -> Settings:
     return settings
 
 
+def _safe_print(text: str = "") -> None:
+    """Print text without crashing on non-UTF-8 Windows consoles."""
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        fallback = text.encode(encoding, errors="replace").decode(encoding, errors="replace")
+        print(fallback)
+
+
 def print_configuration_summary():
     """Print configuration summary on startup"""
     is_valid, warnings = settings.validate_configuration()
     
-    print("\n" + "="*70)
-    print("RAG SYSTEM CONFIGURATION")
-    print("="*70)
+    _safe_print("\n" + "="*70)
+    _safe_print("RAG SYSTEM CONFIGURATION")
+    _safe_print("="*70)
     
     # Database info
     db_type = "PostgreSQL" if settings.is_postgresql else "SQLite"
-    print(f"\n💾 Database: {db_type}")
+    _safe_print(f"\n💾 Database: {db_type}")
     if settings.is_postgresql:
         # Extract database name from URL for display
         db_name = settings.database_url.split('/')[-1].split('?')[0]
-        print(f"  Database: {db_name}")
-        print(f"  Pool Size: {settings.db_pool_size}")
-        print(f"  Max Overflow: {settings.db_max_overflow}")
+        _safe_print(f"  Database: {db_name}")
+        _safe_print(f"  Pool Size: {settings.db_pool_size}")
+        _safe_print(f"  Max Overflow: {settings.db_max_overflow}")
     
     device_info = settings.get_device_info()
-    print(f"\n🖥️  Device: {device_info['device'].upper()}")
+    _safe_print(f"\n🖥️  Device: {device_info['device'].upper()}")
     
     if device_info['is_gpu']:
-        print(f"  GPU: {device_info.get('gpu_name', 'Unknown')}")
-        print(f"  Memory: {device_info.get('gpu_memory_total_gb', 0):.2f} GB")
-        print(f"  Mixed Precision: {'✅' if settings.use_mixed_precision else '❌'}")
-        print(f"  SPLADE Batch: {device_info['splade_batch_size']}")
+        _safe_print(f"  GPU: {device_info.get('gpu_name', 'Unknown')}")
+        _safe_print(f"  Memory: {device_info.get('gpu_memory_total_gb', 0):.2f} GB")
+        _safe_print(f"  Mixed Precision: {'✅' if settings.use_mixed_precision else '❌'}")
+        _safe_print(f"  SPLADE Batch: {device_info['splade_batch_size']}")
     else:
-        print(f"  CPU Cores: {os.cpu_count()}")
-        print(f"  SPLADE Batch: {device_info['splade_batch_size']}")
+        _safe_print(f"  CPU Cores: {os.cpu_count()}")
+        _safe_print(f"  SPLADE Batch: {device_info['splade_batch_size']}")
     
-    print(f"\n📊 Models:")
-    print(f"  LLM: {settings.bedrock_model_id} (AWS Bedrock)")
-    print(f"  Dense Embedding: {settings.bedrock_embedding_model_id} (AWS Bedrock)")
-    print(f"  Sparse Embedding: {settings.splade_model_name} (HuggingFace)")
+    _safe_print(f"\n📊 Models:")
+    _safe_print(f"  LLM: {settings.bedrock_model_id} (AWS Bedrock)")
+    _safe_print(f"  Dense Embedding: {settings.bedrock_embedding_model_id} (AWS Bedrock)")
+    _safe_print(f"  Sparse Embedding: {settings.splade_model_name} (HuggingFace)")
     
-    print(f"\n⚡ Concurrency:")
-    print(f"  I/O Workers: {settings.max_io_workers}")
-    print(f"  CPU Workers: {settings.max_cpu_workers}")
+    _safe_print(f"\n⚡ Concurrency:")
+    _safe_print(f"  I/O Workers: {settings.max_io_workers}")
+    _safe_print(f"  CPU Workers: {settings.max_cpu_workers}")
     
     if warnings:
-        print(f"\n⚠️  Warnings:")
+        _safe_print(f"\n⚠️  Warnings:")
         for warning in warnings:
-            print(f"  - {warning}")
+            _safe_print(f"  - {warning}")
     else:
-        print("\n✅ Configuration valid")
+        _safe_print("\n✅ Configuration valid")
     
-    print("="*70 + "\n")
+    _safe_print("="*70 + "\n")
 
 
 # Run on import

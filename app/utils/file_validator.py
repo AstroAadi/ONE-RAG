@@ -42,6 +42,7 @@ class FileValidator:
         'tiff': 'image/tiff',
         'html': 'text/html',
         'xml': 'application/xml',
+        'zip': 'application/zip',
     }
     
     @classmethod

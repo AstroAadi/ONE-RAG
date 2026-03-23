@@ -23,6 +23,7 @@ from app.services.extraction import ExtractorFactory
 from app.api.routes.data_upload import database_upload, api_endpoint, file_upload, cloud_storage
 # Import routes
 from app.api.routes import (
+    cloud_upload,
     query,
     task_routes,
     knowledge_base,
@@ -221,7 +222,7 @@ app.include_router(chunks.router)
 app.include_router(query.router)
 app.include_router(task_routes.router)
 app.include_router(chunk_edit.router)
-# app.include_router(markdown_output.router)
+app.include_router(markdown_output.router)
 app.include_router(settings_route.router)
 app.include_router(cloud_upload.router)
 

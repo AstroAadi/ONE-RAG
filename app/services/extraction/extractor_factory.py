@@ -420,11 +420,11 @@ def auto_register_extractors():
         logger.warning(f"Could not register MDXExtractor: {e}")
     
     # XLS Extractor
-    try:
-        from .extractors.xls_extractor import XLSExtractor
-        ExtractorFactory.register_extractor(XLSExtractor)
-    except ImportError as e:
-        logger.warning(f"Could not register XLSExtractor: {e}")
+    # try:
+    #     from .extractors.xls_extractor import XLSExtractor
+    #     ExtractorFactory.register_extractor(XLSExtractor)
+    # except ImportError as e:
+    #     logger.warning(f"Could not register XLSExtractor: {e}")
 
     # CSV / TSV Extractor
     try:
@@ -433,6 +433,20 @@ def auto_register_extractors():
     except ImportError as e:
         logger.warning(f"Could not register CSVExtractor: {e}")
 
+    # ZIP Extractor
+    try:
+        from .extractors.zip_extractor import ZIPExtractor
+        ExtractorFactory.register_extractor(ZIPExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register ZIPExtractor: {e}")
+    
+    # JSON Extractor
+    try:
+        from .extractors.json_extractor import JSONExtractor
+        ExtractorFactory.register_extractor(JSONExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register JSONExtractor: {e}")
+    
     # Log final status
     report = ExtractorFactory.get_availability_report()
     supported = ExtractorFactory.get_supported_formats()
