@@ -19,3 +19,4 @@ venv/
 docs/
 model_test.py
 vlm.py
+temp_data/
