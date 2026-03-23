@@ -188,6 +188,15 @@ class APISourceInput(BaseModel):
         description="Human-readable label for this API source",
         examples=["API Source"],
     )
+    knowledge_base_id: Optional[str] = Field(
+        default=None,
+        description="Existing knowledge base ID to attach this API source to.",
+    )
+    knowledge_base_name: Optional[str] = Field(
+        default=None,
+        max_length=255,
+        description="Knowledge base name to create or reuse for this API source.",
+    )
 
     # ── Request config ────────────────────────────────────────────────────────
     http_method: HttpMethod = Field(
@@ -266,6 +275,16 @@ class APISourceInput(BaseModel):
             raise ValueError("field_paths must be a list of strings")
         return [str(item).strip() for item in value if str(item).strip()]
 
+    @model_validator(mode="after")
+    def _validate_knowledge_base_target(self) -> "APISourceInput":
+        if self.knowledge_base_id and self.knowledge_base_name:
+            raise ValueError(
+                "Provide either knowledge_base_id or knowledge_base_name, not both"
+            )
+        if self.knowledge_base_name is not None:
+            self.knowledge_base_name = self.knowledge_base_name.strip() or None
+        return self
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Cloud Storage Source input
@@ -343,31 +362,3 @@ async def create_source(payload: SourceInput):
         pass
     return {"status": "created", "source_name": payload.source_name}
 """
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Quick smoke-test
-# ══════════════════════════════════════════════════════════════════════════════
-
-if __name__ == "__main__":
-    import json
-
-    sample = APISourceInput(
-        source_name = "API Source",
-        http_method = "POST",
-        url         = "www.apiendpointurl.com",          # scheme auto-prepended
-        auth        = BasicAuth(username="sounak", password="root"),
-        pagination  = PaginationConfig(
-            pagination_type      = "page_number",
-            page_param_name      = "page",
-            page_size_param_name = "pageSize",
-            page_size_value      = 20,
-            start_page           = 1,
-        ),
-        json_path   = "$.data.items",
-    )
-
-    print(json.dumps(
-        sample.model_dump(mode="json"),
-        indent=2,
-    ))
