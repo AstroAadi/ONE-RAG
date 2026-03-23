@@ -314,28 +314,124 @@ def auto_register_extractors():
     Automatically register all available extractors
     Call this function at module initialization
     """
-    cls_specs = [
-        (".extractors.pdf_extractor", "PDFExtractor", ["pdf"]),
-        (".extractors.docx_extractor", "DocxExtractor", ["docx", "doc"]),
-        (".extractors.pptx_extractor", "PptxExtractor", ["pptx", "ppt"]),
-        (".extractors.excel_extractor", "ExcelExtractor", ["xlsx", "xls", "xlsm", "csv", "tsv"]),
-        (".extractors.image_extractor", "ImageExtractor", ["png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "tif"]),
-        (".extractors.markdown_extractor", "MarkdownExtractor", ["md", "markdown", "mdown", "mkd"]),
-        (".extractors.text_extractor", "PlainTextExtractor", ["txt", "text", "log", "csv", "tsv"]),
-        (".extractors.epub_extractor", "EPUBExtractor", ["epub"]),
-        (".extractors.msg_extractor", "MSGExtractor", ["msg"]),
-        (".extractors.eml_extractor", "EMLExtractor", ["eml", "email"]),
-        (".extractors.html_extractor", "HTMLExtractor", ["html", "htm"]),
-        (".extractors.xml_extractor", "XMLExtractor", ["xml"]),
-        (".extractors.vtt_extractor", "VTTExtractor", ["vtt", "webvtt"]),
-        (".extractors.properties_extractor", "PropertiesExtractor", ["properties", "props", "config", "conf", "ini"]),
-        (".extractors.mdx_extractor", "MDXExtractor", ["mdx"]),
-        (".extractors.zip_extractor", "ZIPExtractor", ["zip"]),
-        (".extractors.json_extractor", "JSONExtractor", ["json", "jsonl", "ndjson"]),
-    ]
+    # PDF Extractor
+    try:
+        from .extractors.pdf_extractor import PDFExtractor
+        ExtractorFactory.register_extractor(PDFExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register PDFExtractor: {e}")
+    
+    # DOCX Extractor
+    try:
+        from .extractors.docx_extractor import DocxExtractor
+        ExtractorFactory.register_extractor(DocxExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register DocxExtractor: {e}")
+    
+    # PPTX Extractor
+    try:
+        from .extractors.pptx_extractor import PptxExtractor
+        ExtractorFactory.register_extractor(PptxExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register PptxExtractor: {e}")
+    
+    # Excel Extractor 
+    try:
+        from .extractors.excel_extractor import ExcelExtractor
+        ExtractorFactory.register_extractor(ExcelExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register ExcelExtractor: {e}")
+    
+    # Image Extractor 
+    try:
+        from .extractors.image_extractor import ImageExtractor
+        ExtractorFactory.register_extractor(ImageExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register ImageExtractor: {e}")
+    
+    # Markdown Extractor
+    try:
+        from .extractors.markdown_extractor import MarkdownExtractor
+        ExtractorFactory.register_extractor(MarkdownExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register MarkdownExtractor: {e}")
+    
+    # Plain Text Extractor
+    try:
+        from .extractors.text_extractor import PlainTextExtractor
+        ExtractorFactory.register_extractor(PlainTextExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register PlainTextExtractor: {e}")
 
-    for module_path, class_name, extensions in cls_specs:
-        _register_optional_extractor(module_path, class_name, extensions)
+    # EPUB Extractor
+    try:
+        from .extractors.epub_extractor import EPUBExtractor
+        ExtractorFactory.register_extractor(EPUBExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register EPUBExtractor: {e}")
+    
+    # MSG Extractor
+    try:
+        from .extractors.msg_extractor import MSGExtractor
+        ExtractorFactory.register_extractor(MSGExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register MSGExtractor: {e}")
+    
+    # EML Extractor
+    try:
+        from .extractors.eml_extractor import EMLExtractor
+        ExtractorFactory.register_extractor(EMLExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register EMLExtractor: {e}")
+
+    # HTML Extractor
+    try:
+        from .extractors.html_extractor import HTMLExtractor
+        ExtractorFactory.register_extractor(HTMLExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register HTMLExtractor: {e}")
+
+    # XML Extractor
+    try:
+        from .extractors.xml_extractor import XMLExtractor
+        ExtractorFactory.register_extractor(XMLExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register XMLExtractor: {e}")
+
+    # VTT Extractor
+    try:
+        from .extractors.vtt_extractor import VTTExtractor
+        ExtractorFactory.register_extractor(VTTExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register VTTExtractor: {e}")
+
+    # PROPERTIES Extractor
+    try:
+        from .extractors.properties_extractor import PropertiesExtractor
+        ExtractorFactory.register_extractor(PropertiesExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register PropertiesExtractor: {e}")
+    
+    #MDX Extractor
+    try:
+        from .extractors.mdx_extractor import MDXExtractor
+        ExtractorFactory.register_extractor(MDXExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register MDXExtractor: {e}")
+    
+    # XLS Extractor
+    try:
+        from .extractors.xls_extractor import XLSExtractor
+        ExtractorFactory.register_extractor(XLSExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register XLSExtractor: {e}")
+
+    # CSV / TSV Extractor
+    try:
+        from .extractors.csv_extractor import CSVExtractor
+        ExtractorFactory.register_extractor(CSVExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register CSVExtractor: {e}")
 
     # Log final status
     report = ExtractorFactory.get_availability_report()
