@@ -254,7 +254,13 @@ def auto_register_extractors():
     except ImportError as e:
         logger.warning(f"Could not register XLSExtractor: {e}")
 
-    
+    # CSV / TSV Extractor
+    try:
+        from .extractors.csv_extractor import CSVExtractor
+        ExtractorFactory.register_extractor(CSVExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register CSVExtractor: {e}")
+
     # Log final status
     supported = ExtractorFactory.get_supported_formats()
     logger.info(f"Auto-registration complete. {len(supported)} formats supported: {', '.join(supported)}")

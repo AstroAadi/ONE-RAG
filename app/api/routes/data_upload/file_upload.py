@@ -7,7 +7,6 @@ Extraction → completed (no chunking/indexing in upload flow)
 from typing import Optional
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Query, Form
 from sqlalchemy.orm import Session
-from sqlalchemy import func
 from pathlib import Path
 import uuid
 import shutil
@@ -30,7 +29,8 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/upload", tags=["Upload"])
 
 
-@router.post("/", response_model=FileUploadResponse)
+
+@router.post("/file-upload", response_model=FileUploadResponse)
 async def upload_file(
     file: UploadFile = File(...),
     knowledge_base_name: str = Form(...),
@@ -216,110 +216,209 @@ def extract_document_background(
     task_id=None
 ):
     """
-    Extract document ONLY - marks as COMPLETED when done
-    NO chunking or indexing here - that happens separately
+    Extract document and (for most formats) mark as COMPLETED.
+
+    CSV / TSV special path
+    ----------------------
+    For .csv and .tsv files this function bypasses the normal
+    markdown → chunk → finalize pipeline entirely:
+      1. Each row is converted to plain text.
+      2. Embeddings are generated per row.
+      3. Each row is stored as its own Qdrant point.
+    The file is then marked COMPLETED with chunks_created set to the
+    number of rows stored, so no further /chunks/create or
+    /chunks/finalize calls are needed.
+
+    All other formats follow the original flow:
+      extract → save markdown → COMPLETED
+    (chunking and indexing happen separately via /chunks/create and
+    /chunks/finalize).
     """
     import time
     from pathlib import Path
     from datetime import datetime
     import json
-    
+
     logger.info(f"🚀 [Task {task_id}] Starting extraction for {file_id}")
     start_time = time.time()
-    
+
     try:
         from app.services.extraction.extractor_factory import ExtractorFactory
+        from app.services.extraction.extractors.csv_extractor import CSVExtractor
         from app.utils.markdown_converter import MarkdownConverter
         from app.core.database import get_db_context
         from app.db.models import FileMetadata, ProcessingStatus as DBProcessingStatus
-        
+
         if progress_callback:
             progress_callback(10.0)
-        
+
         with get_db_context() as db:
             file_metadata = db.query(FileMetadata).filter(
                 FileMetadata.file_id == file_id
             ).first()
-            
+
             if not file_metadata:
                 raise ValueError(f"File not found: {file_id}")
-            
-            # Get extractor
+
+            # Resolve the KB name for Qdrant payload
+            from app.db.models import KnowledgeBase
+            kb = db.query(KnowledgeBase).filter(
+                KnowledgeBase.knowledge_base_id == knowledge_base_id
+            ).first()
+            knowledge_base_name = kb.knowledge_base_name if kb else knowledge_base_id
+
+            # Identify extractor
             file_extension = Path(storage_path).suffix.lstrip('.')
             extractor = ExtractorFactory.get_extractor(file_extension)
-            
+
             if not extractor:
                 raise ValueError(f"No extractor for .{file_extension}")
-            
-            logger.info(f"⚙️  [Task {task_id}] Running extraction...")
-            
+
+            logger.info(f"⚙️  [Task {task_id}] Running extraction ({extractor.__class__.__name__})...")
+
             if progress_callback:
                 progress_callback(30.0)
-            
-            # Run extraction
+
+            # ── CSV / TSV: row-level embedding + Qdrant storage ──────────
+            if isinstance(extractor, CSVExtractor):
+                logger.info(f"📊 [Task {task_id}] CSV/TSV detected — using row-level storage path")
+
+                from app.services.vector_store_service import VectorStoreService
+                vector_store = VectorStoreService()
+
+                extraction_start = time.time()
+                success, extraction_metadata = extractor.extract_and_store(
+                    file_path=storage_path,
+                    file_id=file_id,
+                    filename=safe_filename,
+                    knowledge_base_id=knowledge_base_id,
+                    knowledge_base_name=knowledge_base_name,
+                    user_id=user_id,
+                    vector_store=vector_store,
+                )
+                extraction_time = time.time() - extraction_start
+
+                if not success:
+                    error_msg = extraction_metadata.get('error', 'CSV row storage failed')
+                    raise Exception(f"CSV extraction failed: {error_msg}")
+
+                rows_stored = extraction_metadata.get('total_stored', 0)
+                row_count   = extraction_metadata.get('row_count', 0)
+
+                logger.info(
+                    f"✅ [Task {task_id}] CSV stored: {rows_stored}/{row_count} rows"
+                )
+
+                if progress_callback:
+                    progress_callback(90.0)
+
+                # Mark file as fully processed — no further steps needed
+                processing_meta = {
+                    'extraction_time_seconds': extraction_time,
+                    'extractor_used': extractor.__class__.__name__,
+                    'pipeline': 'csv_row_level_qdrant',
+                    **extraction_metadata,
+                }
+
+                file_metadata.status          = DBProcessingStatus.COMPLETED
+                file_metadata.processed_at    = datetime.utcnow()
+                file_metadata.markdown_path   = None   # no markdown for CSV
+                file_metadata.total_pages     = 1
+                file_metadata.word_count      = row_count
+                file_metadata.image_count     = 0
+                file_metadata.table_count     = 0
+                file_metadata.chunks_created  = rows_stored   # rows == chunks
+                file_metadata.processing_metadata = json.dumps(processing_meta)
+
+                # Keep KB chunk count in sync
+                if kb:
+                    kb.total_chunks  += rows_stored
+                    kb.updated_at     = datetime.utcnow()
+
+                db.commit()
+
+                total_time = time.time() - start_time
+
+                if progress_callback:
+                    progress_callback(100.0)
+
+                logger.info(
+                    f"🎉 [Task {task_id}] CSV COMPLETED in {total_time:.2f}s — "
+                    f"{rows_stored} rows indexed directly to Qdrant"
+                )
+
+                return {
+                    'success': True,
+                    'file_id': file_id,
+                    'status': 'completed',
+                    'pipeline': 'csv_row_level_qdrant',
+                    'rows_stored': rows_stored,
+                    'extraction_time_seconds': total_time,
+                }
+
+            # ── Standard path: extract → save markdown → COMPLETED ───────
             extraction_start = time.time()
             markdown_content, success, extraction_metadata = extractor.extract(storage_path)
             extraction_time = time.time() - extraction_start
-            
+
             if not success:
                 error_msg = extraction_metadata.get('error', 'Unknown extraction error')
                 raise Exception(f"Extraction failed: {error_msg}")
-            
+
             # Get stats
             total_pages = extraction_metadata.get('total_pages', 0)
-            word_count = extraction_metadata.get('word_count', 0)
+            word_count  = extraction_metadata.get('word_count', 0)
             image_count = extraction_metadata.get('images_extracted', 0)
             table_count = extraction_metadata.get('tables_extracted', 0)
-            
+
             logger.info(f"✅ [Task {task_id}] Extracted: {total_pages} pages, {word_count} words")
-            
+
             if progress_callback:
                 progress_callback(70.0)
-            
+
             # Save markdown
             markdown_converter = MarkdownConverter()
             user_markdown_dir = Path(settings.markdown_dir) / user_id / knowledge_base_id
             user_markdown_dir.mkdir(parents=True, exist_ok=True)
             markdown_path = user_markdown_dir / f"{file_id}.md"
-            
+
             markdown_saved = markdown_converter.save_markdown_file(
                 markdown_content,
                 str(markdown_path)
             )
-            
+
             if progress_callback:
                 progress_callback(90.0)
-            
-            # Update file metadata - COMPLETED after extraction only
-            file_metadata.status = DBProcessingStatus.COMPLETED
+
+            # Update file metadata — COMPLETED after extraction only
+            file_metadata.status       = DBProcessingStatus.COMPLETED
             file_metadata.processed_at = datetime.utcnow()
             file_metadata.markdown_path = str(markdown_path) if markdown_saved else None
-            file_metadata.total_pages = total_pages
-            file_metadata.word_count = word_count
-            file_metadata.image_count = image_count
-            file_metadata.table_count = table_count
-            
-            # Store metadata
+            file_metadata.total_pages  = total_pages
+            file_metadata.word_count   = word_count
+            file_metadata.image_count  = image_count
+            file_metadata.table_count  = table_count
+
             processing_meta = {
                 'extraction_time_seconds': extraction_time,
                 'extractor_used': extractor.__class__.__name__,
                 **extraction_metadata
             }
             file_metadata.processing_metadata = json.dumps(processing_meta)
-            
+
             db.commit()
-            
+
             total_time = time.time() - start_time
-            
+
             if progress_callback:
                 progress_callback(100.0)
-            
+
             logger.info(
                 f"🎉 [Task {task_id}] COMPLETED in {total_time:.2f}s\n"
                 f"   File: {safe_filename}\n"
                 f"   Status: completed"
             )
-            
+
             return {
                 'success': True,
                 'file_id': file_id,
@@ -328,10 +427,10 @@ def extract_document_background(
                 'word_count': word_count,
                 'extraction_time_seconds': total_time
             }
-            
+
     except Exception as e:
         logger.error(f"❌ [Task {task_id}] FAILED: {str(e)}", exc_info=True)
-        
+
         try:
             from app.core.database import get_db_context
             from app.db.models import ProcessingStatus as DBProcessingStatus
@@ -339,14 +438,14 @@ def extract_document_background(
                 file_metadata = db.query(FileMetadata).filter(
                     FileMetadata.file_id == file_id
                 ).first()
-                
+
                 if file_metadata:
                     file_metadata.status = DBProcessingStatus.FAILED
                     file_metadata.error_message = str(e)
                     db.commit()
         except Exception as db_error:
             logger.error(f"❌ Failed to update error status: {db_error}")
-        
+
         raise
 
 

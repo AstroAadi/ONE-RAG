@@ -61,9 +61,94 @@ async def preview_chunks(
             detail=f"File must be extracted first. Current status: {file_metadata.status.value}"
         )
 
-    # ── Read markdown ────────────────────────────────────────────────────────
+    # ── CSV / TSV fast-path: no markdown exists → sample rows from Qdrant ────
+    #
+    # Files processed via the CSV row-level pipeline (csv_extractor.py) are
+    # stored directly in Qdrant during extraction and never produce a markdown
+    # file.  For these files we skip all chunking logic and instead fetch a
+    # small sample of already-indexed points so the caller gets a meaningful
+    # preview regardless of which chunking_strategy value was sent.
     if not file_metadata.markdown_path:
-        raise HTTPException(status_code=400, detail="No markdown content available. Re-run extraction.")
+        if file_metadata.status != ProcessingStatus.COMPLETED:
+            # Should already be caught above, but be explicit.
+            raise HTTPException(
+                status_code=400,
+                detail="File extraction has not completed yet."
+            )
+
+        SAMPLE_LIMIT = 5
+        start_time = time.time()
+
+        try:
+            from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+            vector_store = VectorStoreService()
+            points, _ = vector_store.client.scroll(
+                collection_name=vector_store.collection_name,
+                scroll_filter=Filter(must=[
+                    FieldCondition(key="file_id",  match=MatchValue(value=request.file_id)),
+                    FieldCondition(key="user_id",  match=MatchValue(value=user_id)),
+                ]),
+                limit=SAMPLE_LIMIT,
+                with_payload=True,
+                with_vectors=False,
+            )
+        except Exception as e:
+            logger.error(f"❌ Qdrant sample fetch failed for {request.file_id}: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Could not fetch sample rows from vector store: {e}"
+            )
+
+        preview_time = time.time() - start_time
+        total_stored = file_metadata.chunks_created or 0
+
+        if not points:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "File has been extracted but no indexed rows were found in the "
+                    "vector store. The file may still be indexing, or indexing may "
+                    "have failed."
+                )
+            )
+
+        sample_rows = [
+            {
+                "chunk_index":  pt.payload.get("chunk_index", idx),
+                "chunk_id":     pt.payload.get("chunk_id", ""),
+                "chunk_type":   pt.payload.get("chunk_type", "csv_row"),
+                "char_count":   len(pt.payload.get("text", "")),
+                "page_number":  pt.payload.get("page_number", 1),
+                "content":      pt.payload.get("text", ""),
+                "row_index":    pt.payload.get("row_index", None),
+            }
+            for idx, pt in enumerate(points)
+        ]
+
+        logger.info(
+            f"👁️ CSV preview for file {request.file_id}: "
+            f"showing {len(sample_rows)} sample rows of {total_stored} total"
+        )
+
+        return {
+            "file_id":               request.file_id,
+            "knowledge_base_id":     kb.knowledge_base_id,
+            "chunking_strategy":     "csv_row_level",
+            "parameters":            {"note": "Each row is stored as a separate vector. No chunking applied."},
+            "preview_chunks":        sample_rows,
+            "preview_structure":     "flat",
+            "preview_count_flat":    len(sample_rows),
+            "estimated_total_chunks": total_stored,
+            "preview_time_seconds":  round(preview_time, 3),
+            "note": (
+                "Sample rows fetched directly from the vector store. "
+                "CSV/TSV files are indexed row-by-row and do not use the "
+                "markdown chunking pipeline."
+            ),
+        }
+
+    # ── Standard path: read markdown and run chunking ─────────────────────────
     try:
         with open(file_metadata.markdown_path, 'r', encoding='utf-8') as f:
             markdown_content = f.read()
