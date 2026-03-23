@@ -516,9 +516,14 @@ class EnhancedChunkingService:
         for entry in entries:
             # Derive a human display name for breadcrumbs
             display_name = self._json_display_name(entry, parent_index)
+            entry_identity = self._json_entry_identity(entry)
 
             # ── Parent: full serialized entry ──────────────────────────────
-            parent_text = json.dumps(entry, indent=2, ensure_ascii=False)
+            parent_text = self._json_build_parent_text(
+                entry,
+                display_name=display_name,
+                entry_identity=entry_identity,
+            )
             if not parent_text.strip():
                 continue
 
@@ -528,6 +533,9 @@ class EnhancedChunkingService:
                 base_metadata,
                 chunk_type="parent",
             )
+            parent_chunk["metadata"]["json_entry_name"] = display_name
+            if entry_identity:
+                parent_chunk["metadata"]["json_entry_id"] = entry_identity
 
             # ── Children: recursive structural decomposition ───────────────
             children: List[Dict[str, Any]] = []
@@ -537,6 +545,7 @@ class EnhancedChunkingService:
                 node           = entry,
                 path           = [],
                 display_name   = display_name,
+                entry_identity = entry_identity,
                 base_metadata  = base_metadata,
                 children       = children,
                 counter        = child_counter,
@@ -574,6 +583,7 @@ class EnhancedChunkingService:
         node:           Any,
         path:           List[str],
         display_name:   str,
+        entry_identity: Optional[str],
         base_metadata:  Dict,
         children:       List[Dict[str, Any]],
         counter:        List[int],
@@ -589,14 +599,14 @@ class EnhancedChunkingService:
         """
         # Collect items: dict → key/value pairs, list → index/element pairs
         if isinstance(node, dict):
-            items: List[Tuple[str, Any]] = list(node.items())
+            items = self._json_ordered_items(node)
         elif isinstance(node, list):
             items = [(str(i), v) for i, v in enumerate(node)]
         else:
             # Scalar at unexpected depth — emit directly
             self._json_emit_child(
-                node, path, display_name, base_metadata,
-                children, counter, context_prefix,
+                node, path, display_name, entry_identity, base_metadata,
+                children, counter, child_tokens, context_prefix,
             )
             return
 
@@ -610,6 +620,7 @@ class EnhancedChunkingService:
             nonlocal acc_tokens
             if not accumulator:
                 return
+            field_names = [label for label, _ in accumulator]
             if len(accumulator) == 1:
                 label, val = accumulator[0]
                 if isinstance(node, dict):
@@ -617,16 +628,19 @@ class EnhancedChunkingService:
                     emit_path = path + [label]
                 else:
                     emit_obj  = val
-                    emit_path = path
+                    emit_path = path + [label]
             else:
                 if isinstance(node, dict):
                     emit_obj  = {lbl: v for lbl, v in accumulator}
+                    emit_path = path
                 else:
                     emit_obj  = [v for _, v in accumulator]
-                emit_path = path
+                    emit_path = path + [
+                        f"{accumulator[0][0]}..{accumulator[-1][0]}"
+                    ]
             self._json_emit_child(
-                emit_obj, emit_path, display_name, base_metadata,
-                children, counter, context_prefix,
+                emit_obj, emit_path, display_name, entry_identity, base_metadata,
+                children, counter, child_tokens, context_prefix, field_names,
             )
             accumulator.clear()
             acc_tokens = 0
@@ -638,16 +652,30 @@ class EnhancedChunkingService:
             if item_tokens > child_tokens:
                 # Too large for one child — flush current group, recurse deeper
                 flush()
-                self._json_split_node(
-                    node           = value,
-                    path           = path + [str(label)],
-                    display_name   = display_name,
-                    base_metadata  = base_metadata,
-                    children       = children,
-                    counter        = counter,
-                    child_tokens   = child_tokens,
-                    context_prefix = context_prefix,
-                )
+                if isinstance(value, (dict, list)):
+                    self._json_split_node(
+                        node           = value,
+                        path           = path + [str(label)],
+                        display_name   = display_name,
+                        entry_identity = entry_identity,
+                        base_metadata  = base_metadata,
+                        children       = children,
+                        counter        = counter,
+                        child_tokens   = child_tokens,
+                        context_prefix = context_prefix,
+                    )
+                else:
+                    self._json_emit_large_scalar(
+                        value=value,
+                        path=path + [str(label)],
+                        display_name=display_name,
+                        entry_identity=entry_identity,
+                        base_metadata=base_metadata,
+                        children=children,
+                        counter=counter,
+                        child_tokens=child_tokens,
+                        context_prefix=context_prefix,
+                    )
             elif acc_tokens + item_tokens > child_tokens and accumulator:
                 # Adding this would overflow — flush first, then start fresh
                 flush()
@@ -664,21 +692,28 @@ class EnhancedChunkingService:
         obj:            Any,
         path:           List[str],
         display_name:   str,
+        entry_identity: Optional[str],
         base_metadata:  Dict,
         children:       List[Dict[str, Any]],
         counter:        List[int],
+        child_tokens:   int,
         context_prefix: bool,
+        field_names:    Optional[List[str]] = None,
     ) -> None:
         """Serialize obj, optionally prepend breadcrumb, emit as a child chunk."""
-        body = json.dumps(obj, indent=2, ensure_ascii=False)
-        if not body or not body.strip():
+        raw_body = json.dumps(obj, indent=2, ensure_ascii=False)
+        if not raw_body or not raw_body.strip():
             return
-
-        if context_prefix:
-            breadcrumb = self._json_breadcrumb(display_name, path)
-            if breadcrumb:
-                sep  = "─" * min(len(breadcrumb), 60)
-                body = f"{breadcrumb}\n{sep}\n{body}"
+        breadcrumb = self._json_breadcrumb(display_name, path)
+        body = self._json_build_child_text(
+            obj=obj,
+            raw_body=raw_body,
+            display_name=display_name,
+            entry_identity=entry_identity,
+            breadcrumb=breadcrumb,
+            context_prefix=context_prefix,
+            field_names=field_names,
+        )
 
         counter[0] += 1
         child = self._create_chunk(
@@ -687,8 +722,14 @@ class EnhancedChunkingService:
             base_metadata,
             chunk_type="child",
         )
-        child["metadata"]["path"]       = path
-        child["metadata"]["breadcrumb"] = self._json_breadcrumb(display_name, path)
+        child["metadata"]["path"] = path
+        child["metadata"]["breadcrumb"] = breadcrumb
+        child["metadata"]["json_entry_name"] = display_name
+        child["metadata"]["json_path_depth"] = len(path)
+        if field_names:
+            child["metadata"]["field_names"] = field_names
+        if entry_identity:
+            child["metadata"]["json_entry_id"] = entry_identity
         children.append(child)
 
     @staticmethod
@@ -697,6 +738,17 @@ class EnhancedChunkingService:
         parts = [display_name] if display_name else []
         parts.extend(str(p) for p in path)
         return " > ".join(parts)
+
+    @staticmethod
+    def _json_entry_identity(entry: Any) -> Optional[str]:
+        """Extract a stable identity field so every child carries record context."""
+        if not isinstance(entry, dict):
+            return None
+        for key in ("book_id", "id", "uuid", "key", "isbn", "_source_url"):
+            value = entry.get(key)
+            if value is not None:
+                return str(value)
+        return None
 
     @staticmethod
     def _json_display_name(entry: Any, fallback_index: int) -> str:
@@ -713,6 +765,278 @@ class EnhancedChunkingService:
                 or f"Entry {fallback_index}"
             )
         return f"Entry {fallback_index}"
+
+    def _json_build_parent_text(
+        self,
+        entry: Any,
+        display_name: str,
+        entry_identity: Optional[str],
+    ) -> str:
+        raw_body = json.dumps(entry, indent=2, ensure_ascii=False)
+        semantic_lines = self._json_semantic_lines(entry, max_lines=14, max_depth=3)
+
+        sections: List[str] = []
+        if display_name:
+            sections.append(f"Record: {display_name}")
+        if entry_identity and entry_identity != display_name:
+            sections.append(f"Record ID: {entry_identity}")
+        if semantic_lines:
+            sections.append("Key facts:\n" + "\n".join(semantic_lines))
+        sections.append("JSON:\n" + raw_body)
+        return "\n\n".join(section for section in sections if section)
+
+    def _json_build_child_text(
+        self,
+        obj: Any,
+        raw_body: str,
+        display_name: str,
+        entry_identity: Optional[str],
+        breadcrumb: str,
+        context_prefix: bool,
+        field_names: Optional[List[str]] = None,
+    ) -> str:
+        semantic_lines = self._json_semantic_lines(obj, max_lines=10, max_depth=3)
+        sections: List[str] = []
+
+        if display_name:
+            sections.append(f"Record: {display_name}")
+        if entry_identity and entry_identity != display_name:
+            sections.append(f"Record ID: {entry_identity}")
+        if context_prefix and breadcrumb and breadcrumb != display_name:
+            sections.append(f"Path: {breadcrumb}")
+        if field_names:
+            sections.append(
+                "Fields: " + ", ".join(field_names[:8]) +
+                (f" (+{len(field_names) - 8} more)" if len(field_names) > 8 else "")
+            )
+        if semantic_lines:
+            sections.append("Facts:\n" + "\n".join(semantic_lines))
+        sections.append("JSON:\n" + raw_body)
+        return "\n\n".join(section for section in sections if section)
+
+    def _json_emit_large_scalar(
+        self,
+        value: Any,
+        path: List[str],
+        display_name: str,
+        entry_identity: Optional[str],
+        base_metadata: Dict,
+        children: List[Dict[str, Any]],
+        counter: List[int],
+        child_tokens: int,
+        context_prefix: bool,
+    ) -> None:
+        if isinstance(value, str):
+            parts = self._split_text_for_json_child(value, max(20, child_tokens - 30))
+            field_name = path[-1] if path else "value"
+            for idx, part in enumerate(parts, start=1):
+                segment_label = f"{field_name}_part_{idx}" if len(parts) > 1 else field_name
+                self._json_emit_child(
+                    obj={segment_label: part},
+                    path=path,
+                    display_name=display_name,
+                    entry_identity=entry_identity,
+                    base_metadata=base_metadata,
+                    children=children,
+                    counter=counter,
+                    child_tokens=child_tokens,
+                    context_prefix=context_prefix,
+                    field_names=[field_name],
+                )
+            return
+
+        self._json_emit_child(
+            obj=value,
+            path=path,
+            display_name=display_name,
+            entry_identity=entry_identity,
+            base_metadata=base_metadata,
+            children=children,
+            counter=counter,
+            child_tokens=child_tokens,
+            context_prefix=context_prefix,
+            field_names=[path[-1]] if path else None,
+        )
+
+    def _json_ordered_items(self, obj: Dict[str, Any]) -> List[Tuple[str, Any]]:
+        priority = {
+            "book_id": 0,
+            "id": 0,
+            "uuid": 0,
+            "key": 0,
+            "isbn": 0,
+            "name": 1,
+            "title": 1,
+            "label": 1,
+            "displayName": 1,
+            "type": 2,
+            "genre": 2,
+            "category": 2,
+            "categories": 2,
+            "rating": 2,
+            "score": 2,
+            "author": 3,
+            "publisher": 3,
+            "tags": 3,
+            "description": 4,
+            "summary": 4,
+            "content": 5,
+            "text": 5,
+            "body": 5,
+            "_source_url": 6,
+        }
+        order_index = {key: idx for idx, key in enumerate(obj.keys())}
+        return sorted(
+            obj.items(),
+            key=lambda item: (priority.get(item[0], 100), order_index[item[0]]),
+        )
+
+    def _json_semantic_lines(
+        self,
+        obj: Any,
+        max_lines: int = 10,
+        max_depth: int = 3,
+    ) -> List[str]:
+        lines: List[str] = []
+
+        def visit(value: Any, prefix: str = "", depth: int = 0) -> None:
+            if len(lines) >= max_lines:
+                return
+
+            if isinstance(value, dict):
+                if depth >= max_depth:
+                    compact = self._json_compact_value(value)
+                    if compact:
+                        lines.append(f"{prefix}: {compact}" if prefix else compact)
+                    return
+
+                for key, child in self._json_ordered_items(value):
+                    next_prefix = f"{prefix}.{key}" if prefix else str(key)
+                    visit(child, next_prefix, depth + 1)
+                    if len(lines) >= max_lines:
+                        return
+                return
+
+            if isinstance(value, list):
+                if not value:
+                    if prefix:
+                        lines.append(f"{prefix}: []")
+                    return
+
+                if self._json_list_is_scalar(value):
+                    scalar_values = [
+                        rendered
+                        for rendered in (self._json_scalar_to_text(item) for item in value[:6])
+                        if rendered is not None
+                    ]
+                    joined = ", ".join(scalar_values)
+                    if len(value) > 6:
+                        joined = f"{joined}, ... ({len(value)} items)" if joined else f"{len(value)} items"
+                    if prefix:
+                        lines.append(f"{prefix}: {joined}")
+                    elif joined:
+                        lines.append(joined)
+                    return
+
+                if depth >= max_depth:
+                    if prefix:
+                        lines.append(f"{prefix}: {len(value)} items")
+                    return
+
+                for idx, item in enumerate(value[:3]):
+                    next_prefix = f"{prefix}[{idx}]" if prefix else f"[{idx}]"
+                    visit(item, next_prefix, depth + 1)
+                    if len(lines) >= max_lines:
+                        return
+                if len(value) > 3 and prefix and len(lines) < max_lines:
+                    lines.append(f"{prefix}: {len(value)} items")
+                return
+
+            rendered = self._json_scalar_to_text(value)
+            if rendered is not None:
+                lines.append(f"{prefix}: {rendered}" if prefix else rendered)
+
+        visit(obj)
+        return lines[:max_lines]
+
+    @staticmethod
+    def _json_list_is_scalar(value: List[Any]) -> bool:
+        return all(not isinstance(item, (dict, list)) for item in value)
+
+    def _json_compact_value(self, value: Any) -> str:
+        if isinstance(value, dict):
+            keys = list(value.keys())
+            if not keys:
+                return "{}"
+            preview = ", ".join(keys[:4])
+            if len(keys) > 4:
+                preview += f", +{len(keys) - 4} more"
+            return f"object with keys [{preview}]"
+        if isinstance(value, list):
+            return f"list with {len(value)} items"
+        rendered = self._json_scalar_to_text(value)
+        return rendered or ""
+
+    @staticmethod
+    def _json_scalar_to_text(value: Any, max_length: int = 180) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float)):
+            return str(value)
+        text = re.sub(r"\s+", " ", str(value)).strip()
+        if not text:
+            return None
+        if len(text) > max_length:
+            return text[: max_length - 3].rstrip() + "..."
+        return text
+
+    def _split_text_for_json_child(self, text: str, max_tokens: int) -> List[str]:
+        normalized = re.sub(r"\s+", " ", (text or "")).strip()
+        if not normalized:
+            return []
+        if self.token_counter.count_tokens(normalized) <= max_tokens:
+            return [normalized]
+
+        parts: List[str] = []
+        current = ""
+
+        def append_piece(piece: str) -> None:
+            nonlocal current
+            if not piece:
+                return
+            candidate = f"{current} {piece}".strip() if current else piece
+            if self.token_counter.count_tokens(candidate) <= max_tokens:
+                current = candidate
+                return
+            if current:
+                parts.append(current)
+                current = ""
+            if self.token_counter.count_tokens(piece) <= max_tokens:
+                current = piece
+                return
+
+            words = piece.split()
+            buffer = ""
+            for word in words:
+                candidate_word = f"{buffer} {word}".strip() if buffer else word
+                if self.token_counter.count_tokens(candidate_word) <= max_tokens:
+                    buffer = candidate_word
+                else:
+                    if buffer:
+                        parts.append(buffer)
+                    buffer = word
+            if buffer:
+                current = buffer
+
+        for sentence in self._split_into_sentences(normalized):
+            append_piece(sentence)
+
+        if current:
+            parts.append(current)
+
+        return parts or [normalized]
 
     # ──────────────────────────────────────────────────────────────────────
     # STRATEGY: No-chunking
@@ -1324,7 +1648,12 @@ class EnhancedChunkingService:
         page_number = self._extract_page_number(text)
         token_count = self.token_counter.count_tokens(text)
         chunk: Dict[str, Any] = {
-            "chunk_id":    self._generate_chunk_id(text, chunk_index, chunk_type),
+            "chunk_id":    self._generate_chunk_id(
+                text,
+                chunk_index,
+                chunk_type,
+                base_metadata,
+            ),
             "text":        text,
             "char_count":  len(text),
             "token_count": token_count,
@@ -1345,9 +1674,23 @@ class EnhancedChunkingService:
         return int(matches[0]) if matches else 1
 
     def _generate_chunk_id(
-        self, text: str, chunk_index: int, chunk_type: str = "text"
+        self,
+        text: str,
+        chunk_index: int,
+        chunk_type: str = "text",
+        base_metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
-        hash_input = f"{text[:100].strip()}|{len(text)}|{chunk_index}|{chunk_type}"
+        base_metadata = base_metadata or {}
+        file_scope = (
+            base_metadata.get("file_id")
+            or base_metadata.get("storage_path")
+            or base_metadata.get("filename")
+            or ""
+        )
+        hash_input = (
+            f"{file_scope}|{text[:100].strip()}|{len(text)}|"
+            f"{chunk_index}|{chunk_type}"
+        )
         return hashlib.sha256(hash_input.encode()).hexdigest()[:16]
 
     def _chunk_fixed_size_chars(

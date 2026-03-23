@@ -27,6 +27,7 @@ class APISourceService:
         )
 
         aggregated_entries: List[Any] = []
+        page_urls: List[str] = []
         pages_fetched = 0
         page_marker = payload.pagination.start_page
 
@@ -56,6 +57,7 @@ class APISourceService:
                     source_name=payload.source_name,
                     base_metadata={
                         "api_url": str(payload.url),
+                        "page_url": str(response.url),
                         "page_index": attempt + 1,
                     },
                 )
@@ -65,11 +67,16 @@ class APISourceService:
                         break
                     raise ValueError(result.error or "Failed to extract API response")
 
-                page_entries = [entry.raw_object for entry in result.entries]
+                page_url = str(response.url)
+                page_entries = self._attach_source_url(
+                    [entry.raw_object for entry in result.entries],
+                    page_url,
+                )
                 if not page_entries:
                     break
 
                 aggregated_entries.extend(page_entries)
+                page_urls.append(page_url)
                 pages_fetched += 1
 
                 if payload.pagination.pagination_type == PaginationType.NONE:
@@ -97,6 +104,7 @@ class APISourceService:
             "json_path": payload.json_path,
             "field_paths": payload.field_paths,
             "pages_fetched": pages_fetched,
+            "page_urls": page_urls,
             "entries_extracted": len(aggregated_entries),
             "data": aggregated_entries,
             "markdown_text": markdown_text,
@@ -191,3 +199,26 @@ class APISourceService:
         if payload.pagination.pagination_type == PaginationType.OFFSET:
             return page_marker + page_size
         return page_marker
+
+    def _attach_source_url(
+        self,
+        entries: List[Any],
+        page_url: str,
+    ) -> List[Any]:
+        annotated_entries: List[Any] = []
+        for entry in entries:
+            if isinstance(entry, dict):
+                annotated_entries.append(
+                    {
+                        **entry,
+                        "_source_url": page_url,
+                    }
+                )
+            else:
+                annotated_entries.append(
+                    {
+                        "value": entry,
+                        "_source_url": page_url,
+                    }
+                )
+        return annotated_entries
