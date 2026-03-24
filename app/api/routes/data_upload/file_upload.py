@@ -245,6 +245,8 @@ def extract_document_background(
     try:
         from app.services.extraction.extractor_factory import ExtractorFactory
         from app.services.extraction.extractors.csv_extractor import CSVExtractor
+        from app.services.extraction.extractors.excel_extractor import ExcelExtractor
+        from app.services.extraction.extractors.excel_classifier import ExcelSheetClassifier
         from app.utils.markdown_converter import MarkdownConverter
         from app.core.database import get_db_context
         from app.db.models import FileMetadata, ProcessingStatus as DBProcessingStatus
@@ -355,6 +357,178 @@ def extract_document_background(
                     'rows_stored': rows_stored,
                     'extraction_time_seconds': total_time,
                 }
+
+            # ── Excel hybrid path: classify → row-wise and/or markdown ───
+            if isinstance(extractor, ExcelExtractor):
+                logger.info(f"📊 [Task {task_id}] Excel detected — classifying workbook...")
+
+                classifier    = ExcelSheetClassifier()
+                workbook_info = classifier.classify_workbook(storage_path)
+                file_decision = workbook_info["file_decision"]   # 'row_wise' | 'semantic'
+
+                logger.info(
+                    f"[Task {task_id}] Workbook decision: {file_decision.upper()} "
+                    f"(sheets: {list(workbook_info['sheets'].keys())})"
+                )
+
+                if file_decision == "row_wise":
+                    # --- Tabular: store rows directly in Qdrant ---------------
+                    from app.services.vector_store_service import VectorStoreService
+                    vector_store = VectorStoreService()
+
+                    extraction_start = time.time()
+                    success, extraction_metadata, fallback_markdown = extractor.extract_and_store(
+                        file_path           = storage_path,
+                        file_id             = file_id,
+                        filename            = safe_filename,
+                        knowledge_base_id   = knowledge_base_id,
+                        knowledge_base_name = knowledge_base_name,
+                        user_id             = user_id,
+                        vector_store        = vector_store,
+                    )
+                    extraction_time = time.time() - extraction_start
+
+                    if not success:
+                        error_msg = extraction_metadata.get("error", "Excel row storage failed")
+                        raise Exception(f"Excel extraction failed: {error_msg}")
+
+                    rows_stored = extraction_metadata.get("total_rows_stored", 0)
+
+                    if progress_callback:
+                        progress_callback(80.0)
+
+                    # Save fallback markdown for any text-heavy sheets in the workbook
+                    markdown_path_str = None
+                    if fallback_markdown.strip():
+                        markdown_converter = MarkdownConverter()
+                        user_markdown_dir  = Path(settings.markdown_dir) / user_id / knowledge_base_id
+                        user_markdown_dir.mkdir(parents=True, exist_ok=True)
+                        markdown_path      = user_markdown_dir / f"{file_id}.md"
+                        markdown_saved     = markdown_converter.save_markdown_file(
+                            fallback_markdown, str(markdown_path)
+                        )
+                        markdown_path_str  = str(markdown_path) if markdown_saved else None
+                        logger.info(
+                            f"[Task {task_id}] Fallback markdown saved for "
+                            f"{len(extraction_metadata.get('semantic_sheets', []))} text-heavy sheet(s)"
+                        )
+
+                    sheet_detail = extraction_metadata.get("sheet_detail", {})
+                    processing_meta = {
+                        "extraction_time_seconds": extraction_time,
+                        "extractor_used":          extractor.__class__.__name__,
+                        "pipeline":                "excel_hybrid_row_wise",
+                        "file_decision":           file_decision,
+                        "sheet_pipelines":         {
+                            k: v.get("pipeline", "unknown")
+                            for k, v in sheet_detail.items()
+                        },
+                        "tabular_sheets":          extraction_metadata.get("tabular_sheets", []),
+                        "semantic_sheets":         extraction_metadata.get("semantic_sheets", []),
+                        "total_rows_stored":       rows_stored,
+                        "total_rows_failed":       extraction_metadata.get("total_rows_failed", 0),
+                    }
+
+                    file_metadata.status          = DBProcessingStatus.COMPLETED
+                    file_metadata.processed_at    = datetime.utcnow()
+                    file_metadata.markdown_path   = markdown_path_str
+                    file_metadata.total_pages     = len(workbook_info["sheets"])
+                    file_metadata.word_count      = rows_stored
+                    file_metadata.image_count     = 0
+                    file_metadata.table_count     = 0
+                    file_metadata.chunks_created  = rows_stored
+                    file_metadata.processing_metadata = json.dumps(processing_meta)
+
+                    if kb:
+                        kb.total_chunks += rows_stored
+                        kb.updated_at    = datetime.utcnow()
+
+                    db.commit()
+                    total_time = time.time() - start_time
+
+                    if progress_callback:
+                        progress_callback(100.0)
+
+                    logger.info(
+                        f"🎉 [Task {task_id}] Excel (row-wise) COMPLETED in {total_time:.2f}s — "
+                        f"{rows_stored} rows indexed to Qdrant"
+                    )
+                    return {
+                        "success":                 True,
+                        "file_id":                 file_id,
+                        "status":                  "completed",
+                        "pipeline":                "excel_hybrid_row_wise",
+                        "rows_stored":             rows_stored,
+                        "tabular_sheets":          extraction_metadata.get("tabular_sheets", []),
+                        "semantic_sheets":         extraction_metadata.get("semantic_sheets", []),
+                        "extraction_time_seconds": total_time,
+                    }
+
+                else:
+                    # --- Semantic: standard extract() → save markdown ---------
+                    logger.info(f"📝 [Task {task_id}] Excel (semantic) — running extract()")
+                    extraction_start = time.time()
+                    markdown_content, success, extraction_metadata = extractor.extract(storage_path)
+                    extraction_time  = time.time() - extraction_start
+
+                    if not success:
+                        error_msg = extraction_metadata.get("error", "Excel extraction failed")
+                        raise Exception(f"Extraction failed: {error_msg}")
+
+                    total_pages = extraction_metadata.get("total_pages", 0)
+                    word_count  = extraction_metadata.get("word_count",  0)
+                    image_count = extraction_metadata.get("images_extracted", 0)
+                    table_count = extraction_metadata.get("tables_extracted", 0)
+
+                    if progress_callback:
+                        progress_callback(70.0)
+
+                    markdown_converter = MarkdownConverter()
+                    user_markdown_dir  = Path(settings.markdown_dir) / user_id / knowledge_base_id
+                    user_markdown_dir.mkdir(parents=True, exist_ok=True)
+                    markdown_path      = user_markdown_dir / f"{file_id}.md"
+                    markdown_saved     = markdown_converter.save_markdown_file(
+                        markdown_content, str(markdown_path)
+                    )
+
+                    if progress_callback:
+                        progress_callback(90.0)
+
+                    processing_meta = {
+                        "extraction_time_seconds": extraction_time,
+                        "extractor_used":          extractor.__class__.__name__,
+                        "pipeline":                "excel_semantic",
+                        "file_decision":           file_decision,
+                        **extraction_metadata,
+                    }
+
+                    file_metadata.status          = DBProcessingStatus.COMPLETED
+                    file_metadata.processed_at    = datetime.utcnow()
+                    file_metadata.markdown_path   = str(markdown_path) if markdown_saved else None
+                    file_metadata.total_pages     = total_pages
+                    file_metadata.word_count      = word_count
+                    file_metadata.image_count     = image_count
+                    file_metadata.table_count     = table_count
+                    file_metadata.processing_metadata = json.dumps(processing_meta)
+
+                    db.commit()
+                    total_time = time.time() - start_time
+
+                    if progress_callback:
+                        progress_callback(100.0)
+
+                    logger.info(
+                        f"🎉 [Task {task_id}] Excel (semantic) COMPLETED in {total_time:.2f}s"
+                    )
+                    return {
+                        "success":                 True,
+                        "file_id":                 file_id,
+                        "status":                  "completed",
+                        "pipeline":                "excel_semantic",
+                        "total_pages":             total_pages,
+                        "word_count":              word_count,
+                        "extraction_time_seconds": total_time,
+                    }
 
             # ── Standard path: extract → save markdown → COMPLETED ───────
             extraction_start = time.time()
