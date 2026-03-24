@@ -22,8 +22,6 @@ from app.core.task_manager import get_task_manager, shutdown_task_manager
 from app.api.routes.data_upload import database_upload, api_endpoint, file_upload, cloud_storage
 # Import routes
 from app.api.routes import (
-    api_sources,
-    upload,
     query,
     task_routes,
     knowledge_base,
@@ -200,8 +198,12 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 # Include routers
 app.include_router(knowledge_base.router)
-app.include_router(api_sources.router)
-app.include_router(upload.router)
+# app.include_router(upload.router)
+
+app.include_router(file_upload.router)
+app.include_router(cloud_storage.router)
+app.include_router(database_upload.router)
+app.include_router(api_endpoint.router)
 app.include_router(chunks.router)
 app.include_router(query.router)
 app.include_router(task_routes.router)
