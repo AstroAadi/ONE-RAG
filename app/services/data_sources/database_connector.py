@@ -210,20 +210,49 @@ class MSSQLConnector(DatabaseConnector):
 class MongoDBConnector(DatabaseConnector):
     """MongoDB database connector"""
 
+    @staticmethod
+    def _is_atlas_host(host: str) -> bool:
+        """
+        Detect MongoDB Atlas cluster hostnames.
+        Atlas uses DNS SRV records and must be connected via mongodb+srv://.
+        These hostnames typically end with .mongodb.net.
+        """
+        return host.strip().lower().endswith(".mongodb.net")
+
     def connect(self) -> bool:
         try:
             from pymongo import MongoClient
 
-            if self.config.get('username') and self.config.get('password'):
-                uri = (
-                    f"mongodb://{self.config['username']}:{self.config['password']}"
-                    f"@{self.config['host']}:{self.config['port']}/{self.config['database_name']}"
-                )
-            else:
-                uri = f"mongodb://{self.config['host']}:{self.config['port']}"
+            host = self.config['host']
+            use_srv = self._is_atlas_host(host)
 
-            if self.config.get('ssl_enabled', False):
-                uri += "?ssl=true"
+            if use_srv:
+                # MongoDB Atlas / SRV connection — port must NOT be included
+                # mongodb+srv:// resolves the hostname via DNS SRV records.
+                if self.config.get('username') and self.config.get('password'):
+                    uri = (
+                        f"mongodb+srv://{self.config['username']}:{self.config['password']}"
+                        f"@{host}/{self.config['database_name']}"
+                        f"?retryWrites=true&w=majority"
+                    )
+                else:
+                    uri = (
+                        f"mongodb+srv://{host}/{self.config['database_name']}"
+                        f"?retryWrites=true&w=majority"
+                    )
+                logger.info(f"Detected Atlas host — using mongodb+srv:// (no port)")
+            else:
+                # Standard self-hosted MongoDB — include host:port
+                if self.config.get('username') and self.config.get('password'):
+                    uri = (
+                        f"mongodb://{self.config['username']}:{self.config['password']}"
+                        f"@{host}:{self.config['port']}/{self.config['database_name']}"
+                    )
+                else:
+                    uri = f"mongodb://{host}:{self.config['port']}"
+
+                if self.config.get('ssl_enabled', False):
+                    uri += "?ssl=true"
 
             self.connection = MongoClient(
                 uri,
@@ -234,7 +263,7 @@ class MongoDBConnector(DatabaseConnector):
             self.connection.server_info()
 
             self.db = self.connection[self.config['database_name']]
-            logger.info(f"✓ Connected to MongoDB: {self.config['host']}:{self.config['port']}")
+            logger.info(f"✓ Connected to MongoDB: {host}")
             return True
         except Exception as e:
             logger.error(f"❌ MongoDB connection failed: {e}")
