@@ -1682,13 +1682,23 @@ class EnhancedChunkingService:
     ) -> str:
         base_metadata = base_metadata or {}
         file_scope = (
+            base_metadata.get("zip_archive")
+            or ""
+        )
+        zip_source_scope = (
+            base_metadata.get("zip_source_file")
+            or base_metadata.get("zip_file_name")
+            or ""
+        )
+        primary_scope = (
             base_metadata.get("file_id")
             or base_metadata.get("storage_path")
             or base_metadata.get("filename")
             or ""
         )
         hash_input = (
-            f"{file_scope}|{text[:100].strip()}|{len(text)}|"
+            f"{file_scope}|{zip_source_scope}|{primary_scope}|"
+            f"{text[:100].strip()}|{len(text)}|"
             f"{chunk_index}|{chunk_type}"
         )
         return hashlib.sha256(hash_input.encode()).hexdigest()[:16]

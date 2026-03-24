@@ -575,6 +575,10 @@ async def delete_document_from_kb(
             if markdown_path.exists():
                 markdown_path.unlink()
                 logger.info(f"  ✓ Deleted markdown: {markdown_path}")
+            markdown_bundle_dir = markdown_path.with_suffix("")
+            if markdown_bundle_dir.exists() and markdown_bundle_dir.is_dir():
+                shutil.rmtree(markdown_bundle_dir)
+                logger.info(f"  ✓ Deleted markdown bundle: {markdown_bundle_dir}")
         
         # Delete from database (cascades to chunks)
         db.delete(file_metadata)

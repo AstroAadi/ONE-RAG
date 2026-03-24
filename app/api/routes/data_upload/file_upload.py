@@ -29,6 +29,43 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/upload", tags=["Upload"])
 
 
+def _save_zip_markdown_bundle(
+    user_markdown_dir: Path,
+    file_id: str,
+    archive_name: str,
+    summary_markdown: str,
+    file_chunks: list[dict],
+    markdown_converter,
+):
+    from app.services.extraction.extractors.zip_extractor import ZIPExtractor
+
+    bundle_root = user_markdown_dir / file_id
+    archive_dir = bundle_root / ZIPExtractor._sanitize_path_part(archive_name)
+    index_markdown_path = user_markdown_dir / f"{file_id}.md"
+
+    if bundle_root.exists():
+        shutil.rmtree(bundle_root)
+
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    files_saved = 0
+    for chunk in file_chunks:
+        relative_md = chunk.get("markdown_relative_path")
+        if not relative_md:
+            relative_md = ZIPExtractor.source_path_to_markdown_path(
+                chunk.get("source_path", "")
+            ).as_posix()
+
+        target_path = archive_dir / Path(relative_md)
+        if markdown_converter.save_markdown_file(chunk.get("content", ""), str(target_path)):
+            files_saved += 1
+
+    markdown_converter.save_markdown_file(summary_markdown, str(archive_dir / "README.md"))
+    index_saved = markdown_converter.save_markdown_file(summary_markdown, str(index_markdown_path))
+
+    return index_saved, index_markdown_path, archive_dir, files_saved
+
+
 
 @router.post("/file-upload", response_model=FileUploadResponse)
 async def upload_file(
@@ -386,12 +423,26 @@ def extract_document_background(
             markdown_converter = MarkdownConverter()
             user_markdown_dir = Path(settings.markdown_dir) / user_id / knowledge_base_id
             user_markdown_dir.mkdir(parents=True, exist_ok=True)
-            markdown_path = user_markdown_dir / f"{file_id}.md"
+            file_chunks = extraction_metadata.get('file_chunks')
 
-            markdown_saved = markdown_converter.save_markdown_file(
-                markdown_content,
-                str(markdown_path)
-            )
+            if file_extension.lower() == "zip" and isinstance(file_chunks, list) and file_chunks:
+                archive_name = extraction_metadata.get('archive_name', Path(storage_path).stem)
+                markdown_saved, markdown_path, archive_markdown_dir, bundle_files_saved = _save_zip_markdown_bundle(
+                    user_markdown_dir=user_markdown_dir,
+                    file_id=file_id,
+                    archive_name=archive_name,
+                    summary_markdown=markdown_content,
+                    file_chunks=file_chunks,
+                    markdown_converter=markdown_converter,
+                )
+            else:
+                archive_markdown_dir = None
+                bundle_files_saved = 0
+                markdown_path = user_markdown_dir / f"{file_id}.md"
+                markdown_saved = markdown_converter.save_markdown_file(
+                    markdown_content,
+                    str(markdown_path)
+                )
 
             if progress_callback:
                 progress_callback(90.0)
@@ -405,10 +456,18 @@ def extract_document_background(
             file_metadata.image_count  = image_count
             file_metadata.table_count  = table_count
 
+            stored_extraction_metadata = dict(extraction_metadata)
+            if 'file_chunks' in stored_extraction_metadata:
+                stored_extraction_metadata.pop('file_chunks', None)
+                stored_extraction_metadata['file_chunks_count'] = len(file_chunks or [])
+            if archive_markdown_dir is not None:
+                stored_extraction_metadata['archive_markdown_dir'] = str(archive_markdown_dir)
+                stored_extraction_metadata['archive_bundle_files_saved'] = bundle_files_saved
+
             processing_meta = {
                 'extraction_time_seconds': extraction_time,
                 'extractor_used': extractor.__class__.__name__,
-                **extraction_metadata
+                **stored_extraction_metadata
             }
             file_metadata.processing_metadata = json.dumps(processing_meta)
 

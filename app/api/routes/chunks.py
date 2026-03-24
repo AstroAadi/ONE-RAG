@@ -36,7 +36,13 @@ def _get_zip_file_chunks(file_metadata, context: str = "") -> Optional[List[Dict
     try:
         from app.services.extraction.extractors.zip_extractor import ZIPExtractor
         zip_extractor = ZIPExtractor()
-        zip_file_chunks, zip_ok, _ = zip_extractor.extract_chunks(file_metadata.file_path)
+        zip_storage_path = getattr(file_metadata, "storage_path", None)
+        if not zip_storage_path:
+            logger.warning(
+                f"ZIP storage path missing{' (' + context + ')' if context else ''}"
+            )
+            return None
+        zip_file_chunks, zip_ok, _ = zip_extractor.extract_chunks(zip_storage_path)
         if not zip_ok or not zip_file_chunks:
             logger.warning(f"ZIP extract_chunks returned no data{' (' + context + ')' if context else ''} "
                            f"— falling back to flat markdown")
