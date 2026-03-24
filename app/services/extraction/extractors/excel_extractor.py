@@ -1,18 +1,34 @@
 """
-Excel File Extractor - XLSX/XLS/CSV
-Matches PDF extractor pattern with image caching and consistent flow
-Handles spreadsheets with multiple sheets, images, charts, and data
+Excel File Extractor  –  XLSX / XLS / XLSM
+===========================================
+Handles Excel workbooks with two distinct pipelines:
+
+  A) Semantic pipeline  (text-heavy workbooks)
+     extract() → returns markdown → caller saves it → /chunks/create →
+     /chunks/finalize  (any chunking strategy)
+
+  B) Row-wise pipeline  (tabular / financial workbooks)
+     extract_and_store() → embeds every data row → upserts each row as
+     a separate Qdrant point → no markdown produced for tabular sheets.
+     Text-heavy sheets inside the same workbook still produce a markdown
+     fragment that is saved to disk and used by the semantic pipeline.
+
+CSV and TSV files are handled by csv_extractor.py, NOT here.
 """
 
-import os
-from pathlib import Path
-from typing import Tuple, Dict, List, Optional
-import logging
-import re
+from __future__ import annotations
+
 import base64
+import json
+import logging
+import os
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
 import pandas as pd
 from openpyxl import load_workbook
-from openpyxl.drawing.image import Image as OpenpyxlImage
 
 try:
     from ..base_extractor import BaseExtractor
@@ -22,184 +38,454 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _string_to_uuid(text: str) -> str:
+    """Deterministic UUID v5 from any string."""
+    namespace = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+    return str(uuid.uuid5(namespace, text))
+
+
+def _row_to_text(sheet_name: str, row_index: int, row: pd.Series) -> str:
+    """
+    Convert one DataFrame row to a searchable plain-text sentence.
+
+    Format:
+        Sheet: <name> | Row <N>: col1: val1 | col2: val2 | …
+
+    Empty / NaN cells are skipped so they don't pollute the embedding.
+    """
+    parts = []
+    for col, val in row.items():
+        if pd.notna(val) and str(val).strip():
+            parts.append(f"{col}: {val}")
+    body = " | ".join(parts) if parts else "(empty row)"
+    return f"Sheet: {sheet_name} | Row {row_index}: {body}"
+
+
+# ── extractor ─────────────────────────────────────────────────────────────────
+
 class ExcelExtractor(BaseExtractor):
     """
-    Enhanced Excel extractor matching PDF extractor pattern
-    
-    Features:
-    - Image caching (avoid redundant API calls)
-    - Duplicate detection (skip same image multiple times)
-    - Multi-sheet support (each sheet = page)
-    - Chart extraction and description
-    - Consistent markdown structure
-    - Smart table formatting
-    
-    Supported formats:
-    - XLSX (Excel 2007+)
-    - XLS (Excel 97-2003) via pandas
-    - CSV (Comma-separated values)
-    - TSV (Tab-separated values)
+    Excel extractor supporting both semantic and row-wise pipelines.
+
+    Supported formats: xlsx, xls, xlsm
+    (csv / tsv → handled by CSVExtractor)
+
+    Key methods
+    -----------
+    extract()            Standard BaseExtractor contract.  Returns markdown.
+                         Used by the semantic pipeline.
+    extract_and_store()  Row-wise pipeline entry point.  Embeds every data
+                         row of tabular sheets and upserts to Qdrant.
+                         Returns (success, summary, fallback_markdown) where
+                         fallback_markdown covers any text-heavy sheets found
+                         inside the same workbook.
     """
-    
+
     def __init__(self, config: Optional[Dict] = None):
         super().__init__(config)
-        
+
         from app.services.image_cache_manager import get_image_cache
         from app.services.image_description_service import get_image_description_service
-        
-        self.image_cache = get_image_cache()
+
+        self.image_cache   = get_image_cache()
         self.image_service = get_image_description_service()
-        
-        # Tracking counters
+
         self._duplicates_skipped = 0
-        self._charts_found = 0
-        
-        # Configuration
-        self.max_rows_per_table = config.get('max_rows_per_table', 100) if config else 100
-        self.max_preview_rows = config.get('max_preview_rows', 20) if config else 20
-        self.include_formulas = config.get('include_formulas', True) if config else True
-        
-        logger.info("Excel Extractor initialized with caching and duplicate detection")
-    
+        self._charts_found       = 0
+
+        # max_rows_per_table is ONLY used in the markdown (semantic) path.
+        # The row-wise path always processes ALL rows — no cap.
+        cfg = config or {}
+        self.max_rows_per_table = cfg.get("max_rows_per_table", 100)
+        self.max_preview_rows   = cfg.get("max_preview_rows",   20)
+        self.include_formulas   = cfg.get("include_formulas",   True)
+
+        logger.info("ExcelExtractor initialised (csv/tsv → CSVExtractor)")
+
+    # ── format support ────────────────────────────────────────────────────────
+
     def _get_supported_formats(self) -> List[str]:
-        return ['xlsx', 'xls', 'xlsm', 'csv', 'tsv']
-    
+        # CSV and TSV intentionally removed — owned by CSVExtractor.
+        return ["xlsx", "xls", "xlsm"]
+
+    # ── validation ────────────────────────────────────────────────────────────
+
     def validate_file(self, file_path: str) -> Tuple[bool, str]:
-        """Validate Excel file"""
         path = Path(file_path)
-        
         if not path.exists():
             return False, "File does not exist"
-        
-        ext = path.suffix.lower().lstrip('.')
+        ext = path.suffix.lower().lstrip(".")
         if ext not in self.supported_formats:
-            return False, f"Not a supported Excel format. Supported: {', '.join(self.supported_formats)}"
-        
+            return False, (
+                f"Not a supported Excel format. Supported: "
+                f"{', '.join(self.supported_formats)}"
+            )
         if path.stat().st_size == 0:
             return False, "File is empty"
-        
         return True, "Valid Excel file"
-    
+
+    # =========================================================================
+    # PUBLIC API — extract()  (semantic / markdown pipeline)
+    # =========================================================================
+
     def extract(self, file_path: str) -> Tuple[str, bool, Dict]:
-        """Extract Excel file with proper flow matching PDF extractor"""
+        """
+        Extract Excel workbook to markdown.
+
+        Routing:
+            .xlsx / .xlsm  →  _extract_xlsx()
+            .xls           →  _extract_xls()
+        """
         try:
             is_valid, msg = self.validate_file(file_path)
             if not is_valid:
-                return "", False, {'error': msg}
-            
+                return "", False, {"error": msg}
+
             excel_stem = Path(file_path).stem
-            file_ext = Path(file_path).suffix.lower().lstrip('.')
-            
-            logger.info(f"📊 Extracting: {file_path}")
-            
-            # Route to appropriate extraction method
-            if file_ext in ['csv', 'tsv']:
-                return self._extract_csv(file_path, excel_stem, file_ext)
-            elif file_ext in ['xlsx', 'xlsm']:
+            file_ext   = Path(file_path).suffix.lower().lstrip(".")
+
+            logger.info("📊 Extracting (semantic): %s", file_path)
+
+            if file_ext in ("xlsx", "xlsm"):
                 return self._extract_xlsx(file_path, excel_stem)
-            elif file_ext == 'xls':
+            elif file_ext == "xls":
                 return self._extract_xls(file_path, excel_stem)
             else:
-                return "", False, {'error': f'Unsupported format: {file_ext}'}
-            
-        except Exception as e:
-            logger.error(f"❌ Excel extraction error: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return "", False, {'error': str(e)}
-    
-    def _extract_csv(
+                return "", False, {"error": f"Unsupported format: {file_ext}"}
+
+        except Exception as exc:
+            logger.error("❌ Excel extraction error: %s", exc, exc_info=True)
+            return "", False, {"error": str(exc)}
+
+    # =========================================================================
+    # PUBLIC API — extract_and_store()  (row-wise pipeline)
+    # =========================================================================
+
+    def extract_and_store(
         self,
         file_path: str,
+        file_id: str,
+        filename: str,
+        knowledge_base_id: str,
+        knowledge_base_name: str,
+        user_id: str,
+        vector_store,               # VectorStoreService instance
+        batch_size: int = 50,
+    ) -> Tuple[bool, Dict, str]:
+        """
+        Row-wise extraction + Qdrant storage for tabular Excel sheets.
+
+        Each sheet is individually classified by ExcelSheetClassifier:
+          • TABULAR   → every data row becomes one Qdrant point.
+          • TEXT_HEAVY → sheet is rendered to markdown for the fallback
+                         semantic pipeline.
+
+        Parameters
+        ----------
+        file_path          : absolute path to the Excel file.
+        file_id            : unique identifier for this upload.
+        filename           : human-readable filename (stored in payload).
+        knowledge_base_id  : KB this file belongs to.
+        knowledge_base_name: KB display name.
+        user_id            : owning user.
+        vector_store       : initialised VectorStoreService.
+        batch_size         : rows per embedding/upsert batch.
+
+        Returns
+        -------
+        (success, summary_dict, fallback_markdown_str)
+
+        summary_dict keys:
+            total_rows_stored  int   – rows successfully indexed in Qdrant.
+            total_rows_failed  int   – rows that failed.
+            tabular_sheets     list  – sheet names processed row-wise.
+            semantic_sheets    list  – sheet names rendered to markdown.
+            sheet_detail       dict  – per-sheet breakdown.
+
+        fallback_markdown_str:
+            Markdown content for all text-heavy sheets (may be empty string
+            if every sheet was tabular).  Caller is responsible for saving
+            this to disk and setting file_metadata.markdown_path.
+        """
+        from app.services.extraction.extractors.excel_classifier import ExcelSheetClassifier
+
+        try:
+            is_valid, msg = self.validate_file(file_path)
+            if not is_valid:
+                return False, {"error": msg}, ""
+
+            classifier   = ExcelSheetClassifier()
+            xl           = pd.ExcelFile(file_path)
+            excel_stem   = Path(file_path).stem
+            file_ext     = Path(file_path).suffix.lower().lstrip(".")
+
+            total_rows_stored  = 0
+            total_rows_failed  = 0
+            tabular_sheets:  List[str] = []
+            semantic_sheets: List[str] = []
+            sheet_detail:    Dict      = {}
+            fallback_md_parts: List[str] = []
+
+            logger.info(
+                "📊 extract_and_store: %d sheets in '%s'",
+                len(xl.sheet_names), filename,
+            )
+
+            for sheet_idx, sheet_name in enumerate(xl.sheet_names, start=1):
+                try:
+                    # Always read the FULL DataFrame — no row cap here.
+                    df = pd.read_excel(file_path, sheet_name=sheet_name)
+                except Exception as exc:
+                    logger.error("Cannot read sheet '%s': %s", sheet_name, exc)
+                    sheet_detail[sheet_name] = {"error": str(exc)}
+                    continue
+
+                decision = classifier.classify_sheet(df)
+
+                # ── TABULAR sheet → row-wise Qdrant storage ───────────────
+                if decision == "tabular":
+                    tabular_sheets.append(sheet_name)
+                    stored, failed = self._store_sheet_rows(
+                        df         = df,
+                        sheet_name = sheet_name,
+                        sheet_idx  = sheet_idx,
+                        file_id    = file_id,
+                        filename   = filename,
+                        knowledge_base_id   = knowledge_base_id,
+                        knowledge_base_name = knowledge_base_name,
+                        user_id    = user_id,
+                        vector_store= vector_store,
+                        batch_size = batch_size,
+                    )
+                    total_rows_stored += stored
+                    total_rows_failed += failed
+                    sheet_detail[sheet_name] = {
+                        "pipeline": "row_wise",
+                        "rows_total" : len(df),
+                        "rows_stored": stored,
+                        "rows_failed": failed,
+                    }
+                    logger.info(
+                        "  ✅ Sheet '%s' (tabular): %d/%d rows stored",
+                        sheet_name, stored, len(df),
+                    )
+
+                # ── TEXT_HEAVY sheet → render markdown ────────────────────
+                else:
+                    semantic_sheets.append(sheet_name)
+                    sheet_md = self._sheet_to_markdown(
+                        df         = df,
+                        sheet_name = sheet_name,
+                        sheet_idx  = sheet_idx,
+                        excel_stem = excel_stem,
+                    )
+                    fallback_md_parts.append(sheet_md)
+                    sheet_detail[sheet_name] = {
+                        "pipeline": "semantic",
+                        "rows": len(df),
+                    }
+                    logger.info(
+                        "  📝 Sheet '%s' (text-heavy): rendered to markdown",
+                        sheet_name,
+                    )
+
+            fallback_markdown = "\n\n".join(fallback_md_parts)
+
+            summary = {
+                "total_rows_stored": total_rows_stored,
+                "total_rows_failed": total_rows_failed,
+                "tabular_sheets"   : tabular_sheets,
+                "semantic_sheets"  : semantic_sheets,
+                "sheet_detail"     : sheet_detail,
+                "extraction_method": "excel_hybrid_row_wise",
+            }
+
+            success = total_rows_stored > 0 or bool(fallback_md_parts)
+            logger.info(
+                "🎉 extract_and_store complete: %d rows in Qdrant, "
+                "%d semantic sheets → markdown",
+                total_rows_stored, len(semantic_sheets),
+            )
+            return success, summary, fallback_markdown
+
+        except Exception as exc:
+            logger.error("❌ extract_and_store error: %s", exc, exc_info=True)
+            return False, {"error": str(exc)}, ""
+
+    # =========================================================================
+    # PRIVATE — row-wise storage helpers
+    # =========================================================================
+
+    def _store_sheet_rows(
+        self,
+        df: pd.DataFrame,
+        sheet_name: str,
+        sheet_idx: int,
+        file_id: str,
+        filename: str,
+        knowledge_base_id: str,
+        knowledge_base_name: str,
+        user_id: str,
+        vector_store,
+        batch_size: int,
+    ) -> Tuple[int, int]:
+        """
+        Embed and upsert every non-empty row of *df* as a Qdrant point.
+
+        Returns (rows_stored, rows_failed).
+
+        Bug fix applied here
+        --------------------
+        The old markdown path capped rows at max_rows_per_table (100).
+        This method intentionally iterates ALL rows of df — the caller
+        must pass the complete (uncapped) DataFrame.
+        """
+        # Drop rows where every cell is NaN (truly empty rows)
+        df = df.dropna(how="all").reset_index(drop=True)
+
+        if df.empty:
+            logger.warning("Sheet '%s' has no non-empty rows after cleaning.", sheet_name)
+            return 0, 0
+
+        total_stored = 0
+        total_failed = 0
+
+        for batch_start in range(0, len(df), batch_size):
+            batch = df.iloc[batch_start : batch_start + batch_size]
+            chunks: List[Dict] = []
+
+            for local_idx, (_, row) in enumerate(batch.iterrows()):
+                global_row_idx = batch_start + local_idx + 1   # 1-based
+                row_text  = _row_to_text(sheet_name, global_row_idx, row)
+                chunk_id  = _string_to_uuid(
+                    f"{file_id}::{sheet_name}::row::{global_row_idx}"
+                )
+                chunks.append({
+                    "text":        row_text,
+                    "chunk_id":    chunk_id,
+                    "chunk_index": global_row_idx - 1,   # 0-based for storage
+                    "metadata": {
+                        "chunk_type":  "excel_row",
+                        "sheet_name":  sheet_name,
+                        "row_index":   global_row_idx,
+                        "page_number": sheet_idx,
+                        "source_file": filename,
+                    },
+                })
+
+            try:
+                stored = vector_store.add_document_chunks(
+                    chunks             = chunks,
+                    file_id            = file_id,
+                    filename           = filename,
+                    knowledge_base_id  = knowledge_base_id,
+                    knowledge_base_name= knowledge_base_name,
+                    user_id            = user_id,
+                )
+                total_stored += stored
+                logger.debug(
+                    "  Sheet '%s' batch %d–%d: stored %d rows",
+                    sheet_name,
+                    batch_start + 1,
+                    batch_start + len(batch),
+                    stored,
+                )
+            except Exception as exc:
+                logger.error(
+                    "  Batch %d–%d of sheet '%s' failed: %s",
+                    batch_start + 1,
+                    batch_start + len(batch),
+                    sheet_name,
+                    exc,
+                )
+                total_failed += len(batch)
+
+        return total_stored, total_failed
+
+    # =========================================================================
+    # PRIVATE — markdown rendering (semantic / text-heavy path)
+    # =========================================================================
+
+    def _sheet_to_markdown(
+        self,
+        df: pd.DataFrame,
+        sheet_name: str,
+        sheet_idx: int,
         excel_stem: str,
-        file_ext: str
-    ) -> Tuple[str, bool, Dict]:
-        """Extract CSV/TSV files"""
+    ) -> str:
+        """
+        Render a single text-heavy sheet to markdown.
+
+        This reuses the same table-capped rendering as before so the
+        semantic pipeline receives reasonably sized markdown chunks.
+        The row cap (max_preview_rows) only applies here, never in the
+        row-wise path.
+        """
+        lines: List[str] = [f"## Sheet {sheet_idx}: {sheet_name}\n"]
+
+        if df.empty:
+            lines.append("*(Empty sheet)*\n")
+            return "\n".join(lines)
+
+        if len(df) > self.max_rows_per_table:
+            lines.append(
+                f"**Note**: Showing first {self.max_preview_rows} of {len(df)} rows\n"
+            )
+            df_show = df.head(self.max_preview_rows)
+        else:
+            df_show = df
+
+        lines.append(self._dataframe_to_markdown(df_show))
+        lines.append("")
+        lines.append(
+            f"**Sheet Statistics**: {len(df)} rows × {len(df.columns)} columns"
+        )
+        lines.append("")
+        return "\n".join(lines)
+
+    # ── existing markdown helpers (unchanged) ─────────────────────────────────
+
+    def _extract_xls(self, file_path: str, excel_stem: str) -> Tuple[str, bool, Dict]:
+        """Extract XLS files using pandas (no image support)."""
         try:
-            # Determine delimiter
-            delimiter = '\t' if file_ext == 'tsv' else ','
-            
-            # Read CSV
-            df = pd.read_csv(file_path, delimiter=delimiter, encoding='utf-8', on_bad_lines='skip')
-            
-            logger.info(f"📑 CSV has {len(df)} rows, {len(df.columns)} columns")
-            
-            # Build markdown
-            markdown_content = self._build_csv_markdown(df, excel_stem, file_ext)
-            
-            metadata = self.get_metadata(file_path)
-            metadata.update({
-                'extractor': 'ExcelExtractor_CSV',
-                'total_pages': 1,
-                'total_sheets': 1,
-                'row_count': len(df),
-                'column_count': len(df.columns),
-                'images_extracted': 0,
-                'extraction_method': 'pandas_csv'
-            })
-            
-            logger.info(f"✅ Complete: {len(df)} rows, {len(df.columns)} columns")
-            
-            return markdown_content, True, metadata
-            
-        except Exception as e:
-            logger.error(f"CSV extraction failed: {str(e)}")
-            return "", False, {'error': str(e)}
-    
-    def _extract_xls(
-        self,
-        file_path: str,
-        excel_stem: str
-    ) -> Tuple[str, bool, Dict]:
-        """Extract XLS files using pandas (no image support)"""
-        try:
-            # Read all sheets
             excel_file = pd.ExcelFile(file_path)
             sheet_names = excel_file.sheet_names
-            
-            logger.info(f"📑 XLS has {len(sheet_names)} sheets")
-            
-            # Process each sheet
-            sheets_data = {}
+            logger.info("📑 XLS has %d sheets", len(sheet_names))
+
+            sheets_data: Dict[str, pd.DataFrame] = {}
             for sheet_name in sheet_names:
                 df = pd.read_excel(file_path, sheet_name=sheet_name)
                 sheets_data[sheet_name] = df
-                logger.info(f"  Sheet '{sheet_name}': {len(df)} rows, {len(df.columns)} columns")
-            
-            # Build markdown
+                logger.info("  Sheet '%s': %d rows, %d cols", sheet_name, len(df), len(df.columns))
+
             markdown_content = self._build_xls_markdown(sheets_data, excel_stem)
-            
+
             total_rows = sum(len(df) for df in sheets_data.values())
-            total_cols = max(len(df.columns) for df in sheets_data.values()) if sheets_data else 0
-            
+            total_cols = max((len(df.columns) for df in sheets_data.values()), default=0)
+
             metadata = self.get_metadata(file_path)
             metadata.update({
-                'extractor': 'ExcelExtractor_XLS',
-                'total_pages': len(sheet_names),
-                'total_sheets': len(sheet_names),
-                'row_count': total_rows,
-                'column_count': total_cols,
-                'images_extracted': 0,
-                'extraction_method': 'pandas_xls',
-                'note': 'XLS format - images not supported'
+                "extractor":         "ExcelExtractor_XLS",
+                "total_pages":       len(sheet_names),
+                "total_sheets":      len(sheet_names),
+                "row_count":         total_rows,
+                "column_count":      total_cols,
+                "images_extracted":  0,
+                "extraction_method": "pandas_xls",
+                "note":              "XLS format — images not supported",
             })
-            
-            logger.info(f"✅ Complete: {len(sheet_names)} sheets")
-            
+            logger.info("✅ XLS complete: %d sheets", len(sheet_names))
             return markdown_content, True, metadata
-            
-        except Exception as e:
-            logger.error(f"XLS extraction failed: {str(e)}")
-            return "", False, {'error': str(e)}
-    
-    def _extract_xlsx(
-        self,
-        file_path: str,
-        excel_stem: str
-    ) -> Tuple[str, bool, Dict]:
-        """Extract XLSX files with full support (images, charts, data)"""
+
+        except Exception as exc:
+            logger.error("XLS extraction failed: %s", exc)
+            return "", False, {"error": str(exc)}
+
+    def _extract_xlsx(self, file_path: str, excel_stem: str) -> Tuple[str, bool, Dict]:
+        """Extract XLSX/XLSM with images, charts, and data."""
         try:
-            # Create image directory
             image_output_dir = self._create_image_directory(file_path, excel_stem)
             
             # Load workbook with data_only=True for values, plus a second pass
@@ -213,15 +499,12 @@ class ExcelExtractor(BaseExtractor):
                 except Exception as e:
                     logger.warning(f"Could not load formula workbook: {e}")
             sheet_names = wb.sheetnames
-            
-            logger.info(f"📑 XLSX has {len(sheet_names)} sheets")
-            
-            # Reset counters
+            logger.info("📑 XLSX has %d sheets", len(sheet_names))
+
             self._duplicates_skipped = 0
-            self._charts_found = 0
-            
-            # Process all sheets
-            sheets_data = []
+            self._charts_found       = 0
+
+            sheets_data: List[Dict] = []
             for sheet_idx, sheet_name in enumerate(sheet_names, start=1):
                 sheet_data = self._process_sheet(
                     wb,
@@ -233,7 +516,7 @@ class ExcelExtractor(BaseExtractor):
                     wb_formulas=wb_formulas
                 )
                 sheets_data.append(sheet_data)
-            
+
             wb.close()
             if wb_formulas:
                 wb_formulas.close()
@@ -253,36 +536,32 @@ class ExcelExtractor(BaseExtractor):
             
             metadata = self.get_metadata(file_path)
             metadata.update({
-                'extractor': 'ExcelExtractor_XLSX_Enhanced',
-                'total_pages': len(sheet_names),
-                'total_sheets': len(sheet_names),
-                'row_count': total_rows,
-                'images_extracted': total_images,
-                'charts_found': total_charts,
-                'images_described': sum(
-                    len([img for img in sheet['images'] if img.get('success')])
-                    for sheet in sheets_data
+                "extractor":              "ExcelExtractor_XLSX",
+                "total_pages":            len(sheet_names),
+                "total_sheets":           len(sheet_names),
+                "row_count":              total_rows,
+                "images_extracted":       total_images,
+                "charts_found":           total_charts,
+                "images_described":       sum(
+                    len([img for img in s["images"] if img.get("success")])
+                    for s in sheets_data
                 ),
-                'images_cached': cache_stats['hits'],
-                'images_skipped_duplicates': self._duplicates_skipped,
-                'cache_hit_rate': cache_stats['hit_rate_percent'],
-                'image_directory': str(image_output_dir),
-                'extraction_method': 'openpyxl+pandas'
+                "images_cached":          cache_stats["hits"],
+                "images_skipped_duplicates": self._duplicates_skipped,
+                "cache_hit_rate":         cache_stats["hit_rate_percent"],
+                "image_directory":        str(image_output_dir),
+                "extraction_method":      "openpyxl+pandas",
             })
-            
             logger.info(
-                f"✅ Complete: {len(sheet_names)} sheets, {total_images} images, "
-                f"{total_charts} charts ({metadata['images_cached']} cached)"
+                "✅ XLSX complete: %d sheets, %d images, %d charts",
+                len(sheet_names), total_images, total_charts,
             )
-            
             return final_markdown, True, metadata
-            
-        except Exception as e:
-            logger.error(f"XLSX extraction failed: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return "", False, {'error': str(e)}
-    
+
+        except Exception as exc:
+            logger.error("XLSX extraction failed: %s", exc, exc_info=True)
+            return "", False, {"error": str(exc)}
+
     def _process_sheet(
         self,
         wb,
@@ -335,13 +614,10 @@ class ExcelExtractor(BaseExtractor):
                 image_output_dir,
                 excel_stem
             )
-            
-            # Detect charts
-            charts_count = len(sheet._charts) if hasattr(sheet, '_charts') else 0
-            if charts_count > 0:
-                logger.info(f"  Found {charts_count} charts in sheet '{sheet_name}'")
+            charts_count = len(sheet._charts) if hasattr(sheet, "_charts") else 0
+            if charts_count:
                 self._charts_found += charts_count
-            
+
             return {
                 'sheet_name': sheet_name,
                 'sheet_idx': sheet_idx,
@@ -356,9 +632,9 @@ class ExcelExtractor(BaseExtractor):
                 'truncated': truncated,
                 'has_data': not df.empty
             }
-            
-        except Exception as e:
-            logger.error(f"Error processing sheet '{sheet_name}': {e}")
+
+        except Exception as exc:
+            logger.error("Error processing sheet '%s': %s", sheet_name, exc)
             return {
                 'sheet_name': sheet_name,
                 'sheet_idx': sheet_idx,
@@ -423,98 +699,75 @@ class ExcelExtractor(BaseExtractor):
         return formula_map
 
     def _process_sheet_images(
-        self,
-        sheet,
-        sheet_idx: int,
-        sheet_name: str,
-        image_output_dir: str,
-        excel_stem: str
+        self, sheet, sheet_idx: int, sheet_name: str,
+        image_output_dir: str, excel_stem: str,
     ) -> List[Dict]:
-        """Process images in a sheet with caching and duplicate detection"""
-        images_data = []
-        seen_hashes = set()
-        
+        """Extract and describe images from a single XLSX sheet."""
+        images_data: List[Dict] = []
+        seen_hashes: set = set()
         doc_context = f"Excel workbook: {excel_stem}, Sheet: {sheet_name}"
-        
-        # Get images from sheet
-        if not hasattr(sheet, '_images') or not sheet._images:
+
+        if not hasattr(sheet, "_images") or not sheet._images:
             return images_data
-        
+
         for img_idx, img in enumerate(sheet._images, start=1):
             try:
-                # Get image data
                 image_bytes = img._data()
-                
-                # Check for duplicates
-                img_hash = self.image_cache.compute_hash(image_bytes)
+                img_hash    = self.image_cache.compute_hash(image_bytes)
+
                 if img_hash in seen_hashes:
-                    logger.debug(f"  ⏭ Skipping duplicate image in sheet '{sheet_name}'")
+                    logger.debug("Skipping duplicate image in sheet '%s'", sheet_name)
                     self._duplicates_skipped += 1
                     continue
                 seen_hashes.add(img_hash)
-                
-                # Get cached description or generate new one
+
                 cached_desc = self.image_cache.get(image_bytes)
-                
                 if cached_desc:
                     description = cached_desc
-                    from_cache = True
-                    success = True
+                    from_cache  = True
+                    success     = True
                 else:
-                    # Generate AI description
                     if self.image_service.is_available():
-                        base64_image = base64.b64encode(image_bytes).decode('utf-8')
-                        # Determine media type from image format
+                        b64        = base64.b64encode(image_bytes).decode("utf-8")
                         media_type = self._get_media_type_from_bytes(image_bytes)
-                        
                         success, description = self.image_service.describe_image_from_base64(
-                            base64_image,
-                            media_type,
-                            context=doc_context,
-                            page_number=sheet_idx
+                            b64, media_type, context=doc_context, page_number=sheet_idx
                         )
                         from_cache = False
-                        
                         if success:
                             self.image_cache.put(image_bytes, description)
                     else:
-                        success = False
+                        success     = False
                         description = self.image_service.generate_fallback_description(
                             f"sheet_{sheet_idx}_image",
                             page_number=sheet_idx,
-                            image_type="spreadsheet image"
+                            image_type="spreadsheet image",
                         )
                         from_cache = False
-                
-                # Determine format
-                ext = self._detect_image_format(image_bytes)
-                
-                # Save image
-                filename = f"sheet_{sheet_idx:02d}_image_{img_idx:03d}.{ext}"
-                output_path = os.path.join(image_output_dir, filename)
-                
-                with open(output_path, 'wb') as f:
-                    f.write(image_bytes)
-                
+
+                ext      = self._detect_image_format(image_bytes)
+                img_file = f"sheet_{sheet_idx:02d}_image_{img_idx:03d}.{ext}"
+                out_path = os.path.join(image_output_dir, img_file)
+                with open(out_path, "wb") as fh:
+                    fh.write(image_bytes)
+
                 images_data.append({
-                    'img_idx': img_idx,
-                    'filename': filename,
-                    'sheet_idx': sheet_idx,
-                    'sheet_name': sheet_name,
-                    'format': ext,
-                    'description': description,
-                    'success': success,
-                    'from_cache': from_cache,
-                    'size_bytes': len(image_bytes)
+                    "img_idx":    img_idx,
+                    "filename":   img_file,
+                    "sheet_idx":  sheet_idx,
+                    "sheet_name": sheet_name,
+                    "format":     ext,
+                    "description":description,
+                    "success":    success,
+                    "from_cache": from_cache,
+                    "size_bytes": len(image_bytes),
                 })
-                
-                cache_str = "💾" if from_cache else "✓"
-                logger.info(f"  {cache_str} Image {img_idx} -> {filename} (sheet {sheet_idx})")
-                
-            except Exception as e:
-                logger.warning(f"  ⚠ Error processing image {img_idx} in sheet '{sheet_name}': {e}")
-                continue
-        
+                logger.info("  %s Image %d → %s (sheet %d)",
+                            "💾" if from_cache else "✓", img_idx, img_file, sheet_idx)
+
+            except Exception as exc:
+                logger.warning("Error processing image %d in sheet '%s': %s",
+                               img_idx, sheet_name, exc)
         return images_data
     
     def _build_csv_markdown(
@@ -579,9 +832,7 @@ class ExcelExtractor(BaseExtractor):
         return '\n'.join(result_lines)
     
     def _build_xls_markdown(
-        self,
-        sheets_data: Dict[str, pd.DataFrame],
-        excel_stem: str
+        self, sheets_data: Dict[str, pd.DataFrame], excel_stem: str
     ) -> str:
         """Build markdown for XLS files — includes statistics for retrieval"""
         result_lines = []
@@ -594,10 +845,9 @@ class ExcelExtractor(BaseExtractor):
         
         # Process each sheet as a page
         for page_num, (sheet_name, df) in enumerate(sheets_data.items(), start=1):
-            result_lines.append(f"## Page {page_num}: {sheet_name}\n")
-            
+            lines.append(f"## Page {page_num}: {sheet_name}\n")
             if df.empty:
-                result_lines.append("*(Empty sheet)*\n")
+                lines.append("*(Empty sheet)*\n")
                 continue
             
             # FIX: Embed all rows up to max_rows_per_table, not max_preview_rows
@@ -638,10 +888,7 @@ class ExcelExtractor(BaseExtractor):
         return '\n'.join(result_lines)
     
     def _build_xlsx_markdown(
-        self,
-        sheets_data: List[Dict],
-        excel_stem: str,
-        total_sheets: int
+        self, sheets_data: List[Dict], excel_stem: str, total_sheets: int
     ) -> str:
         """Build markdown for XLSX files — includes statistics and formulas for retrieval"""
         result_lines = []
@@ -663,22 +910,21 @@ class ExcelExtractor(BaseExtractor):
             if 'error' in sheet_data:
                 result_lines.append(f"*(Error: {sheet_data['error']})*\n")
                 continue
-            
-            # Add images first
-            for img_info in sheet_data['images']:
-                result_lines.append(f"**[Image Description]**: {img_info['description']}")
-                cache_str = "cached" if img_info.get('from_cache') else "described"
-                result_lines.append(f"*(Sheet {page_num}, {cache_str})*")
-                result_lines.append("")
-            
-            # Add chart note
-            if sheet_data['chart_count'] > 0:
-                result_lines.append(f"**Charts**: {sheet_data['chart_count']} chart(s) found in this sheet")
-                result_lines.append("")
-            
-            # Add data table
-            if not sheet_data['has_data']:
-                result_lines.append("*(No data in this sheet)*\n")
+
+            for img_info in sd["images"]:
+                lines.append(f"**[Image Description]**: {img_info['description']}")
+                lines.append(
+                    f"*(Sheet {page_num}, "
+                    f"{'cached' if img_info.get('from_cache') else 'described'})*"
+                )
+                lines.append("")
+
+            if sd["chart_count"] > 0:
+                lines.append(f"**Charts**: {sd['chart_count']} chart(s) found in this sheet")
+                lines.append("")
+
+            if not sd["has_data"]:
+                lines.append("*(No data in this sheet)*\n")
                 continue
             
             df = sheet_data['dataframe']
@@ -688,15 +934,10 @@ class ExcelExtractor(BaseExtractor):
                     f"**Note**: Showing first {self.max_rows_per_table} of "
                     f"{sheet_data['row_count']} rows\n"
                 )
-            
-            table_md = self._dataframe_to_markdown(df)
-            result_lines.append(table_md)
-            result_lines.append("")
-            
-            # Sheet statistics
-            result_lines.append(
-                f"**Sheet Statistics**: {sheet_data['row_count']} rows × "
-                f"{sheet_data['column_count']} columns"
+            lines.append(self._dataframe_to_markdown(sd["dataframe"]))
+            lines.append("")
+            lines.append(
+                f"**Sheet Statistics**: {sd['row_count']} rows × {sd['column_count']} columns"
             )
             result_lines.append("")
             
@@ -760,36 +1001,28 @@ class ExcelExtractor(BaseExtractor):
         return '\n'.join(lines)
     
     def _create_image_directory(self, file_path: str, excel_stem: str) -> str:
-        """Create directory for extracted images"""
         image_dir = os.path.join(
-            os.path.dirname(file_path),
-            "extracted_images",
-            excel_stem
+            os.path.dirname(file_path), "extracted_images", excel_stem
         )
         os.makedirs(image_dir, exist_ok=True)
         return image_dir
-    
+
     def _detect_image_format(self, image_bytes: bytes) -> str:
-        """Detect image format from bytes"""
-        # Check magic numbers
-        if image_bytes[:2] == b'\xff\xd8':
-            return 'jpg'
-        elif image_bytes[:8] == b'\x89PNG\r\n\x1a\n':
-            return 'png'
-        elif image_bytes[:3] == b'GIF':
-            return 'gif'
-        elif image_bytes[:2] == b'BM':
-            return 'bmp'
-        else:
-            return 'png'  # Default
-    
+        if image_bytes[:2] == b"\xff\xd8":
+            return "jpg"
+        if image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+            return "png"
+        if image_bytes[:3] == b"GIF":
+            return "gif"
+        if image_bytes[:2] == b"BM":
+            return "bmp"
+        return "png"
+
     def _get_media_type_from_bytes(self, image_bytes: bytes) -> str:
-        """Get MIME type from image bytes"""
-        ext = self._detect_image_format(image_bytes)
         return {
-            'jpg': 'image/jpeg',
-            'jpeg': 'image/jpeg',
-            'png': 'image/png',
-            'gif': 'image/gif',
-            'bmp': 'image/bmp'
-        }.get(ext, 'image/png')
+            "jpg":  "image/jpeg",
+            "jpeg": "image/jpeg",
+            "png":  "image/png",
+            "gif":  "image/gif",
+            "bmp":  "image/bmp",
+        }.get(self._detect_image_format(image_bytes), "image/png")

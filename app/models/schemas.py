@@ -40,6 +40,29 @@ class ChunkingStrategy(str, Enum):
     JSON="json"
 
 
+class DataSourceType(str, Enum):
+    """Data source types"""
+    FILE_UPLOAD = "file_upload"
+    DATABASE = "database"
+    API = "api"
+    CLOUD_STORAGE = "cloud_storage"
+
+
+class DatabaseType(str, Enum):
+    """Supported database types"""
+    MYSQL = "mysql"
+    POSTGRESQL = "postgresql"
+    MSSQL = "mssql"
+    MONGODB = "mongodb"
+
+
+class CloudStorageProvider(str, Enum):
+    """Supported cloud storage providers"""
+    AWS_S3 = "aws_s3"
+    AZURE_BLOB = "azure_blob"
+    GOOGLE_CLOUD = "google_cloud"
+
+
 # ==================== NEW: Knowledge Base Models ====================
 
 class KnowledgeBaseCreate(BaseModel):
@@ -92,12 +115,177 @@ class KnowledgeBaseUpdate(BaseModel):
     )
 
 
+# ==================== Data Source Configuration Models ====================
+
+class DatabaseConfig(BaseModel):
+    """Database connection configuration"""
+    model_config = ConfigDict(str_strip_whitespace=True)
+    
+    db_type: DatabaseType = Field(..., description="Database type")
+    host: str = Field(..., min_length=1, max_length=255, description="Database host")
+    port: int = Field(..., ge=1, le=65535, description="Database port")
+    username: str = Field(..., min_length=1, max_length=255, description="Database username")
+    password: str = Field(..., min_length=1, max_length=255, description="Database password")
+    database_name: str = Field(..., min_length=1, max_length=255, description="Database name")
+    query: str = Field(..., min_length=1, max_length=10000, description="SQL query to retrieve data")
+    ssl_enabled: bool = Field(default=False, description="Enable SSL connection")
+    connection_timeout: int = Field(default=30, ge=5, le=300, description="Connection timeout in seconds")
+
+
+class APIConfig(BaseModel):
+    """API endpoint configuration"""
+    model_config = ConfigDict(str_strip_whitespace=True)
+    
+    endpoint_url: str = Field(..., min_length=1, max_length=2000, description="API endpoint URL")
+    method: Literal["GET", "POST"] = Field(default="GET", description="HTTP method")
+    auth_type: Literal["none", "bearer", "api_key", "basic"] = Field(default="none", description="Authentication type")
+    api_key: Optional[str] = Field(default=None, max_length=500, description="API key")
+    bearer_token: Optional[str] = Field(default=None, max_length=1000, description="Bearer token")
+    basic_username: Optional[str] = Field(default=None, max_length=255, description="Basic auth username")
+    basic_password: Optional[str] = Field(default=None, max_length=255, description="Basic auth password")
+    headers: Optional[Dict[str, str]] = Field(default=None, description="Additional HTTP headers")
+    query_params: Optional[Dict[str, str]] = Field(default=None, description="Query parameters")
+    request_body: Optional[Dict[str, Any]] = Field(default=None, description="Request body for POST")
+    timeout: int = Field(default=30, ge=5, le=300, description="Request timeout in seconds")
+
+
+class CloudStorageConfig(BaseModel):
+    """Cloud storage configuration"""
+    model_config = ConfigDict(str_strip_whitespace=True)
+    
+    provider: CloudStorageProvider = Field(..., description="Cloud storage provider")
+    bucket_name: str = Field(..., min_length=1, max_length=255, description="Bucket/container name")
+    path_prefix: Optional[str] = Field(default="", max_length=1000, description="Path prefix/folder")
+    aws_access_key_id: Optional[str] = Field(default=None, max_length=255)
+    aws_secret_access_key: Optional[str] = Field(default=None, max_length=255)
+    aws_region: Optional[str] = Field(default="us-east-1", max_length=50)
+    azure_connection_string: Optional[str] = Field(default=None, max_length=1000)
+    azure_account_name: Optional[str] = Field(default=None, max_length=255)
+    azure_account_key: Optional[str] = Field(default=None, max_length=500)
+    google_credentials_json: Optional[str] = Field(default=None, max_length=5000)
+    google_project_id: Optional[str] = Field(default=None, max_length=255)
+
+
+class KnowledgeBaseCreateWithSource(BaseModel):
+    """Request to create a new knowledge base with data source"""
+    model_config = ConfigDict(str_strip_whitespace=True)
+    
+    knowledge_base_name: str = Field(..., min_length=1, max_length=255)
+    description: Optional[str] = Field(default=None, max_length=1000)
+    data_source_type: DataSourceType = Field(..., description="Data source type (cannot be changed later)")
+    database_config: Optional[DatabaseConfig] = Field(default=None)
+    api_config: Optional[APIConfig] = Field(default=None)
+    cloud_storage_config: Optional[CloudStorageConfig] = Field(default=None)
+    auto_sync_enabled: bool = Field(default=False)
+    sync_interval_hours: Optional[int] = Field(default=None, ge=1, le=168)
+    
+    @field_validator('knowledge_base_name')
+    @classmethod
+    def validate_kb_name(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("Knowledge base name cannot be empty")
+        invalid_chars = ['/', '\\', '<', '>', ':', '"', '|', '?', '*']
+        if any(char in v for char in invalid_chars):
+            raise ValueError(f"Knowledge base name contains invalid characters")
+        return v.strip()
+
+
+# ==================== Data Upload Request Models ====================
+
+class DatabaseKBRequest(BaseModel):
+    """Request model for creating database knowledge base"""
+    knowledge_base_name: str = Field(..., min_length=1, max_length=255)
+    description: Optional[str] = Field(None, max_length=1000)
+    database_config: DatabaseConfig
+    auto_sync_enabled: bool = Field(default=False)
+    sync_interval_hours: Optional[int] = Field(None, ge=1, le=168)
+    
+    @field_validator('knowledge_base_name')
+    @classmethod
+    def validate_kb_name(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("Knowledge base name cannot be empty")
+        invalid_chars = ['/', '\\', '<', '>', ':', '"', '|', '?', '*']
+        if any(char in v for char in invalid_chars):
+            raise ValueError(f"Knowledge base name contains invalid characters")
+        return v.strip()
+
+
+class DatabaseKBAddDataRequest(BaseModel):
+    """
+    Request model for PUT /api/upload/database/{kb_id}
+
+    The user provides fresh credentials + a new query each time.
+    Credentials are used in-memory only and are NEVER stored.
+    The new query's rows are APPENDED to the existing KB — nothing is deleted.
+    """
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    database_config: DatabaseConfig = Field(
+        ...,
+        description=(
+            "Connection details and the new query to run. "
+            "Credentials (username/password) are used once and never stored."
+        )
+    )
+    query_label: Optional[str] = Field(
+        default=None,
+        max_length=100,
+        description=(
+            "Optional label for this batch of rows "
+            "(e.g. 'orders_2024'). Auto-generated from timestamp if omitted."
+        )
+    )
+
+
+class APIKBRequest(BaseModel):
+    """Request model for creating API knowledge base"""
+    knowledge_base_name: str = Field(..., min_length=1, max_length=255)
+    description: Optional[str] = Field(None, max_length=1000)
+    api_config: APIConfig
+    auto_sync_enabled: bool = Field(default=False)
+    sync_interval_hours: Optional[int] = Field(None, ge=1, le=168)
+    
+    @field_validator('knowledge_base_name')
+    @classmethod
+    def validate_kb_name(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("Knowledge base name cannot be empty")
+        invalid_chars = ['/', '\\', '<', '>', ':', '"', '|', '?', '*']
+        if any(char in v for char in invalid_chars):
+            raise ValueError(f"Knowledge base name contains invalid characters")
+        return v.strip()
+
+
+class CloudStorageKBRequest(BaseModel):
+    """Request model for creating cloud storage knowledge base"""
+    knowledge_base_name: str = Field(..., min_length=1, max_length=255)
+    description: Optional[str] = Field(None, max_length=1000)
+    cloud_storage_config: CloudStorageConfig
+    auto_sync_enabled: bool = Field(default=False)
+    sync_interval_hours: Optional[int] = Field(None, ge=1, le=168)
+    
+    @field_validator('knowledge_base_name')
+    @classmethod
+    def validate_kb_name(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("Knowledge base name cannot be empty")
+        invalid_chars = ['/', '\\', '<', '>', ':', '"', '|', '?', '*']
+        if any(char in v for char in invalid_chars):
+            raise ValueError(f"Knowledge base name contains invalid characters")
+        return v.strip()
+
+
 class KnowledgeBaseInfo(BaseModel):
     """Knowledge base information"""
     model_config = ConfigDict(from_attributes=True)
     
     knowledge_base_id: str
     user_id: str
+    data_source_type: Optional[DataSourceType] = DataSourceType.FILE_UPLOAD
+    last_sync_at: Optional[datetime] = None
+    auto_sync_enabled: bool = False
+    sync_interval_hours: Optional[int] = None
     knowledge_base_name: str
     description: Optional[str] = None
     document_count: int = Field(default=0, ge=0)

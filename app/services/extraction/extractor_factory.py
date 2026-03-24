@@ -254,13 +254,19 @@ def auto_register_extractors():
     except ImportError as e:
         logger.warning(f"Could not register ZIPExtractor: {e}")
 
+    # CSV / TSV Extractor
+    try:
+        from .extractors.csv_extractor import CSVExtractor
+        ExtractorFactory.register_extractor(CSVExtractor)
+    except ImportError as e:
+        logger.warning(f"Could not register CSVExtractor: {e}")
     # JSON Extractor
     try:
         from .extractors.json_extractor import JSONExtractor
         ExtractorFactory.register_extractor(JSONExtractor)
     except ImportError as e:
         logger.warning(f"Could not register JSONExtractor: {e}")
-    
+
     # Log final status
     supported = ExtractorFactory.get_supported_formats()
     logger.info(f"Auto-registration complete. {len(supported)} formats supported: {', '.join(supported)}")

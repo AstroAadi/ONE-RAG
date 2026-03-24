@@ -19,6 +19,7 @@ from app.core.config import settings
 from app.core.database import create_all_tables, close_database_connections, check_database_health
 from app.core.task_manager import get_task_manager, shutdown_task_manager
 
+from app.api.routes.data_upload import database_upload, api_endpoint, file_upload, cloud_storage
 # Import routes
 from app.api.routes import (
     api_sources,
@@ -29,7 +30,7 @@ from app.api.routes import (
     chunk_edit,
     markdown_output,
     settings as settings_route,
-    chunks
+    chunks, 
 )
 
 # Configure logging with custom stream handler for Windows compatibility
