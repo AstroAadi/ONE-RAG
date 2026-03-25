@@ -106,7 +106,7 @@ class Settings(BaseSettings):
     
     # Database URL - supports both SQLite and PostgreSQL
     database_url: str = Field(
-        default="postgresql+psycopg2://postgres:aadi@localhost:5432/oneragdb",
+        default="postgresql+psycopg2://postgres:root@localhost:5432/oneragdb",
         description="Database URL (SQLite or PostgreSQL)"
     )
     
@@ -182,6 +182,12 @@ class Settings(BaseSettings):
     default_top_k: int = Field(default=5, ge=1, le=50)
     default_keyword_weight: float = Field(default=0.5, ge=0.0, le=1.0)
     default_semantic_weight: float = Field(default=0.5, ge=0.0, le=1.0)
+    retrieval_min_score: float = Field(
+        default=0.8,
+        ge=0.0,
+        le=1.0,
+        description="Minimum retrieval score required for a chunk to be used"
+    )
     
     # ==================== EXTRACTION ====================
     

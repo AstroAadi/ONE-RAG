@@ -1,0 +1,206 @@
+0721:     def _chunk_no_chunking(
+0722:         self, text: str, base_metadata: Dict[str, Any]
+0723:     ) -> List[Dict[str, Any]]:
+0724:         """Entire document becomes one single chunk."""
+0725:         if not text or not text.strip():
+0726:             return []
+0727:         return [self._create_chunk(
+0728:             text=text,
+0729:             chunk_index=1,
+0730:             base_metadata=base_metadata,
+0731:             chunk_type="full_document",
+0732:             position=0,
+0733:             total_tokens=self.token_counter.count_tokens(text),
+0734:         )]
+0735: 
+0736:     # ──────────────────────────────────────────────────────────────────────
+0737:     # STRATEGY: Fixed-size  (also used by DEFAULT)
+0738:     # ──────────────────────────────────────────────────────────────────────
+0739: 
+0740:     def _chunk_fixed_size(
+0741:         self, text: str, base_metadata: Dict
+0742:     ) -> List[Dict[str, Any]]:
+0743: 
+0744:         tokens = self.token_counter.get_tokens(text)
+0745:         if not tokens:
+0746:             return self._chunk_fixed_size_chars(text, base_metadata)
+0747: 
+0748:         stride = max(1, self.target_chunk_tokens - self.chunk_overlap_tokens)
+0749: 
+0750:         raw: List[Tuple[int, List[int]]] = []
+0751:         position = 0
+0752:         while position < len(tokens):
+0753:             window = tokens[position: position + self.target_chunk_tokens]
+0754:             raw.append((position, window))
+0755:             position += stride
+0756: 
+0757:         # Merge tiny tail into the previous window
+0758:         if len(raw) >= 2 and len(raw[-1][1]) < self.min_chunk_tokens:
+0759:             prev_pos, _ = raw[-2]
+0760:             last_pos, last_toks = raw[-1]
+0761:             merged_toks = tokens[prev_pos: last_pos + len(last_toks)]
+0762:             raw[-2] = (prev_pos, merged_toks)
+0763:             raw.pop()
+0764: 
+0765:         chunks: List[Dict[str, Any]] = []
+0766:         for chunk_index, (pos, toks) in enumerate(raw, start=1):
+0767:             chunk_text = self.token_counter.decode_tokens(toks)
+0768:             if chunk_text.strip():
+0769:                 chunks.append(self._create_chunk(
+0770:                     chunk_text, chunk_index, base_metadata,
+0771:                     position=pos, total_tokens=len(tokens),
+0772:                 ))
+0773:         return chunks
+0774: 
+0775:     # ──────────────────────────────────────────────────────────────────────
+0776:     # STRATEGY: Hierarchical
+0777:     # ──────────────────────────────────────────────────────────────────────
+0778: 
+0779:     def _chunk_hierarchical(
+0780:         self,
+0781:         text: str,
+0782:         base_metadata: Dict,
+0783:         max_parent_tokens: Optional[int] = None,
+0784:         max_child_tokens: Optional[int] = None,
+0785:         child_overlap_tokens: Optional[int] = None,
+0786:     ) -> List[Dict[str, Any]]:
+0787:         """
+0788:         Two-level hierarchical chunking.
+0789: 
+0790:         Phase 1 – Create overlapping parent windows over the full token sequence.
+0791:         Phase 2 – Split each parent into fixed-size overlapping child windows.
+0792: 
+0793:         Returns a flat list: parent chunks first, then child chunks in order.
+0794: 
+0795:         """
+0796:         if not text.strip():
+0797:             return []
+0798: 
+0799:         # ── Defaults ─────────────────────────────────────────────────────
+0800:         if max_parent_tokens is None:
+0801:             max_parent_tokens = max(600, self.target_chunk_tokens * 4)
+0802:         if max_child_tokens is None:
+0803:             max_child_tokens = self.target_chunk_tokens
+0804:         if child_overlap_tokens is None:
+0805:             child_overlap_tokens = self.chunk_overlap_tokens
+0806: 
+0807:         # Safety guards
+0808:         max_parent_tokens    = max(max_parent_tokens, max_child_tokens + 1)
+0809:         child_overlap_tokens = min(child_overlap_tokens, max_child_tokens // 2)
+0810:         parent_overlap_tokens = min(
+0811:             int(max_parent_tokens * 0.20), max_parent_tokens // 2
+0812:         )
+0813: 
+0814:         # ── Phase 1: parent windows ───────────────────────────────────────
+0815:         all_tokens = self.token_counter.get_tokens(text)
+0816:         if not all_tokens:
+0817:             return self._chunk_fixed_size_chars(text, base_metadata)
+0818: 
+0819:         parent_stride = max(1, max_parent_tokens - parent_overlap_tokens)
+0820:         parent_records: List[Dict[str, Any]] = []
+0821:         p_index  = 1
+0822:         position = 0
+0823: 
+0824:         while position < len(all_tokens):
+0825:             end      = min(position + max_parent_tokens, len(all_tokens))
+0826:             p_tokens = all_tokens[position:end]
+0827:             p_text   = self.token_counter.decode_tokens(p_tokens)
+0828:             if p_text.strip():
+0829:                 # FIX-4: use hash-based chunk_id (same as _create_chunk does)
+0830:                 p_chunk = self._create_chunk(
+0831:                     p_text, p_index, base_metadata,
+0832:                     position=position, total_tokens=len(all_tokens),
+0833:                     chunk_type="parent",
+0834:                 )
+0835:                 parent_records.append(p_chunk)
+0836:                 p_index += 1
+0837:             position += parent_stride
+0838: 
+0839:         # ── Phase 2: children for each parent ────────────────────────────
+0840:         all_output: List[Dict[str, Any]] = list(parent_records)   # parents first
+0841:         child_counter = 1
+0842: 
+0843:         for parent in parent_records:
+0844:             parent_id   = parent["chunk_id"]
+0845:             parent_text = parent["text"]
+0846: 
+0847:             children = self._split_into_children(
+0848:                 parent_text,
+0849:                 max_child_tokens,
+0850:                 child_overlap_tokens,
+0851:                 base_metadata,
+0852:                 parent_id=parent_id,
+0853:                 child_index_start=child_counter,
+0854:             )
+0855: 
+0856:             # Back-fill child IDs into parent metadata
+0857:             parent["metadata"]["child_chunk_ids"] = [c["chunk_id"] for c in children]
+0858: 
+0859:             all_output.extend(children)
+0860:             child_counter += len(children)
+0861: 
+0862:         n_parents  = len(parent_records)
+0863:         n_children = len(all_output) - n_parents
+0864:         logger.info(
+0865:             f"Hierarchical → {n_parents} parents, {n_children} children  "
+0866:             f"(parent={max_parent_tokens}t/{parent_overlap_tokens}t-overlap, "
+0867:             f"child={max_child_tokens}t/{child_overlap_tokens}t-overlap)"
+0868:         )
+0869:         return all_output
+0870: 
+0871:     def _split_into_children(
+0872:         self,
+0873:         text: str,
+0874:         max_child_tokens: int,
+0875:         child_overlap_tokens: int,
+0876:         base_metadata: Dict,
+0877:         parent_id: str,
+0878:         child_index_start: int = 1,
+0879:     ) -> List[Dict[str, Any]]:
+0880:         """
+0881:         Produce fixed-size overlapping child chunks from one parent's text.
+0882:         """
+0883:         tokens = self.token_counter.get_tokens(text)
+0884:         if not tokens:
+0885:             return []
+0886: 
+0887:         stride = max(1, max_child_tokens - child_overlap_tokens)
+0888: 
+0889:         raw: List[Tuple[int, List[int]]] = []
+0890:         position = 0
+0891:         while position < len(tokens):
+0892:             window = tokens[position: position + max_child_tokens]
+0893:             raw.append((position, window))
+0894:             position += stride
+0895: 
+0896:         # FIX-2: merge tiny tail into previous window
+0897:         if len(raw) >= 2 and len(raw[-1][1]) < self.min_chunk_tokens:
+0898:             prev_pos, _ = raw[-2]
+0899:             last_pos, last_toks = raw[-1]
+0900:             merged_toks = tokens[prev_pos: last_pos + len(last_toks)]
+0901:             raw[-2] = (prev_pos, merged_toks)
+0902:             raw.pop()
+0903: 
+0904:         children: List[Dict[str, Any]] = []
+0905:         for local_i, (pos, toks) in enumerate(raw):
+0906:             chunk_text = self.token_counter.decode_tokens(toks)
+0907:             if not chunk_text.strip():
+0908:                 continue
+0909:             child = self._create_chunk(
+0910:                 chunk_text,
+0911:                 child_index_start + local_i,
+0912:                 base_metadata,
+0913:                 position=pos,
+0914:                 total_tokens=len(tokens),
+0915:                 chunk_type="child",
+0916:             )
+0917:             # FIX-3 & FIX-4: always stamp the parent reference
+0918:             child["metadata"]["parent_chunk_id"] = parent_id
+0919:             children.append(child)
+0920: 
+0921:         return children
+0922: 
+0923:     # ──────────────────────────────────────────────────────────────────────
+0924:     # STRATEGY: Semantic
+0925:     # ──────────────────────────────────────────────────────────────────────
+0926: 

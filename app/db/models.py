@@ -41,6 +41,7 @@ class ChunkingStrategyEnum(str, enum.Enum):
     HIERARCHICAL = "hierarchical"
     SEMANTIC = "semantic"
     NO_CHUNKING = "no_chunking"
+    JSON="json"
 
 
 class DataSourceType(str, enum.Enum):
@@ -356,6 +357,3 @@ class ConversationHistory(Base):
     
     def __repr__(self) -> str:
         return f"<ConversationHistory(conversation_id={self.conversation_id}, role={self.role})>"
-    
-
-    
