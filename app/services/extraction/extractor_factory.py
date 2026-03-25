@@ -248,11 +248,11 @@ def auto_register_extractors():
         logger.warning(f"Could not register MDXExtractor: {e}")
     
     # XLS Extractor
-    try:
-        from .extractors.xls_extractor import XLSExtractor
-        ExtractorFactory.register_extractor(XLSExtractor)
-    except ImportError as e:
-        logger.warning(f"Could not register XLSExtractor: {e}")
+    # try:
+    #     from .extractors.xls_extractor import XLSExtractor
+    #     ExtractorFactory.register_extractor(XLSExtractor)
+    # except ImportError as e:
+    #     logger.warning(f"Could not register XLSExtractor: {e}")
 
     # CSV / TSV Extractor
     try:

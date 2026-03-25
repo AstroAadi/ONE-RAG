@@ -19,3 +19,6 @@ venv/
 docs/
 model_test.py
 vlm.py
+INGESTION_IMPLEMENTATION.md
+RESTRUCTURE_CHECKLIST.md
+QUICK_START.md

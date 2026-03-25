@@ -199,6 +199,53 @@ class Settings(BaseSettings):
     enable_performance_metrics: bool = Field(default=True)
     log_file_path: Path = Field(default=Path("./logs/rag_system.log"))
     
+    # ==================== DATA SOURCE CONFIGURATION ====================
+    
+    data_source: Literal["file_upload", "cloud_storage", "database", "api"] = Field(
+        default="file_upload",
+        description="Data source type: file_upload, cloud_storage, database, or api"
+    )
+    
+    # File Upload Configuration
+    file_path: Optional[str] = Field(
+        default=None,
+        description="Path to single file or directory for file_upload source"
+    )
+    
+    # Knowledge Base Configuration
+    knowledge_base_id: str = Field(
+        default="default_kb",
+        description="Knowledge base identifier for organizing chunks"
+    )
+    
+    # Chunking Strategy Configuration
+    chunking_strategy: Literal["default", "fixed_size", "semantic", "hierarchical", "no_chunking"] = Field(
+        default="fixed_size",
+        description="Chunking strategy to use during ingestion"
+    )
+    
+    # Cloud Storage Configuration (Placeholder for now)
+    cloud_storage_provider: Optional[Literal["aws_s3", "azure_blob", "google_cloud"]] = Field(
+        default=None,
+        description="Cloud storage provider (aws_s3, azure_blob, google_cloud)"
+    )
+    cloud_storage_bucket: Optional[str] = Field(default=None)
+    cloud_storage_prefix: Optional[str] = Field(default=None)
+    
+    # Database Source Configuration (Placeholder for now)
+    data_source_db_type: Optional[Literal["mysql", "postgresql", "mssql", "mongodb"]] = Field(
+        default=None,
+        description="Database type for database source"
+    )
+    data_source_db_url: Optional[str] = Field(default=None, description="Database connection URL")
+    data_source_db_table: Optional[str] = Field(default=None, description="Table name to ingest")
+    data_source_db_query: Optional[str] = Field(default=None, description="Custom SQL query")
+    
+    # API Source Configuration (Placeholder for now)
+    data_source_api_url: Optional[str] = Field(default=None, description="API endpoint URL")
+    data_source_api_key: Optional[str] = Field(default=None, description="API authentication key")
+    data_source_api_headers: Optional[dict] = Field(default=None, description="Custom API headers")
+    
     # ==================== ERROR HANDLING ====================
     
     max_retries: int = Field(default=3, ge=0, le=10)
