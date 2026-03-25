@@ -1,108 +1,347 @@
+# import logging
+# import re
+# import uuid
+# from datetime import datetime
 
-from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Body
-from sqlalchemy.orm import Session
+# from fastapi import APIRouter, Depends, HTTPException, Body
+# from sqlalchemy.orm import Session
+
+# from app.models.schemas import APIConfig, APIKBRequest
+# from app.core.dependencies import get_user_id, get_database_session
+# from app.db.models import KnowledgeBase
+
+# logger = logging.getLogger(__name__)
+
+# router = APIRouter(prefix="/api/upload", tags=["API Upload"])
+
+
+# # ── Helpers (mirrors api_sources.py) ─────────────────────────────────────────
+
+# def _normalise_kb_name(source_name: str) -> str:
+#     cleaned = re.sub(r'[\\/<>:"|?*]+', " ", (source_name or "").strip())
+#     cleaned = " ".join(cleaned.split())
+#     return (cleaned[:255] or "API Source")
+
+
+# def _get_knowledge_base_by_id(
+#     db: Session,
+#     user_id: str,
+#     knowledge_base_id: str,
+# ) -> KnowledgeBase:
+#     kb = db.query(KnowledgeBase).filter(
+#         KnowledgeBase.knowledge_base_id == knowledge_base_id,
+#         KnowledgeBase.user_id == user_id,
+#     ).first()
+#     if not kb:
+#         raise HTTPException(
+#             status_code=404,
+#             detail=f"Knowledge base not found: {knowledge_base_id}",
+#         )
+#     return kb
+
+
+# def _get_or_create_knowledge_base(
+#     db: Session,
+#     user_id: str,
+#     knowledge_base_name: str,
+#     description: str = None,
+# ) -> KnowledgeBase:
+#     normalized_name = knowledge_base_name.lower()
+#     kb = db.query(KnowledgeBase).filter(
+#         KnowledgeBase.user_id == user_id,
+#         KnowledgeBase.knowledge_base_name_normalized == normalized_name,
+#     ).first()
+
+#     if kb:
+#         return kb
+
+#     kb = KnowledgeBase(
+#         knowledge_base_id=str(uuid.uuid4()),
+#         user_id=user_id,
+#         knowledge_base_name=knowledge_base_name,
+#         knowledge_base_name_normalized=normalized_name,
+#         description=description,
+#         document_count=0,
+#         total_chunks=0,
+#         total_size_bytes=0,
+#         created_at=datetime.utcnow(),
+#     )
+#     db.add(kb)
+#     db.flush()
+#     return kb
+
+
+# # ── Endpoint ──────────────────────────────────────────────────────────────────
+
+# @router.post("/endpoint", response_model=dict)
+# async def create_api_kb(
+#     request: APIKBRequest = Body(...),
+#     user_id: str = Depends(get_user_id),
+#     db: Session = Depends(get_database_session),
+# ):
+#     """
+#     Create or retrieve a knowledge base configured for an API source.
+
+#     Headers:
+#         X-User-ID: User identifier (REQUIRED)
+
+#     Request Body (JSON):
+#         {
+#             "knowledge_base_name": "External API",
+#             "description": "API data source",
+#             "api_config": {
+#                 "endpoint_url": "https://api.example.com/data",
+#                 "method": "GET",
+#                 "auth_type": "bearer",
+#                 "bearer_token": "your-token",
+#                 "headers": {"Accept": "application/json"},
+#                 "timeout": 30
+#             },
+#             "auto_sync_enabled": true,
+#             "sync_interval_hours": 12
+#         }
+#     """
+#     try:
+#         api_cfg = request.api_config
+#         knowledge_base_name = _normalise_kb_name(request.knowledge_base_name)
+
+#         kb = _get_or_create_knowledge_base(
+#             db,
+#             user_id,
+#             knowledge_base_name,
+#             description=request.description,
+#         )
+
+#         # Persist API config and sync settings on the KB record.
+#         # TODO: Encrypt sensitive fields (bearer_token, api_key) before storing.
+#         kb.data_source_config = api_cfg.model_dump()
+#         kb.auto_sync_enabled = request.auto_sync_enabled
+#         kb.sync_interval_hours = request.sync_interval_hours
+#         kb.updated_at = datetime.utcnow()
+
+#         db.commit()
+#         db.refresh(kb)
+
+#         logger.info(
+#             "KB ready for API source: %s - '%s' for user %s",
+#             kb.knowledge_base_id, kb.knowledge_base_name, user_id,
+#         )
+
+#         return {
+#             "knowledge_base_id": kb.knowledge_base_id,
+#             "knowledge_base_name": kb.knowledge_base_name,
+#             "data_source_type": "api",
+#             "endpoint_url": api_cfg.endpoint_url,
+#             "method": api_cfg.method,
+#             "auto_sync_enabled": request.auto_sync_enabled,
+#             "sync_interval_hours": request.sync_interval_hours,
+#             "message": "API knowledge base created successfully. Sync not yet implemented.",
+#             "warning": "API credentials stored unencrypted — implement encryption before production!",
+#         }
+
+#     except HTTPException:
+#         raise
+#     except Exception as exc:
+#         db.rollback()
+#         logger.error("Error creating API KB: %s", exc, exc_info=True)
+#         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+import logging
+import json
+import re
 import uuid
 from datetime import datetime
-import logging
+from pathlib import Path
 
-from app.models.schemas import APIConfig, APIKBRequest
-from app.core.dependencies import get_user_id, get_database_session
-from app.db.models import KnowledgeBase, DataSourceType as DBDataSourceType
+import httpx
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+
+from app.api_upload import APISourceInput
+from app.core.config import settings
+from app.core.dependencies import get_database_session, get_user_id
+from app.db.models import (
+    FileMetadata,
+    FileType,
+    KnowledgeBase,
+    ProcessingStatus as DBProcessingStatus,
+)
+from app.services.api_source_service import APISourceService
+from app.utils.file_validator import FileValidator
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/upload", tags=["API Upload"])
+router = APIRouter(prefix="/api/sources", tags=["Sources"])
 
 
-@router.post("/api-endpoint", response_model=dict)
-async def create_api_kb(
-    request: APIKBRequest = Body(...),
+def _normalise_kb_name(source_name: str) -> str:
+    cleaned = re.sub(r'[\\/<>:"|?*]+', " ", (source_name or "").strip())
+    cleaned = " ".join(cleaned.split())
+    return (cleaned[:255] or "API Source")
+
+
+def _get_knowledge_base_by_id(
+    db: Session,
+    user_id: str,
+    knowledge_base_id: str,
+) -> KnowledgeBase:
+    kb = db.query(KnowledgeBase).filter(
+        KnowledgeBase.knowledge_base_id == knowledge_base_id,
+        KnowledgeBase.user_id == user_id,
+    ).first()
+    if not kb:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Knowledge base not found: {knowledge_base_id}",
+        )
+    return kb
+
+
+def _get_or_create_knowledge_base(
+    db: Session,
+    user_id: str,
+    knowledge_base_name: str,
+) -> KnowledgeBase:
+    normalized_name = knowledge_base_name.lower()
+    kb = db.query(KnowledgeBase).filter(
+        KnowledgeBase.user_id == user_id,
+        KnowledgeBase.knowledge_base_name_normalized == normalized_name,
+    ).first()
+
+    if kb:
+        return kb
+
+    kb = KnowledgeBase(
+        knowledge_base_id=str(uuid.uuid4()),
+        user_id=user_id,
+        knowledge_base_name=knowledge_base_name,
+        knowledge_base_name_normalized=normalized_name,
+        document_count=0,
+        total_chunks=0,
+        total_size_bytes=0,
+        created_at=datetime.utcnow(),
+    )
+    db.add(kb)
+    db.flush()
+    return kb
+
+
+def _persist_api_source_result(
+    db: Session,
+    user_id: str,
+    payload: APISourceInput,
+    extraction_result: dict,
+) -> dict:
+    if payload.knowledge_base_id:
+        kb = _get_knowledge_base_by_id(db, user_id, payload.knowledge_base_id)
+    else:
+        knowledge_base_name = _normalise_kb_name(
+            payload.knowledge_base_name or payload.source_name
+        )
+        kb = _get_or_create_knowledge_base(db, user_id, knowledge_base_name)
+
+    file_id = str(uuid.uuid4())
+    base_name = FileValidator.get_safe_filename(
+        f"{payload.source_name or 'api_source'}.json"
+    )
+    unique_filename = f"{file_id}_{base_name}"
+
+    user_upload_dir = Path(settings.upload_dir) / user_id
+    user_upload_dir.mkdir(parents=True, exist_ok=True)
+    storage_path = user_upload_dir / unique_filename
+
+    user_markdown_dir = Path(settings.markdown_dir) / user_id / kb.knowledge_base_id
+    user_markdown_dir.mkdir(parents=True, exist_ok=True)
+    markdown_path = user_markdown_dir / f"{file_id}.json"
+
+    markdown_text = extraction_result["markdown_text"]
+    storage_path.write_text(markdown_text, encoding="utf-8")
+    markdown_path.write_text(markdown_text, encoding="utf-8")
+
+    file_size_bytes = len(markdown_text.encode("utf-8"))
+    now = datetime.utcnow()
+
+    file_metadata = FileMetadata(
+        file_id=file_id,
+        user_id=user_id,
+        knowledge_base_id=kb.knowledge_base_id,
+        original_filename=base_name,
+        safe_filename=unique_filename,
+        file_extension="json",
+        file_type=FileType.TEXT,
+        file_size_bytes=file_size_bytes,
+        storage_path=str(storage_path),
+        markdown_path=str(markdown_path),
+        status=DBProcessingStatus.COMPLETED,
+        uploaded_at=now,
+        processed_at=now,
+        total_pages=extraction_result.get("pages_fetched", 0),
+        processing_metadata=json.dumps(
+            {
+                "source_type": "api",
+                "source_name": payload.source_name,
+                "url": str(payload.url),
+                "http_method": payload.http_method.value,
+                "json_path": payload.json_path,
+                "field_paths": payload.field_paths,
+                "page_urls": extraction_result.get("page_urls", []),
+            },
+            ensure_ascii=False,
+        ),
+        word_count=len(markdown_text.split()),
+    )
+    db.add(file_metadata)
+
+    kb.document_count += 1
+    kb.total_size_bytes += file_size_bytes
+    kb.updated_at = now
+
+    db.commit()
+    db.refresh(file_metadata)
+
+    return {
+        "file_id": file_metadata.file_id,
+        "knowledge_base_id": kb.knowledge_base_id,
+        "knowledge_base_name": kb.knowledge_base_name,
+        "markdown_path": file_metadata.markdown_path,
+        "storage_path": file_metadata.storage_path,
+        "status": file_metadata.status.value,
+    }
+
+
+@router.post("/api/extract")
+async def extract_api_source(
+    payload: APISourceInput,
     user_id: str = Depends(get_user_id),
-    db: Session = Depends(get_database_session)
+    db: Session = Depends(get_database_session),
 ):
     """
-    Create a knowledge base with API source
-    
-    Headers:
-        X-User-ID: User identifier (REQUIRED)
-    
-    Request Body (JSON):
-        {
-            "knowledge_base_name": "External API",
-            "description": "API data source",
-            "api_config": {
-                "endpoint_url": "https://api.example.com/data",
-                "method": "GET",
-                "auth_type": "bearer",
-                "bearer_token": "your-token",
-                "headers": {"Accept": "application/json"},
-                "timeout": 30
-            },
-            "auto_sync_enabled": true,
-            "sync_interval_hours": 12
-        }
+    Call the configured API endpoint and return the extracted JSON data.
+
+    The response is already filtered by `json_path` and `field_paths`, so the
+    returned `data` and `markdown_text` are ready for downstream chunking.
     """
     try:
-        api_cfg = request.api_config
-        
-        # Normalize KB name
-        normalized_name = request.knowledge_base_name.lower().strip()
-        
-        # Check if KB exists
-        existing = db.query(KnowledgeBase).filter(
-            KnowledgeBase.user_id == user_id,
-            KnowledgeBase.knowledge_base_name_normalized == normalized_name
-        ).first()
-        
-        if existing:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Knowledge base '{request.knowledge_base_name}' already exists"
-            )
-        
-        # TODO: Encrypt sensitive data before storing
-        data_source_config = api_cfg.model_dump()
-        
-        # Create KB
-        kb_id = str(uuid.uuid4())
-        new_kb = KnowledgeBase(
-            knowledge_base_id=kb_id,
-            user_id=user_id,
-            knowledge_base_name=request.knowledge_base_name.strip(),
-            knowledge_base_name_normalized=normalized_name,
-            description=request.description,
-            data_source_type=DBDataSourceType.API,
-            data_source_config=data_source_config,
-            auto_sync_enabled=request.auto_sync_enabled,
-            sync_interval_hours=request.sync_interval_hours,
-            document_count=0,
-            total_chunks=0,
-            total_size_bytes=0,
-            created_at=datetime.utcnow()
-        )
-        
-        db.add(new_kb)
-        db.commit()
-        db.refresh(new_kb)
-        
-        logger.info(f"✓ Created API KB: {kb_id} - '{new_kb.knowledge_base_name}' for user {user_id}")
-        
+        service = APISourceService()
+        result = await service.fetch_and_extract(payload)
+        persisted_file = _persist_api_source_result(db, user_id, payload, result)
         return {
-            "knowledge_base_id": kb_id,
-            "knowledge_base_name": new_kb.knowledge_base_name,
-            "data_source_type": "api",
-            "endpoint_url": api_cfg.endpoint_url,
-            "method": api_cfg.method,
-            "auto_sync_enabled": request.auto_sync_enabled,
-            "sync_interval_hours": request.sync_interval_hours,
-            "message": "API knowledge base created successfully. Sync not yet implemented.",
-            "warning": "API credentials stored unencrypted - implement encryption before production!"
+            **persisted_file,
+            "user_id": user_id,
+            **result,
         }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Error creating API KB: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    except httpx.HTTPStatusError as exc:
+        logger.error("API source request failed: %s", exc, exc_info=True)
+        detail = exc.response.text if exc.response is not None else str(exc)
+        raise HTTPException(
+            status_code=exc.response.status_code if exc.response is not None else 502,
+            detail=f"API source request failed: {detail}",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("API source extraction failed: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"API source extraction failed: {exc}",
+        ) from exc
