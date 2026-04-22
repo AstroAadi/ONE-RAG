@@ -22,3 +22,10 @@ vlm.py
 INGESTION_IMPLEMENTATION.md
 RESTRUCTURE_CHECKLIST.md
 QUICK_START.md
+modelQdrant/
+modelQdrant_og/
+chunk_edit.py
+Dockerfile
+retrival.py
+search.py
+sonar-project.properties
