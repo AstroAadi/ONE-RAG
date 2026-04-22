@@ -58,15 +58,15 @@ async def update_model(request: ModelUpdateRequest):
     Update the LLM model at runtime
     
     Args:
-        model_id: New Bedrock model ID
+        model_id: New HuggingFace model ID
     
     Example:
         {
-            "model_id": "anthropic.claude-3-5-sonnet-20240620-v1:0"
+            "model_id": "meta-llama/Meta-Llama-3-8B-Instruct"
         }
     
     Note: This only updates for current session. 
-    To make permanent, update BEDROCK_MODEL_ID in .env
+    To make permanent, update LLM_MODEL_ID in .env
     """
     try:
         success = get_llm_service().update_model(request.model_id)

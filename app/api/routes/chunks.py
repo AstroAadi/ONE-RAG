@@ -12,6 +12,7 @@ import logging
 
 from app.core.dependencies import get_user_id, get_database_session
 from app.core.task_manager import get_task_manager, TaskType
+from app.core.config import settings
 from app.db.models import (
     FileMetadata, ChunkMetadata, KnowledgeBase,
     ProcessingStatus, ChunkingStrategyEnum
@@ -21,6 +22,27 @@ from app.services.vector_store_service import VectorStoreService
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _resolve_embedding_model(embedding_model: Optional[str]) -> str:
+    """
+    Resolve/validate requested embedding model.
+    Falls back to configured default when an invalid model is provided.
+    """
+    requested = (embedding_model or "").strip()
+    if not requested:
+        return settings.embedding_model_id
+
+    if requested not in settings.available_embedding_models:
+        logger.warning(
+            "Unsupported embedding model '%s'. Falling back to '%s'. Allowed models: %s",
+            requested,
+            settings.embedding_model_id,
+            settings.available_embedding_models,
+        )
+        return settings.embedding_model_id
+
+    return requested
 
 
 # ==================== PREVIEW ENDPOINT ====================
@@ -755,7 +777,7 @@ async def _create_chunks_internal(
 @router.post("/finalize", tags=["Chunks - Finalize"])
 async def finalize_chunks(
     file_id: str,
-    embedding_model: str = "cohere.embed-english-v3",
+    embedding_model: str = settings.embedding_model_id,
     chunk_ids: Optional[List[str]] = None,
     batch_size: int = 50,
     user_id: str = Depends(get_user_id),
@@ -791,7 +813,10 @@ async def finalize_chunks(
         if not chunks_to_index:
             raise HTTPException(status_code=400, detail="No chunks to index")
 
-        logger.info(f"📊 Indexing {len(chunks_to_index)} chunks with model: {embedding_model}")
+        resolved_embedding_model = _resolve_embedding_model(embedding_model)
+        logger.info(
+            f"📊 Indexing {len(chunks_to_index)} chunks with model: {resolved_embedding_model}"
+        )
 
         if len(chunks_to_index) > 100:
             task_manager = get_task_manager()
@@ -803,7 +828,7 @@ async def finalize_chunks(
                 file_id=file_id,
                 knowledge_base_id=kb.knowledge_base_id,
                 chunk_ids=[c.chunk_id for c in chunks_to_index],
-                embedding_model=embedding_model,
+                embedding_model=resolved_embedding_model,
                 batch_size=batch_size,
             )
             return {
@@ -816,7 +841,7 @@ async def finalize_chunks(
             }
 
         # ── Inline indexing for small files ──────────────────────────────
-        vector_store = VectorStoreService(embedding_model_id=embedding_model)
+        vector_store = VectorStoreService(embedding_model_id=resolved_embedding_model)
 
         if not file_metadata.markdown_path:
             raise HTTPException(status_code=400, detail="Markdown content not found")
@@ -847,11 +872,11 @@ async def finalize_chunks(
             "file_id": file_id,
             "knowledge_base_id": kb.knowledge_base_id,
             "chunks_indexed": chunks_indexed,
-            "embedding_model": embedding_model,
+            "embedding_model": resolved_embedding_model,
             "indexing_time_seconds": round(indexing_time, 2),
             "vector_store_stats": vector_stats,
             "status": "completed",
-            "message": f"Indexed {chunks_indexed} chunks successfully using {embedding_model}",
+            "message": f"Indexed {chunks_indexed} chunks successfully using {resolved_embedding_model}",
         }
 
     except HTTPException:
@@ -957,7 +982,7 @@ def index_chunks_background(
     file_id: str,
     knowledge_base_id: str,
     chunk_ids: List[str],
-    embedding_model: str = "cohere.embed-english-v3",
+    embedding_model: str = settings.embedding_model_id,
     batch_size: int = 50,
     progress_callback=None,
     task_id=None,
@@ -988,7 +1013,8 @@ def index_chunks_background(
 
             chunks = _rechunk_for_indexing(file_metadata, kb, user_id, markdown_content)
 
-            vector_store = VectorStoreService(embedding_model_id=embedding_model)
+            resolved_embedding_model = _resolve_embedding_model(embedding_model)
+            vector_store = VectorStoreService(embedding_model_id=resolved_embedding_model)
             total_indexed = vector_store.add_document_chunks(
                 chunks, file_id, file_metadata.safe_filename,
                 knowledge_base_id=knowledge_base_id,

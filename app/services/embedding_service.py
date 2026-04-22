@@ -1,203 +1,173 @@
 """
-Embedding Service using AWS Bedrock
-Dense embeddings are generated using AWS Bedrock (Cohere, Titan, etc.)
-NO HuggingFace models for dense embeddings - only AWS Bedrock
+Embedding Service - Using LangChain with HuggingFace
+Works reliably with HuggingFace Inference Client
 """
 
-from langchain_aws import BedrockEmbeddings
+from langchain_huggingface import HuggingFaceEndpointEmbeddings
+from huggingface_hub import InferenceClient
 import logging
 from typing import List
 import time
-import boto3
+import numpy as np
 
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
 
-class BedrockEmbeddingService:
+class OpenSourceEmbeddings:
     """
-    AWS Bedrock embedding service for dense vectors
+    Open source embeddings using LangChain + HuggingFace
     
-    Features:
-    - Uses AWS Bedrock embedding models (Cohere, Titan, etc.)
-    - Batch processing for efficiency
-    - Caching support
-    - Error handling and retries
+    Uses InferenceClient for reliable feature extraction
     """
     
     def __init__(self, model_id: str = None):
-        """
-        Initialize AWS Bedrock embeddings
+        """Initialize embeddings service"""
+        self.model_id = model_id or settings.embedding_model_id
+        self.api_token = settings.huggingface_api_token
         
-        Args:
-            model_id: AWS Bedrock embedding model ID (default from config)
-        """
-        self.model_id = model_id or settings.bedrock_embedding_model_id
+        # Initialize HuggingFace InferenceClient (more reliable)
+        self.client = InferenceClient(token=self.api_token)
         
-        logger.info(f"Loading AWS Bedrock embedding model: {self.model_id}")
-        
+        # Also initialize LangChain embeddings for compatibility
         try:
-            # Create boto3 client with credentials
-            client_kwargs = {
-                "service_name": "bedrock-runtime",
-                "region_name": settings.aws_region,
-            }
-            
-            # Add credentials if provided
-            if settings.aws_access_key_id and settings.aws_secret_access_key:
-                client_kwargs["aws_access_key_id"] = settings.aws_access_key_id
-                client_kwargs["aws_secret_access_key"] = settings.aws_secret_access_key
-            
-            # Create bedrock client
-            bedrock_client = boto3.client(**client_kwargs)
-            
-            # Initialize Bedrock embeddings with the client
-            self.embeddings = BedrockEmbeddings(
-                client=bedrock_client,
-                model_id=self.model_id
+            self.langchain_embeddings = HuggingFaceEndpointEmbeddings(
+                model=self.model_id,
+                huggingfacehub_api_token=self.api_token
             )
-            
-            # Get embedding dimension by generating a test embedding
-            test_embedding = self.embeddings.embed_query("test")
-            self.embedding_dim = len(test_embedding)
-            
-            logger.info(f"✅ AWS Bedrock embedding model loaded successfully")
-            logger.info(f"   Model: {self.model_id}")
-            logger.info(f"   Dimension: {self.embedding_dim}")
-            logger.info(f"   Region: {settings.aws_region}")
-            logger.info(f"   Provider: AWS Bedrock")
-            
         except Exception as e:
-            logger.error(f"Failed to load Bedrock embedding model: {e}")
-            raise
+            logger.warning(f"LangChain embeddings init failed, using InferenceClient only: {e}")
+            self.langchain_embeddings = None
+        
+        self.max_retries = 3
+        self.retry_delay = 2
+        
+        logger.info(f"✅ Embedding service initialized: {self.model_id}")
     
     def embed_query(self, text: str) -> List[float]:
-        """
-        Generate embedding for a single query text
-        
-        Args:
-            text: Input text
-            
-        Returns:
-            Embedding vector as list of floats
-        """
+        """Generate embedding for a single text"""
         try:
             # Truncate if needed
             if len(text) > settings.embedding_max_length:
                 text = text[:settings.embedding_max_length]
             
-            # Generate embedding using Bedrock
-            embedding = self.embeddings.embed_query(text)
+            # Use InferenceClient for reliability
+            embedding = self._embed_with_client(text)
             
             return embedding
                 
         except Exception as e:
             logger.error(f"Error generating query embedding: {e}")
+            # Try LangChain as fallback
+            if self.langchain_embeddings:
+                try:
+                    return self.langchain_embeddings.embed_query(text)
+                except:
+                    pass
             raise
     
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        """
-        Generate embeddings for multiple documents (batch processing)
+        """Generate embeddings for multiple texts"""
+        embeddings = []
         
-        Args:
-            texts: List of input texts
-            
-        Returns:
-            List of embedding vectors
-        """
-        if not texts:
-            return []
-        
-        try:
-            # Truncate texts if needed
-            truncated_texts = []
-            for text in texts:
+        for i, text in enumerate(texts):
+            try:
+                # Truncate if needed
                 if len(text) > settings.embedding_max_length:
-                    truncated_texts.append(text[:settings.embedding_max_length])
-                else:
-                    truncated_texts.append(text)
-            
-            logger.debug(f"Generating Bedrock embeddings for {len(truncated_texts)} documents")
-            
-            start_time = time.time()
-            
-            # Bedrock handles batching internally
-            embeddings = self.embeddings.embed_documents(truncated_texts)
-            
-            elapsed_time = time.time() - start_time
-            throughput = len(truncated_texts) / elapsed_time if elapsed_time > 0 else 0
-            
-            logger.info(
-                f"✓ Embedded {len(truncated_texts)} documents via Bedrock in {elapsed_time:.2f}s "
-                f"({throughput:.1f} docs/sec)"
+                    text = text[:settings.embedding_max_length]
+                
+                embedding = self._embed_with_client(text)
+                embeddings.append(embedding)
+                
+                # Log progress
+                if (i + 1) % 10 == 0:
+                    logger.debug(f"Embedded {i + 1}/{len(texts)} documents")
+                
+                # Small delay to avoid rate limits
+                if i < len(texts) - 1:
+                    time.sleep(0.1)
+                    
+            except Exception as e:
+                logger.error(f"Error embedding document {i}: {e}")
+                # Return zero vector as fallback
+                embeddings.append([0.0] * self._get_embedding_dimension())
+        
+        return embeddings
+    
+    def _embed_with_client(self, text: str, retry_count: int = 0) -> List[float]:
+        """Generate embedding using InferenceClient"""
+        try:
+            # Use feature_extraction which works reliably
+            result = self.client.feature_extraction(
+                text=text,
+                model=self.model_id
             )
             
-            return embeddings
+            # ✅ FIX: Handle numpy arrays, lists, and nested structures
+            # Convert numpy array to list if needed
+            if isinstance(result, np.ndarray):
+                # Flatten if multi-dimensional
+                if result.ndim > 1:
+                    result = result.flatten()
+                return result.tolist()
             
+            # Handle lists
+            elif isinstance(result, list):
+                # If it's a nested list (batch), take first
+                if result and isinstance(result[0], (list, np.ndarray)):
+                    first_item = result[0]
+                    # Convert numpy array to list if needed
+                    if isinstance(first_item, np.ndarray):
+                        return first_item.flatten().tolist()
+                    return first_item
+                return result
+            
+            else:
+                raise ValueError(f"Unexpected embedding format: {type(result)}")
+                
         except Exception as e:
-            logger.error(f"Error embedding documents: {e}")
-            # Return zero vectors as fallback
-            return [[0.0] * self.embedding_dim for _ in texts]
+            if retry_count < self.max_retries:
+                logger.warning(f"Embedding failed, retrying ({retry_count + 1}/{self.max_retries})...")
+                time.sleep(self.retry_delay * (retry_count + 1))
+                return self._embed_with_client(text, retry_count + 1)
+            else:
+                raise Exception(f"Embedding failed after {self.max_retries} retries: {str(e)}")
     
     def get_embedding_dimension(self) -> int:
-        """Get embedding dimension"""
-        return self.embedding_dim
+        """Public API for current embedding dimension."""
+        return self._get_embedding_dimension()
+
+    def _get_embedding_dimension(self) -> int:
+        """Get embedding dimension for the current model"""
+        dimensions = {
+            "BAAI/bge-large-en-v1.5": 1024,
+            "sentence-transformers/all-MiniLM-L6-v2": 384,
+            "intfloat/e5-large-v2": 1024,
+        }
+        
+        return dimensions.get(self.model_id, 768)
     
     def update_model(self, new_model_id: str) -> bool:
-        """
-        Update to a different Bedrock embedding model
-        
-        Args:
-            new_model_id: AWS Bedrock model ID
-            
-        Returns:
-            True if successful
-        """
+        """Update to a different embedding model"""
         try:
-            logger.info(f"Updating Bedrock embedding model to: {new_model_id}")
-            
-            # Create boto3 client with credentials
-            client_kwargs = {
-                "service_name": "bedrock-runtime",
-                "region_name": settings.aws_region,
-            }
-            
-            if settings.aws_access_key_id and settings.aws_secret_access_key:
-                client_kwargs["aws_access_key_id"] = settings.aws_access_key_id
-                client_kwargs["aws_secret_access_key"] = settings.aws_secret_access_key
-            
-            bedrock_client = boto3.client(**client_kwargs)
-            
-            # Load new model
             self.model_id = new_model_id
-            self.embeddings = BedrockEmbeddings(
-                client=bedrock_client,
-                model_id=self.model_id
-            )
             
-            # Update dimension
-            test_embedding = self.embeddings.embed_query("test")
-            self.embedding_dim = len(test_embedding)
+            # Reinitialize client
+            self.client = InferenceClient(token=self.api_token)
             
-            logger.info(f"✅ Bedrock embedding model updated successfully")
+            # Reinitialize LangChain embeddings
+            try:
+                self.langchain_embeddings = HuggingFaceEndpointEmbeddings(
+                    model=self.model_id,
+                    huggingfacehub_api_token=self.api_token
+                )
+            except Exception as e:
+                logger.warning(f"LangChain embeddings reinit failed: {e}")
+                self.langchain_embeddings = None
+            
+            logger.info(f"✅ Embedding model updated to: {new_model_id}")
             return True
-            
         except Exception as e:
-            logger.error(f"Failed to update Bedrock embedding model: {e}")
+            logger.error(f"Failed to update embedding model: {e}")
             return False
-    
-    def get_model_info(self) -> dict:
-        """Get model information"""
-        return {
-            "model_id": self.model_id,
-            "provider": "AWS Bedrock",
-            "embedding_dim": self.embedding_dim,
-            "max_length": settings.embedding_max_length,
-            "region": settings.aws_region
-        }
-
-
-# Alias for backward compatibility
-OpenSourceEmbeddings = BedrockEmbeddingService
-GPUEmbeddingService = BedrockEmbeddingService

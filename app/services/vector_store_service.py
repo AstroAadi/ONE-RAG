@@ -30,7 +30,7 @@ from app.core.exceptions import (
     SearchError,
     NoDocumentsFoundError
 )
-from app.services.embedding_service import BedrockEmbeddingService
+from app.services.embedding_service import OpenSourceEmbeddings
 from app.services.splade_service import GPUSPLADEEmbedder
 
 logger = logging.getLogger(__name__)
@@ -116,8 +116,8 @@ class VectorStoreService:
                 prefer_grpc=False
             )
             self.collection_name = settings.qdrant_collection_name
-            self.embedding_model_id = embedding_model_id or settings.bedrock_embedding_model_id
-            self.dense_embeddings = BedrockEmbeddingService(model_id=self.embedding_model_id)
+            self.embedding_model_id = embedding_model_id or settings.embedding_model_id
+            self.dense_embeddings = OpenSourceEmbeddings(model_id=self.embedding_model_id)
             
             try:
                 self.sparse_embeddings = GPUSPLADEEmbedder(model_name=settings.splade_model_name)
@@ -139,10 +139,10 @@ class VectorStoreService:
             self._initialized = True
             logger.info(f"✅ Multi-tenant Vector Store initialized")
             logger.info(f"  - Collection: {self.collection_name}")
-            logger.info(f"  - Dense: AWS Bedrock ({self.embedding_model_id})")
+            logger.info(f"  - Dense: HuggingFace ({self.embedding_model_id})")
             logger.info(f"  - Sparse: {'HuggingFace SPLADE' if self.sparse_embeddings else 'DISABLED'}")
             logger.info(f"  - KB isolation: ENABLED (payload filter)")
-            
+
         except Exception as e:
             self._init_error = str(e)
             logger.warning(f"⚠️  Qdrant initialization deferred: {e}")
@@ -178,23 +178,43 @@ class VectorStoreService:
 
             if self.collection_name in existing_collections:
                 col = self.client.get_collection(self.collection_name)
+                point_count = col.points_count if hasattr(col, 'points_count') else None
+                if point_count is None:
+                    point_count = self.client.get_collection(self.collection_name).points_count
+
+                # Detect dense vector size from existing collection config.
+                params = getattr(col.config, "params", None)
+                vectors_cfg = getattr(params, "vectors", None)
+                existing_dense_dim = None
+                if isinstance(vectors_cfg, dict):
+                    dense_cfg = vectors_cfg.get("dense")
+                    if dense_cfg is None and len(vectors_cfg) == 1:
+                        dense_cfg = next(iter(vectors_cfg.values()))
+                    existing_dense_dim = getattr(dense_cfg, "size", None)
+                else:
+                    existing_dense_dim = getattr(vectors_cfg, "size", None)
 
                 # Safely probe sparse config — attribute absent on some client versions
                 sparse_cfg = getattr(col.config, 'sparse_vectors_config', None)
                 has_sparse  = sparse_cfg is not None and 'sparse' in sparse_cfg
                 needs_sparse = self.sparse_embeddings is not None
+                dense_mismatch = (
+                    existing_dense_dim is not None and existing_dense_dim != dense_dim
+                )
+                sparse_mismatch = needs_sparse and not has_sparse
 
-                if needs_sparse and not has_sparse:
-                    # Schema mismatch detected — only recreate if collection is EMPTY
-                    point_count = col.points_count if hasattr(col, 'points_count') else None
-                    if point_count is None:
-                        # Fallback: ask Qdrant directly
-                        point_count = self.client.get_collection(self.collection_name).points_count
-
+                if dense_mismatch or sparse_mismatch:
                     if point_count == 0:
+                        reasons = []
+                        if dense_mismatch:
+                            reasons.append(
+                                f"dense dim mismatch (existing={existing_dense_dim}, requested={dense_dim})"
+                            )
+                        if sparse_mismatch:
+                            reasons.append("missing sparse vectors config")
                         logger.warning(
-                            f"⚠️  Collection '{self.collection_name}' is empty and lacks sparse vectors. "
-                            f"Recreating with dense + sparse support..."
+                            f"⚠️  Collection '{self.collection_name}' is empty and needs schema update "
+                            f"({' + '.join(reasons)}). Recreating..."
                         )
                         self.client.delete_collection(self.collection_name)
                         self.client.create_collection(
@@ -202,19 +222,26 @@ class VectorStoreService:
                             vectors_config=vectors_config,
                             sparse_vectors_config=sparse_config,
                         )
-                        self._create_payload_indexes()
-                        logger.info(f"✅ Recreated '{self.collection_name}' with dense + sparse")
+                        logger.info(f"✅ Recreated '{self.collection_name}' with updated schema")
                     else:
-                        # DATA EXISTS — do NOT delete under any circumstances.
-                        # Log a warning and continue so existing data is preserved.
+                        if dense_mismatch:
+                            raise VectorStoreException(
+                                "Dense vector dimension mismatch: "
+                                f"collection expects {existing_dense_dim}, "
+                                f"but model '{self.embedding_model_id}' uses {dense_dim}. "
+                                "Use the original embedding model for this collection, "
+                                "or create/use a separate collection for the new model."
+                            )
+                        # For sparse mismatch with existing data, preserve data and continue.
                         logger.warning(
                             f"⚠️  Collection '{self.collection_name}' has {point_count} points but "
-                            f"lacks sparse vector config. This is likely because some points were "
-                            f"indexed before sparse support was added. Continuing without recreation "
-                            f"to preserve existing data. New points will include sparse vectors."
+                            f"lacks sparse vector config. Continuing without recreation to preserve data."
                         )
                 else:
-                    logger.info(f"✓ Collection '{self.collection_name}' exists — reusing as-is")
+                    logger.info(
+                        f"✓ Collection '{self.collection_name}' exists — reusing as-is "
+                        f"(dense dim={existing_dense_dim})"
+                    )
             else:
                 # Does not exist yet — create fresh
                 self.client.create_collection(
@@ -222,24 +249,33 @@ class VectorStoreService:
                     vectors_config=vectors_config,
                     sparse_vectors_config=sparse_config,
                 )
-                self._create_payload_indexes()
                 logger.info(f"✅ Created collection '{self.collection_name}' with dense + sparse")
+
+            # Ensure payload indexes exist for both newly created and reused collections.
+            self._create_payload_indexes()
 
         except Exception as e:
             logger.error(f"Failed to initialize collection: {e}", exc_info=True)
             raise VectorStoreException(f"Failed to initialize collection: {str(e)}")
     
     def _create_payload_indexes(self):
-        try:
-            for field in ("user_id", "knowledge_base_id", "file_id", "chunk_id", "chunk_type"):
+        fields = ("user_id", "knowledge_base_id", "file_id", "chunk_id", "chunk_type")
+        created_or_verified = 0
+
+        for field in fields:
+            try:
                 self.client.create_payload_index(
                     collection_name=self.collection_name,
                     field_name=field,
                     field_schema="keyword"
                 )
-            logger.info("✓ Created payload indexes")
-        except Exception as e:
-            logger.warning(f"Could not create payload indexes: {e}")
+                created_or_verified += 1
+            except Exception as e:
+                # Keep going so one field failure doesn't block other indexes.
+                logger.warning(f"Could not create payload index for '{field}': {e}")
+
+        if created_or_verified:
+            logger.info(f"✓ Payload indexes ensured for {created_or_verified}/{len(fields)} fields")
     
     def _get_cached_embedding(
         self,

@@ -17,7 +17,7 @@ import json
 import uuid
 
 from app.services.data_sources.database_connector import DatabaseConnectorFactory
-from app.services.embedding_service import BedrockEmbeddingService
+from app.services.embedding_service import OpenSourceEmbeddings
 from app.services.splade_service import GPUSPLADEEmbedder
 from app.services.vector_store_service import VectorStoreService, string_to_uuid
 
@@ -28,7 +28,7 @@ class DatabaseSyncService:
     """Service to sync database data directly to the vector database"""
 
     def __init__(self):
-        self.embedding_service = BedrockEmbeddingService()
+        self.embedding_service = OpenSourceEmbeddings()
         self.vector_store = VectorStoreService()
 
     # ---------------------------------------------------------------------- #

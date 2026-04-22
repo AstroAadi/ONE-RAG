@@ -61,39 +61,64 @@ class Settings(BaseSettings):
     enable_gpu_prefetch: bool = Field(default=True)
     pin_memory: bool = Field(default=True)
     
-    # ==================== AWS Bedrock Configuration ====================
+    # ==================== HuggingFace Configuration ====================
     
-    aws_region: str = Field(default="us-east-1")
-    aws_access_key_id: str = Field(default="")
-    aws_secret_access_key: str = Field(default="")
-    aws_profile_name: str = Field(default="")
-    
-    # ==================== Model Configuration ====================
-    
-    # AWS Bedrock LLM Model
-    bedrock_model_id: str = Field(
-        default="anthropic.claude-3-5-sonnet-20241022",
-        description="AWS Bedrock LLM model ID"
+    huggingface_api_token: str = Field(
+        default=os.getenv("HUGGINGFACE_API_TOKEN", ""),
+        description="HuggingFace API token (required)"
     )
     
-    # AWS Bedrock Dense Embedding Model
-    bedrock_embedding_model_id: str = Field(
-        default="cohere.embed-english-v3",
-        description="AWS Bedrock embedding model ID for dense vectors"
+    huggingface_api_url: str = Field(
+        default="https://router.huggingface.co/v1/chat/completions",
+        description="HuggingFace Router API URL"
     )
     
-    # HuggingFace SPLADE Model (Sparse Vectors ONLY)
-    splade_model_name: str = Field(
-        default="naver/splade-cocondenser-selfdistil",
-        description="HuggingFace SPLADE model for sparse vectors",
-        token=os.getenv('HUGGINGFACE_API_TOKEN')
+    # ==================== LLM Model Configuration ====================
+    
+    llm_model_id: str = Field(
+        default="meta-llama/Meta-Llama-3-8B-Instruct",
+        description="Chat model ID from HuggingFace"
+    )
+    
+    available_llm_models: list = Field(
+        default=[
+            "meta-llama/Meta-Llama-3-8B-Instruct",
+            "mistralai/Mistral-7B-Instruct-v0.2",
+            "google/gemma-7b-it"
+        ],
+        description="Available LLM models"
+    )
+    
+    # ==================== Embedding Model Configuration ====================
+    
+    embedding_model_id: str = Field(
+        default="BAAI/bge-large-en-v1.5",
+        description="Embedding model ID from HuggingFace"
+    )
+    
+    available_embedding_models: list = Field(
+        default=[
+            "BAAI/bge-large-en-v1.5",
+            "sentence-transformers/all-MiniLM-L6-v2",
+            "intfloat/e5-large-v2"
+        ],
+        description="Available embedding models"
     )
     
     embedding_max_length: int = Field(default=512, ge=128, le=2048)
     
-    # Bedrock Vision Model (if needed)
-    bedrock_vision_model_id: str = Field(
-        default="us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+    # ==================== Vision Model Configuration ====================
+    
+    vision_model_id: str = Field(
+        default="llava-hf/llava-1.5-7b-hf",
+        description="Vision model ID from HuggingFace"
+    )
+    
+    # ==================== Sparse Embedding (SPLADE) Configuration ====================
+    
+    splade_model_name: str = Field(
+        default="naver/splade-v3",
+        description="HuggingFace SPLADE model for sparse vectors"
     )
     
     # LLM Parameters
@@ -321,18 +346,17 @@ class Settings(BaseSettings):
                 warnings.append("PostgreSQL selected but psycopg2 not installed. Run: pip install psycopg2-binary")
                 is_valid = False
         
-        # AWS Bedrock validation
-        if not self.aws_access_key_id or not self.aws_secret_access_key:
-            if not self.aws_profile_name:
-                warnings.append("AWS credentials not configured")
-                is_valid = False
-        
-        if not self.bedrock_model_id:
-            warnings.append("BEDROCK_MODEL_ID not set")
+        # HuggingFace validation
+        if not self.huggingface_api_token:
+            warnings.append("HUGGINGFACE_API_TOKEN not set")
             is_valid = False
         
-        if not self.bedrock_embedding_model_id:
-            warnings.append("BEDROCK_EMBEDDING_MODEL_ID not set")
+        if not self.llm_model_id:
+            warnings.append("LLM_MODEL_ID not set")
+            is_valid = False
+        
+        if not self.embedding_model_id:
+            warnings.append("EMBEDDING_MODEL_ID not set")
             is_valid = False
         
         # Qdrant validation
@@ -403,8 +427,9 @@ def print_configuration_summary():
         print(f"  SPLADE Batch: {device_info['splade_batch_size']}")
     
     print(f"\n📊 Models:")
-    print(f"  LLM: {settings.bedrock_model_id} (AWS Bedrock)")
-    print(f"  Dense Embedding: {settings.bedrock_embedding_model_id} (AWS Bedrock)")
+    print(f"  LLM: {settings.llm_model_id} (HuggingFace)")
+    print(f"  Dense Embedding: {settings.embedding_model_id} (HuggingFace)")
+    print(f"  Vision: {settings.vision_model_id} (HuggingFace)")
     print(f"  Sparse Embedding: {settings.splade_model_name} (HuggingFace)")
     
     print(f"\n⚡ Concurrency:")
