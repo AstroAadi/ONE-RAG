@@ -8,8 +8,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 import logging
+import sys
 import time
 from datetime import datetime
+
+for stream in (sys.stdout, sys.stderr):
+    reconfigure = getattr(stream, "reconfigure", None)
+    if callable(reconfigure):
+        reconfigure(encoding="utf-8", errors="backslashreplace")
 
 # Import configurations
 from app.core.config import settings
@@ -32,7 +38,7 @@ logging.basicConfig(
     level=getattr(logging, settings.log_level),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(settings.log_file_path),
+        logging.FileHandler(settings.log_file_path, encoding="utf-8"),
         logging.StreamHandler()
     ]
 )

@@ -1,7 +1,4 @@
-"""
-Document Extraction Services
-Automatically initializes and registers all extractors
-"""
+"""Document extraction services for supported formats."""
 
 from .base_extractor import BaseExtractor
 from .extractor_factory import ExtractorFactory, auto_register_extractors

@@ -29,7 +29,7 @@ class MarkdownExtractor(BaseExtractor):
     """
     
     def _get_supported_formats(self) -> List[str]:
-        return ['md', 'markdown', 'mdown', 'mkd']
+        return ['md']
     
     def validate_file(self, file_path: str) -> Tuple[bool, str]:
         """Validate markdown file"""

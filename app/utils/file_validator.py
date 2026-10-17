@@ -25,14 +25,10 @@ class FileValidator:
     MIME_TYPE_MAP = {
         'pdf': 'application/pdf',
         'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-        'doc': 'application/msword',
         'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
         'ppt': 'application/vnd.ms-powerpoint',
-        'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        'xls': 'application/vnd.ms-excel',
         'txt': 'text/plain',
         'md': 'text/markdown',
-        'csv': 'text/csv',
         'png': 'image/png',
         'jpg': 'image/jpeg',
         'jpeg': 'image/jpeg',
@@ -40,8 +36,7 @@ class FileValidator:
         'bmp': 'image/bmp',
         'webp': 'image/webp',
         'tiff': 'image/tiff',
-        'html': 'text/html',
-        'xml': 'application/xml',
+        'tif': 'image/tiff',
     }
     
     @classmethod
@@ -67,12 +62,25 @@ class FileValidator:
                 
             except ImportError as e:
                 logger.warning(f"Could not import ExtractorFactory: {e}")
-                # Fallback to basic formats
-                cls._allowed_extensions = {'.pdf', '.docx', '.doc'}
+                # Fallback to the supported formats if extractor registration is unavailable.
+                cls._allowed_extensions = {
+                    '.pdf', '.docx', '.pptx', '.ppt', '.txt', '.md',
+                    '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp',
+                    '.tiff', '.tif',
+                }
                 cls._allowed_mime_types = {
                     'application/pdf',
                     'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-                    'application/msword'
+                    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+                    'application/vnd.ms-powerpoint',
+                    'text/plain',
+                    'text/markdown',
+                    'image/png',
+                    'image/jpeg',
+                    'image/gif',
+                    'image/bmp',
+                    'image/webp',
+                    'image/tiff',
                 }
     
     @classmethod
@@ -205,9 +213,9 @@ class FileValidator:
     
     @classmethod
     def is_document(cls, filename: str) -> bool:
-        """Check if file is a document (PDF, DOCX, etc.)"""
+        """Check if file is a supported document format."""
         ext = cls.get_file_extension(filename, with_dot=True)
-        document_types = {'.pdf', '.docx', '.doc', '.txt', '.md'}
+        document_types = {'.pdf', '.docx', '.txt', '.md'}
         return ext in document_types
     
     @classmethod
@@ -218,17 +226,10 @@ class FileValidator:
         return ext in presentation_types
     
     @classmethod
-    def is_spreadsheet(cls, filename: str) -> bool:
-        """Check if file is a spreadsheet (XLSX, XLS, CSV)"""
-        ext = cls.get_file_extension(filename, with_dot=True)
-        spreadsheet_types = {'.xlsx', '.xls', '.csv'}
-        return ext in spreadsheet_types
-    
-    @classmethod
     def is_image(cls, filename: str) -> bool:
         """Check if file is an image"""
         ext = cls.get_file_extension(filename, with_dot=True)
-        image_types = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.tiff'}
+        image_types = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
         return ext in image_types
     
     @classmethod
@@ -237,14 +238,12 @@ class FileValidator:
         Get category of file
         
         Returns:
-            One of: 'document', 'presentation', 'spreadsheet', 'image', 'unknown'
+            One of: 'document', 'presentation', 'image', 'unknown'
         """
         if cls.is_document(filename):
             return 'document'
         elif cls.is_presentation(filename):
             return 'presentation'
-        elif cls.is_spreadsheet(filename):
-            return 'spreadsheet'
         elif cls.is_image(filename):
             return 'image'
         else:

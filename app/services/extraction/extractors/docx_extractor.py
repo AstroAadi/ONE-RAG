@@ -39,7 +39,7 @@ class DocxExtractor(BaseExtractor):
         logger.info("DOCX Extractor initialized (DEBUG MODE)")
     
     def _get_supported_formats(self) -> List[str]:
-        return ['docx', 'doc']
+        return ['docx']
     
     def validate_file(self, file_path: str) -> Tuple[bool, str]:
         """Validate DOCX file"""
@@ -47,7 +47,7 @@ class DocxExtractor(BaseExtractor):
         
         if not path.exists():
             return False, f"File does not exist: {file_path}"
-        if path.suffix.lower() not in ['.docx', '.doc']:
+        if path.suffix.lower() != '.docx':
             return False, f"Not a Word document: {path.suffix}"
         if path.stat().st_size == 0:
             return False, "File is empty (0 bytes)"

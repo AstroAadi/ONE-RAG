@@ -7,23 +7,24 @@ from pydantic import Field, field_validator, ConfigDict
 from pydantic_settings import BaseSettings
 from pathlib import Path
 from typing import Literal
-from dotenv import load_dotenv
-import os
 import logging
-
-load_dotenv()
+import re
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
 
 logger = logging.getLogger(__name__)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class Settings(BaseSettings):
     """Application settings with concurrency optimizations"""
     
     model_config = ConfigDict(
-        env_file=".env.example",
+        env_file=PROJECT_ROOT / ".env",
         case_sensitive=False,
         extra="ignore",
-        validate_assignment=True
+        validate_assignment=True,
+        hide_input_in_errors=True,
     )
     
     # # ==================== AWS Bedrock Configuration ====================
@@ -150,13 +151,20 @@ class Settings(BaseSettings):
     # ==================== Storage Configuration ====================
     upload_dir: Path = Field(default=Path("./uploads"))
     markdown_dir: Path = Field(default=Path("./markdown_output"))
-    database_url: str = Field(default="sqlite:///./rag_system.db")
+    database_url: str = Field(
+        description="PostgreSQL connection URL",
+        repr=False,
+    )
     model_cache_dir: Path = Field(
         default=Path("./model_cache"),
         description="Directory to cache downloaded models"
     )
     max_file_size_mb: int = Field(default=50, ge=1, le=500)
     max_filename_length: int = Field(default=255, ge=1, le=500)
+    enable_sparse_embeddings: bool = Field(
+        default=False,
+        description="Enable SPLADE embeddings (requires access to its Hugging Face model)"
+    )
     
     # ==================== CONCURRENCY SETTINGS (NEW) ====================
     
@@ -245,6 +253,31 @@ class Settings(BaseSettings):
         if v and not v.startswith(('http://', 'https://')):
             raise ValueError("qdrant_url must start with http:// or https://")
         return v
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def validate_database_url(cls, value: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("DATABASE_URL must be set to a PostgreSQL connection URL")
+
+        try:
+            parsed_url = make_url(value.strip())
+        except ArgumentError as exc:
+            raise ValueError("DATABASE_URL is not a valid PostgreSQL connection URL") from exc
+
+        backend = parsed_url.drivername.split("+", maxsplit=1)[0].lower()
+        if backend not in {"postgres", "postgresql"}:
+            scheme = value.strip().partition("://")[0]
+            safe_scheme = scheme if re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*", scheme) else "invalid"
+            raise ValueError(
+                f"DATABASE_URL must use PostgreSQL (detected scheme '{safe_scheme}')"
+            )
+
+        if not parsed_url.host or not parsed_url.database:
+            raise ValueError("DATABASE_URL must include a PostgreSQL host and database name")
+
+        parsed_url = parsed_url.set(drivername="postgresql+psycopg2")
+        return parsed_url.render_as_string(hide_password=False)
     
     # ==================== TOKEN-BASED CHUNKING CONSTRAINTS ====================
     min_chunk_tokens: int = Field(default=200, ge=50, le=500)
@@ -403,7 +436,7 @@ def print_configuration_summary():
     print(f"  - Overlap: {settings.chunk_overlap_tokens} tokens")
     
     print(f"\n💾 Storage:")
-    print(f"  - Database: {settings.database_url}")
+    print("  - Database: PostgreSQL (connection credentials redacted)")
     print(f"  - Vector DB: {'Qdrant Cloud ✓' if settings.qdrant_url else 'Not configured'}")
     
     print(f"\n🔧 Features:")

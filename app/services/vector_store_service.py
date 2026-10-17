@@ -35,7 +35,13 @@ def string_to_uuid(text: str) -> str:
 class SPLADEEmbedder:
     """SPLADE sparse embedder (kept from original)"""
     
-    def __init__(self):
+    def __init__(self, enabled: bool = settings.enable_sparse_embeddings):
+        if not enabled:
+            self.model = None
+            self.available = False
+            logger.info("SPLADE embeddings disabled; dense retrieval will be used")
+            return
+
         try:
             from sentence_transformers import SparseEncoder
             model_name = "naver/splade-v3"
@@ -45,7 +51,7 @@ class SPLADEEmbedder:
             self.available = True
         except Exception as e:
             logger.error(f"Failed to load SPLADE model: {e}")
-            logger.warning("⚠️ SPLADE not available - sparse search will be disabled")
+            logger.warning("SPLADE unavailable - sparse search will fall back to dense retrieval")
             self.model = None
             self.available = False
     
@@ -162,7 +168,7 @@ class VectorStoreService:
             self.dense_embeddings = OpenSourceEmbeddings()
             
             # Initialize sparse embeddings (LOCAL SPLADE)
-            self.sparse_embeddings = SPLADEEmbedder()
+            self.sparse_embeddings = SPLADEEmbedder(settings.enable_sparse_embeddings)
             
             # Collection name
             self.collection_name = settings.qdrant_collection_name

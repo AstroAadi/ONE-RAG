@@ -3,9 +3,9 @@ Database Configuration with Connection Pooling - CORRECTED
 Uses the same Base as models.py to ensure tables are created
 """
 
-from sqlalchemy import create_engine, event, text
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
-from sqlalchemy.pool import QueuePool, NullPool
+from sqlalchemy.pool import QueuePool
 from contextlib import contextmanager
 from typing import Generator
 import logging
@@ -18,45 +18,21 @@ from app.db.models import Base
 
 
 def get_engine():
-    """Create SQLAlchemy engine with optimized connection pooling"""
-    
-    # Determine if we're using SQLite or PostgreSQL
-    is_sqlite = settings.database_url.startswith('sqlite')
-    
-    if is_sqlite:
-        # SQLite configuration
-        logger.warning("Using SQLite - not recommended for production with high concurrency")
-        
-        engine = create_engine(
-            settings.database_url,
-            connect_args={"check_same_thread": False},
-            poolclass=NullPool,
-            echo=False
-        )
-        
-        # Enable foreign keys for SQLite
-        @event.listens_for(engine, "connect")
-        def set_sqlite_pragma(dbapi_conn, connection_record):
-            cursor = dbapi_conn.cursor()
-            cursor.execute("PRAGMA foreign_keys=ON")
-            cursor.close()
-            
-    else:
-        # PostgreSQL/MySQL configuration
-        engine = create_engine(
-            settings.database_url,
-            poolclass=QueuePool,
-            pool_size=10,
-            max_overflow=20,
-            pool_timeout=30,
-            pool_recycle=3600,
-            pool_pre_ping=True,
-            echo=False,
-            connect_args={
-                "connect_timeout": 10,
-                "options": "-c statement_timeout=30000"
-            }
-        )
+    """Create the PostgreSQL engine with connection pooling."""
+    engine = create_engine(
+        settings.database_url,
+        poolclass=QueuePool,
+        pool_size=settings.db_pool_size,
+        max_overflow=settings.db_max_overflow,
+        pool_timeout=settings.db_pool_timeout,
+        pool_recycle=settings.db_pool_recycle,
+        pool_pre_ping=True,
+        echo=False,
+        connect_args={
+            "connect_timeout": 10,
+            "options": "-c statement_timeout=30000"
+        }
+    )
     
     logger.info(
         f"Database engine created: "
@@ -119,12 +95,6 @@ def drop_all_tables():
 
 def get_connection_pool_status() -> dict:
     """Get current connection pool status"""
-    if isinstance(engine.pool, NullPool):
-        return {
-            "pool_type": "NullPool",
-            "message": "No connection pooling (SQLite mode)"
-        }
-    
     pool = engine.pool
     
     return {

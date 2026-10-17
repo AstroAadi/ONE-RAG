@@ -28,7 +28,7 @@ class PlainTextExtractor(BaseExtractor):
     """
     
     def _get_supported_formats(self) -> List[str]:
-        return ['txt', 'text', 'log', 'csv', 'tsv']
+        return ['txt']
     
     def validate_file(self, file_path: str) -> Tuple[bool, str]:
         """Validate text file"""

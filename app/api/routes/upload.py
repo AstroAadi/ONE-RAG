@@ -85,7 +85,6 @@ async def upload_file(
             'presentation': FileType.PRESENTATION,
             'image': FileType.IMAGE,
             'text': FileType.TEXT,
-            'spreadsheet': FileType.OTHER,
             'unknown': FileType.OTHER
         }
         file_type_enum = file_type_map.get(file_category, FileType.OTHER)
