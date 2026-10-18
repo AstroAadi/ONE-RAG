@@ -10,13 +10,14 @@ from app.models.schemas import (
     ConversationQueryRequest, SearchType
 )
 from app.services.vector_store_service import VectorStoreService
-from app.services.llm_service import LLMService
+from app.services.llm_service import LLMService, LLMGenerationError
+from app.core.config import settings
 from app.core.dependencies import get_user_id, get_database_session
-from app.db.models import QueryLog
+from app.db.models import QueryLog, KnowledgeBase
 import time
 import logging
 from datetime import datetime
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Optional
 from app.core.task_manager import get_task_manager, TaskType
 
 logger = logging.getLogger(__name__)
@@ -57,9 +58,15 @@ def safe_get_score(score: float) -> float:
 def _execute_vector_search(
     query: str,
     top_k: int,
-    user_id: str,
-    file_id: str,
-    search_type: str
+    search_type: str,
+    user_id: Optional[str] = None,
+    # The task manager only injects file_id when it is truthy, so this must
+    # have a default or an unfiltered query raises a TypeError.
+    file_id: Optional[str] = None,
+    knowledge_base_id: Optional[str] = None,
+    # Injected into every submitted task by the task manager
+    progress_callback=None,
+    task_id=None
 ) -> Tuple[List[str], List[Dict], List[float]]:
     """
     Execute vector search (runs in I/O thread pool)
@@ -71,16 +78,111 @@ def _execute_vector_search(
         top_k=top_k,
         user_id=user_id,
         file_id=file_id,
-        search_type=search_type
+        search_type=search_type,
+        knowledge_base_id=knowledge_base_id
     )
+
+
+def _embedding_error_detail(error: Exception) -> Optional[str]:
+    """
+    Actionable message for a retrieval failure caused by the embedding
+    provider, or None if the error is unrelated to embeddings.
+    """
+    lowered = str(error).lower()
+
+    if not ("embedding" in lowered or "empty vectors" in lowered):
+        return None
+
+    if "402" in lowered or "payment required" in lowered or "credits" in lowered:
+        return (
+            "Could not search: the hosted embedding API reports no remaining "
+            "credits. Set EMBEDDING_BACKEND=local in the backend .env to run "
+            "the embedding model on this machine instead (no credits needed)."
+        )
+
+    if "401" in lowered or "403" in lowered:
+        return (
+            "Could not search: the embedding API rejected the credentials. "
+            "Check HUGGINGFACE_API_TOKEN, or set EMBEDDING_BACKEND=local to "
+            "embed on this machine."
+        )
+
+    return f"Could not search: {error}"
+
+
+def _llm_error_detail(error: LLMGenerationError) -> Tuple[int, str]:
+    """
+    Map an LLM provider failure onto an HTTP status and an actionable message.
+    """
+    status = error.status_code
+    provider_message = (error.provider_message or str(error)).strip()
+    lowered = provider_message.lower()
+
+    available = ", ".join(settings.available_llm_models)
+
+    if status == 402 or "no remaining credits" in lowered:
+        return 503, (
+            f"Could not generate an answer: the HuggingFace Inference API "
+            f"reports no remaining credits for '{settings.llm_model_id}'. "
+            f"Add credits to the account, or set LLM_MODEL_ID to a model "
+            f"served by a provider you have access to. "
+            f"(Retrieval works offline, so only answer generation is blocked.)"
+        )
+
+    if status in (401, 403):
+        return 503, (
+            "Could not generate an answer: the HuggingFace API rejected the "
+            "credentials. Check HUGGINGFACE_API_TOKEN in the backend .env."
+        )
+
+    if "not supported by any provider" in lowered or "not a chat model" in lowered:
+        return 503, (
+            f"Could not generate an answer: '{settings.llm_model_id}' is not "
+            f"available to your HuggingFace account "
+            f"({provider_message}). Pick a different chat model via "
+            f"POST /api/settings/models/llm or set LLM_MODEL_ID in the "
+            f"backend .env. Currently configured options: {available}."
+        )
+
+    return 502, f"Could not generate an answer: {provider_message}"
+
+
+def _require_knowledge_base(
+    db: Session,
+    knowledge_base_id: str,
+    user_id: str
+) -> KnowledgeBase:
+    """
+    Resolve the knowledge base being queried, enforcing ownership.
+    
+    Returning 404 here (rather than silently searching everything) keeps a
+    stale or wrong KB id from quietly producing answers sourced from an
+    unrelated document set.
+    """
+    knowledge_base = db.query(KnowledgeBase).filter(
+        KnowledgeBase.knowledge_base_id == knowledge_base_id,
+        KnowledgeBase.user_id == user_id
+    ).first()
+    
+    if not knowledge_base:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Knowledge base not found: {knowledge_base_id}"
+        )
+    
+    return knowledge_base
 
 
 def _generate_llm_answer(
     question: str,
     context: str,
-    user_id: str,
-    conversation_id: str,
-    temperature: float
+    temperature: float,
+    user_id: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    file_id: Optional[str] = None,
+    # Injected into every submitted task by the task manager
+    progress_callback=None,
+    task_id=None
 ) -> str:
     """
     Generate LLM answer (runs in I/O thread pool)
@@ -119,11 +221,17 @@ async def query_knowledge_base(
     """
     start_time = time.time()
     
+    # Reject unknown knowledge bases before doing any work
+    knowledge_base = _require_knowledge_base(db, request.knowledge_base_id, user_id)
+    
     try:
         # Get search type
         search_type = request.search_type or SearchType.HYBRID
         
-        logger.info(f"Query from user {user_id}: search_type={search_type.value}, top_k={request.top_k}")
+        logger.info(
+            f"Query from user {user_id} on KB {knowledge_base.knowledge_base_id}: "
+            f"search_type={search_type.value}, top_k={request.top_k}"
+        )
         
         # Get task manager for I/O operations
         task_manager = get_task_manager()
@@ -137,9 +245,8 @@ async def query_knowledge_base(
             file_id=request.file_id,
             query=request.question,
             top_k=request.top_k,
-            # user_id=user_id,
-            # file_id=getattr(request, 'file_id', None),
-            search_type=search_type.value
+            search_type=search_type.value,
+            knowledge_base_id=request.knowledge_base_id
         )
         
         # Wait for search to complete (with timeout)
@@ -157,7 +264,11 @@ async def query_knowledge_base(
         if not documents:
             raise HTTPException(
                 status_code=404,
-                detail="No documents found. Please upload and process documents first."
+                detail=(
+                    f"No indexed content found in knowledge base "
+                    f"'{knowledge_base.knowledge_base_name}'. Upload a document "
+                    f"and finalize its chunks first."
+                )
             )
         
         # Build context for LLM
@@ -182,6 +293,9 @@ async def query_knowledge_base(
                 full_text=doc,
                 chunk_id=safe_get_str(metadata, 'chunk_id', f'chunk_{i}'),
                 file_id=safe_get_str(metadata, 'file_id', 'unknown'),
+                knowledge_base_id=safe_get_str(
+                    metadata, 'knowledge_base_id', request.knowledge_base_id
+                ),
                 filename=safe_get_str(metadata, 'filename', 'unknown'),
                 relevance_score=safe_get_score(score),
                 page_number=page,
@@ -249,15 +363,23 @@ async def query_knowledge_base(
             sources=sources,
             processing_time=round(processing_time, 2),
             search_type=search_type,
-            confidence_score=round(confidence, 3)
+            confidence_score=round(confidence, 3),
+            knowledge_base_id=request.knowledge_base_id
         )
     
     except HTTPException:
         raise
+    except LLMGenerationError as e:
+        logger.error(f"Query generation error: {e}", exc_info=True)
+        status, detail = _llm_error_detail(e)
+        raise HTTPException(status_code=status, detail=detail)
     except Exception as e:
-        logger.error(f"Query error: {str(e)}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"Query error: {str(e)}", exc_info=True)
+
+        embedding_detail = _embedding_error_detail(e)
+        if embedding_detail:
+            raise HTTPException(status_code=503, detail=embedding_detail)
+
         raise HTTPException(
             status_code=500,
             detail=f"Error processing query: {str(e)}"
@@ -277,10 +399,15 @@ async def query_with_conversation(
     """
     start_time = time.time()
     
+    knowledge_base = _require_knowledge_base(db, request.knowledge_base_id, user_id)
+    
     try:
         search_type = request.search_type or SearchType.HYBRID
         
-        logger.info(f"Conversation query: search_type={search_type.value}")
+        logger.info(
+            f"Conversation query on KB {knowledge_base.knowledge_base_id}: "
+            f"search_type={search_type.value}"
+        )
         
         task_manager = get_task_manager()
         
@@ -293,9 +420,8 @@ async def query_with_conversation(
             file_id=request.file_id,
             query=request.question,
             top_k=request.top_k,
-            # user_id=user_id,
-            # file_id=getattr(request, 'file_id', None),
-            search_type=search_type.value
+            search_type=search_type.value,
+            knowledge_base_id=request.knowledge_base_id
         )
         
         # Wait for search
@@ -313,7 +439,11 @@ async def query_with_conversation(
         if not documents:
             raise HTTPException(
                 status_code=404,
-                detail="No documents found"
+                detail=(
+                    f"No indexed content found in knowledge base "
+                    f"'{knowledge_base.knowledge_base_name}'. Upload a document "
+                    f"and finalize its chunks first."
+                )
             )
         
         # Build context
@@ -338,6 +468,9 @@ async def query_with_conversation(
                 full_text=doc,
                 chunk_id=safe_get_str(metadata, 'chunk_id', f'chunk_{i}'),
                 file_id=safe_get_str(metadata, 'file_id', 'unknown'),
+                knowledge_base_id=safe_get_str(
+                    metadata, 'knowledge_base_id', request.knowledge_base_id
+                ),
                 filename=safe_get_str(metadata, 'filename', 'unknown'),
                 relevance_score=safe_get_score(score),
                 page_number=page,
@@ -404,15 +537,23 @@ async def query_with_conversation(
             processing_time=round(processing_time, 2),
             search_type=search_type,
             confidence_score=round(confidence, 3),
+            knowledge_base_id=request.knowledge_base_id,
             conversation_id=request.conversation_id
         )
     
     except HTTPException:
         raise
+    except LLMGenerationError as e:
+        logger.error(f"Conversation generation error: {e}", exc_info=True)
+        status, detail = _llm_error_detail(e)
+        raise HTTPException(status_code=status, detail=detail)
     except Exception as e:
-        logger.error(f"Conversation query error: {str(e)}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"Conversation query error: {str(e)}", exc_info=True)
+
+        embedding_detail = _embedding_error_detail(e)
+        if embedding_detail:
+            raise HTTPException(status_code=503, detail=embedding_detail)
+
         raise HTTPException(
             status_code=500,
             detail=f"Error: {str(e)}"

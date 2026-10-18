@@ -9,6 +9,7 @@ from langchain_core.output_parsers import StrOutputParser
 import logging
 from typing import Optional, Tuple
 import re
+
 from datetime import datetime
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
@@ -17,6 +18,54 @@ from app.core.config import settings
 from app.db.models import ConversationHistory
 
 logger = logging.getLogger(__name__)
+
+
+class LLMGenerationError(Exception):
+    """
+    Raised when the LLM could not produce an answer.
+
+    Carries the provider's HTTP status and message, because the exception text
+    from the client library buries them behind a request id.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        status_code: Optional[int] = None,
+        provider_message: Optional[str] = None
+    ):
+        super().__init__(message)
+        self.status_code = status_code
+        self.provider_message = provider_message
+
+
+def _describe_provider_error(error: Exception) -> Tuple[Optional[int], str]:
+    """
+    Pull the HTTP status and the provider's own message out of a client error.
+
+    huggingface_hub raises HfHubHTTPError whose str() is mostly a request id,
+    while the useful detail sits in the attached response body.
+    """
+    response = getattr(error, "response", None)
+    status_code = getattr(response, "status_code", None)
+
+    provider_message = ""
+
+    if response is not None:
+        try:
+            payload = response.json()
+            detail = payload.get("error", payload)
+            if isinstance(detail, dict):
+                provider_message = str(detail.get("message", "")) or str(detail)
+            else:
+                provider_message = str(detail)
+        except Exception:
+            provider_message = (getattr(response, "text", "") or "")[:500]
+
+    if not provider_message:
+        provider_message = str(error)
+
+    return (int(status_code) if status_code else None), provider_message.strip()
 
 
 class LLMService:
@@ -175,11 +224,26 @@ class LLMService:
             
             return answer
             
+        except LLMGenerationError:
+            raise
         except Exception as e:
-            logger.error(f"Answer generation error: {e}")
-            import traceback
-            traceback.print_exc()
-            return f"I apologize, but I encountered an error: {str(e)}"
+            # Returning the error text as the answer would surface a failure as
+            # a normal reply, and persist it into conversation history and the
+            # query log as if the model had said it. Propagate instead so the
+            # caller can respond with a real error.
+            status_code, provider_message = _describe_provider_error(e)
+
+            logger.error(
+                f"Answer generation failed (model={self.model_id}, "
+                f"status={status_code}): {provider_message}",
+                exc_info=True
+            )
+
+            raise LLMGenerationError(
+                provider_message or str(e),
+                status_code=status_code,
+                provider_message=provider_message
+            ) from e
     
     def _generate_with_langchain(
         self,

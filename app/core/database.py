@@ -77,11 +77,62 @@ def get_db_context():
         db.close()
 
 
+# Additive schema changes that `Base.metadata.create_all` cannot apply to
+# tables which already exist. All statements are idempotent, so this is safe
+# to run on every startup. Keep these in dependency order.
+_SCHEMA_MIGRATIONS: tuple[str, ...] = (
+    # Knowledge base ownership of files
+    'ALTER TABLE file_metadata ADD COLUMN IF NOT EXISTS knowledge_base_id VARCHAR(36)',
+    'CREATE INDEX IF NOT EXISTS ix_file_metadata_knowledge_base_id '
+    'ON file_metadata (knowledge_base_id)',
+    # Ingestion phase tracking (chunks staged -> chunks indexed)
+    'ALTER TABLE file_metadata ADD COLUMN IF NOT EXISTS chunks_staged INTEGER DEFAULT 0',
+    'ALTER TABLE file_metadata ADD COLUMN IF NOT EXISTS indexed_at TIMESTAMP WITHOUT TIME ZONE',
+)
+
+# New values added to existing PostgreSQL enum types. `ALTER TYPE ... ADD VALUE`
+# cannot run inside a transaction block, so these are executed with autocommit.
+_ENUM_VALUE_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("chunkingstrategyenum", "NO_CHUNKING"),
+)
+
+
+def run_schema_migrations() -> None:
+    """
+    Apply additive schema changes to an already-created database.
+
+    `create_all` only creates missing tables; it never alters existing ones.
+    This fills that gap for the columns/enum values introduced alongside
+    knowledge bases and the staged-chunk ingestion flow.
+    """
+    # Enum values must be added outside of a transaction.
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        for type_name, value in _ENUM_VALUE_MIGRATIONS:
+            try:
+                conn.execute(
+                    text(f"ALTER TYPE {type_name} ADD VALUE IF NOT EXISTS '{value}'")
+                )
+            except Exception as e:
+                # The type may not exist yet on a fresh database; create_all
+                # will then build it with the full set of values.
+                logger.debug(f"Enum migration skipped for {type_name}.{value}: {e}")
+
+    with engine.begin() as conn:
+        for statement in _SCHEMA_MIGRATIONS:
+            try:
+                conn.execute(text(statement))
+            except Exception as e:
+                logger.warning(f"Schema migration failed ({statement}): {e}")
+
+    logger.info("✅ Schema migrations applied")
+
+
 def create_all_tables():
     """Create all database tables using the models Base"""
     try:
         Base.metadata.create_all(bind=engine)
         logger.info("✅ Database tables created/verified")
+        run_schema_migrations()
     except Exception as e:
         logger.error(f"❌ Failed to create database tables: {e}")
         raise

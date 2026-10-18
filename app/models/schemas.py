@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, field_validator, ConfigDict, model_valida
 from typing import List, Optional, Dict, Any, Literal
 from datetime import datetime
 from enum import Enum
+import re
 
 
 # ==================== Enums ====================
@@ -40,14 +41,17 @@ class ChunkingStrategy(str, Enum):
     """
     Available chunking strategies
     
-    - FIXED_SIZE: Token-based fixed-size chunks (no overlap)
-    - HIERARCHICAL: Hierarchical split by separators
+    - DEFAULT: Token-based chunks using server defaults
+    - FIXED_SIZE: Token-based fixed-size chunks
+    - HIERARCHICAL: Parent/child split preserving document structure
     - SEMANTIC: Groups semantically similar sentences
+    - NO_CHUNKING: Index the whole document as a single chunk
     """
     DEFAULT = "default"
     FIXED_SIZE = "fixed_size"
     HIERARCHICAL = "hierarchical"
     SEMANTIC = "semantic"
+    NO_CHUNKING = "no_chunking"
 
 
 # ==================== Request Models ====================
@@ -97,6 +101,13 @@ class QueryRequest(BaseModel):
         min_length=1,
         max_length=5000,
         description="Question to ask the RAG system"
+    )
+    
+    knowledge_base_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=36,
+        description="Knowledge base to search within"
     )
     
     top_k: int = Field(
@@ -184,12 +195,39 @@ class FileUploadResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     
     file_id: str
+    knowledge_base_id: str
+    knowledge_base_name: str
     filename: str
     file_type: str
     file_size_bytes: int
     upload_time: datetime
     status: ProcessingStatus
     message: str
+    task_id: Optional[str] = Field(
+        default=None,
+        description="Background extraction task id (poll /api/tasks/{task_id})"
+    )
+
+
+class ProcessingStatusResponse(BaseModel):
+    """Extraction/processing status for a single file"""
+    model_config = ConfigDict(from_attributes=True)
+
+    file_id: str
+    filename: str
+    status: ProcessingStatus
+    progress: float = Field(default=0.0, ge=0.0, le=100.0)
+    message: Optional[str] = None
+    task_id: Optional[str] = None
+
+    knowledge_base_id: Optional[str] = None
+    uploaded_at: Optional[datetime] = None
+    processed_at: Optional[datetime] = None
+    chunks_created: int = Field(default=0, ge=0)
+    chunks_staged: int = Field(default=0, ge=0)
+    total_pages: int = Field(default=0, ge=0)
+    chunking_strategy: Optional[str] = None
+    error_message: Optional[str] = None
 
 
 class DocumentProcessResponse(BaseModel):
@@ -241,6 +279,11 @@ class SourceDocument(BaseModel):
         description="Parent file ID (for editing validation)"
     )
     
+    knowledge_base_id: Optional[str] = Field(
+        default=None,
+        description="Knowledge base the chunk belongs to"
+    )
+    
     # Scores
     relevance_score: float = Field(..., description="Relevance score")
     
@@ -290,6 +333,9 @@ class QueryResponse(BaseModel):
     # Search metadata
     search_type: SearchType = Field(default=SearchType.HYBRID)
     confidence_score: float = Field(default=1.0, ge=0.0, le=1.0)
+    
+    # Scope of the search
+    knowledge_base_id: Optional[str] = None
     
     # Optional conversation tracking
     conversation_id: Optional[str] = None
@@ -371,11 +417,13 @@ class DocumentInfo(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     
     file_id: str
+    knowledge_base_id: Optional[str] = None
     filename: str
     file_type: str
     file_size_bytes: int
     status: ProcessingStatus
     chunks_created: int
+    chunks_staged: int = Field(default=0, ge=0)
     total_pages: int
     uploaded_at: datetime
     processed_at: Optional[datetime] = None
@@ -393,17 +441,202 @@ class DocumentInfo(BaseModel):
 
 
 class KnowledgeBaseStatus(BaseModel):
-    """Knowledge base status"""
+    """Detailed status of a single knowledge base"""
     model_config = ConfigDict(from_attributes=True)
+    
+    knowledge_base_id: str
+    knowledge_base_name: str
+    user_id: str
+    description: Optional[str] = None
     
     total_documents: int = Field(..., ge=0)
     total_chunks: int = Field(..., ge=0)
-    total_users: int = Field(default=0, ge=0)
     documents: List[DocumentInfo]
     
-    # Optional statistics
-    total_size_bytes: Optional[int] = None
-    avg_chunks_per_document: Optional[float] = None
+    total_size_bytes: int = Field(default=0, ge=0)
+    created_at: datetime
+    last_accessed: Optional[datetime] = None
+
+
+class KnowledgeBaseCreate(BaseModel):
+    """Request to create a knowledge base"""
+    model_config = ConfigDict(str_strip_whitespace=True)
+    
+    knowledge_base_name: str = Field(..., min_length=1, max_length=255)
+    description: Optional[str] = Field(default=None, max_length=2000)
+    
+    @field_validator('knowledge_base_name')
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        """Mirror the client-side rule so both ends agree on valid names"""
+        if not re.fullmatch(r'[A-Za-z0-9 _-]+', v):
+            raise ValueError(
+                "Knowledge base name may only contain letters, numbers, "
+                "spaces, hyphens, and underscores"
+            )
+        return v
+
+
+class KnowledgeBaseUpdate(BaseModel):
+    """Request to rename / re-describe a knowledge base"""
+    model_config = ConfigDict(str_strip_whitespace=True)
+    
+    knowledge_base_name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    description: Optional[str] = Field(default=None, max_length=2000)
+    
+    @field_validator('knowledge_base_name')
+    @classmethod
+    def validate_name(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if not re.fullmatch(r'[A-Za-z0-9 _-]+', v):
+            raise ValueError(
+                "Knowledge base name may only contain letters, numbers, "
+                "spaces, hyphens, and underscores"
+            )
+        return v
+
+
+class KnowledgeBaseInfo(BaseModel):
+    """Summary information about a knowledge base"""
+    model_config = ConfigDict(from_attributes=True)
+    
+    knowledge_base_id: str
+    user_id: str
+    knowledge_base_name: str
+    description: Optional[str] = None
+    
+    document_count: int = Field(default=0, ge=0)
+    total_chunks: int = Field(default=0, ge=0)
+    total_size_bytes: int = Field(default=0, ge=0)
+    
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+    last_accessed: Optional[datetime] = None
+
+
+class KnowledgeBaseList(BaseModel):
+    """List of a user's knowledge bases"""
+    model_config = ConfigDict(from_attributes=True)
+    
+    user_id: str
+    total_knowledge_bases: int = Field(..., ge=0)
+    knowledge_bases: List[KnowledgeBaseInfo]
+
+
+# ==================== Chunk Staging Models ====================
+
+class ChunkingRequest(BaseModel):
+    """
+    Request to chunk (or preview chunking of) an extracted document.
+
+    Parameter relevance depends on the selected strategy:
+    - fixed_size: chunk_size, chunk_overlap
+    - semantic:   chunk_size, chunk_overlap, max_buffer_size, breakpoint_threshold
+    - hierarchical: parent_chunk_size, child_chunk_size, child_chunk_overlap
+    - default / no_chunking: no parameters
+    """
+    model_config = ConfigDict(str_strip_whitespace=True)
+    
+    file_id: str = Field(..., min_length=1, max_length=100)
+    chunking_strategy: ChunkingStrategy = Field(default=ChunkingStrategy.DEFAULT)
+    
+    # fixed_size / semantic
+    chunk_size: Optional[int] = Field(default=None, ge=50, le=4096)
+    chunk_overlap: Optional[int] = Field(default=None, ge=0, le=1000)
+    
+    # semantic
+    max_buffer_size: Optional[int] = Field(default=None, ge=1, le=64)
+    breakpoint_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    
+    # hierarchical
+    parent_chunk_size: Optional[int] = Field(default=None, ge=100, le=8192)
+    child_chunk_size: Optional[int] = Field(default=None, ge=50, le=4096)
+    child_chunk_overlap: Optional[int] = Field(default=None, ge=0, le=1000)
+    
+    @model_validator(mode='after')
+    def validate_overlaps(self):
+        """Overlap must stay below the chunk size it applies to"""
+        if (
+            self.chunk_size is not None
+            and self.chunk_overlap is not None
+            and self.chunk_overlap >= self.chunk_size
+        ):
+            raise ValueError("chunk_overlap must be smaller than chunk_size")
+        
+        if (
+            self.child_chunk_size is not None
+            and self.child_chunk_overlap is not None
+            and self.child_chunk_overlap >= self.child_chunk_size
+        ):
+            raise ValueError("child_chunk_overlap must be smaller than child_chunk_size")
+        
+        if (
+            self.parent_chunk_size is not None
+            and self.child_chunk_size is not None
+            and self.child_chunk_size > self.parent_chunk_size
+        ):
+            raise ValueError("child_chunk_size must not exceed parent_chunk_size")
+        
+        return self
+
+
+class PreviewChunk(BaseModel):
+    """A single chunk in a preview response"""
+    model_config = ConfigDict(from_attributes=True)
+    
+    chunk_id: str
+    chunk_index: int = Field(default=0, ge=0)
+    content_preview: str = Field(..., description="Truncated chunk text")
+    char_count: int = Field(default=0, ge=0)
+    full_char_count: int = Field(default=0, ge=0)
+    token_count: int = Field(default=0, ge=0)
+    page_number: int = Field(default=0, ge=0)
+    chunk_type: str = Field(default="text")
+    parent_chunk_id: Optional[str] = None
+    children: Optional[List["PreviewChunk"]] = None
+
+
+class PreviewChunksResponse(BaseModel):
+    """Response for a chunking preview (nothing is persisted)"""
+    model_config = ConfigDict(from_attributes=True)
+    
+    file_id: str
+    chunking_strategy: str
+    total_chunks: int = Field(..., ge=0)
+    preview_count: int = Field(..., ge=0)
+    preview_chunks: List[PreviewChunk]
+    message: str
+
+
+class CreateChunksResponse(BaseModel):
+    """Response after staging chunks for a document"""
+    model_config = ConfigDict(from_attributes=True)
+    
+    file_id: str
+    knowledge_base_id: Optional[str] = None
+    chunks_created: int = Field(..., ge=0)
+    chunk_ids: List[str] = Field(default_factory=list)
+    total_chunk_ids: int = Field(default=0, ge=0)
+    chunking_strategy: str
+    chunking_time_seconds: float = Field(default=0.0, ge=0.0)
+    status: str = "chunked"
+    parameters: Dict[str, Any] = Field(default_factory=dict)
+    message: str
+
+
+class FinalizeChunksResponse(BaseModel):
+    """Response after embedding + indexing staged chunks"""
+    model_config = ConfigDict(from_attributes=True)
+    
+    file_id: str
+    knowledge_base_id: Optional[str] = None
+    indexed_chunks: int = Field(..., ge=0)
+    embedding_model: str
+    batch_size: int = Field(..., ge=1)
+    indexing_time_seconds: float = Field(default=0.0, ge=0.0)
+    status: str = "completed"
+    message: str
 
 
 class UserDocumentsResponse(BaseModel):
@@ -507,3 +740,7 @@ class HealthCheckResponse(BaseModel):
     
     # Optional details
     details: Optional[Dict[str, Any]] = None
+
+
+# Resolve the self-referencing `children` field on PreviewChunk
+PreviewChunk.model_rebuild()

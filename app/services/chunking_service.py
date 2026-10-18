@@ -47,10 +47,11 @@ settings = get_settings()
 
 class ChunkingStrategy(str, Enum):
     """Available chunking strategies"""
-    DEFAULT="default_size"
+    DEFAULT = "default"
     FIXED_SIZE = "fixed_size"
     HIERARCHICAL = "hierarchical"
     SEMANTIC = "semantic"
+    NO_CHUNKING = "no_chunking"
 
 
 class TokenCounter:
@@ -165,7 +166,12 @@ class EnhancedChunkingService:
         markdown_text: str,
         structured_data: Optional[Dict] = None,
         base_metadata: Optional[Dict] = None,
-        strategy: ChunkingStrategy = ChunkingStrategy.FIXED_SIZE
+        strategy: ChunkingStrategy = ChunkingStrategy.FIXED_SIZE,
+        parent_chunk_tokens: Optional[int] = None,
+        child_chunk_tokens: Optional[int] = None,
+        child_chunk_overlap_tokens: Optional[int] = None,
+        breakpoint_threshold: Optional[float] = None,
+        max_buffer_size: Optional[int] = None
     ) -> List[Dict[str, Any]]:
         """
         Split document into chunks using specified strategy
@@ -175,6 +181,11 @@ class EnhancedChunkingService:
             structured_data: Optional structured data
             base_metadata: Base metadata for all chunks
             strategy: Chunking strategy to use
+            parent_chunk_tokens: Hierarchical only - parent chunk size in tokens
+            child_chunk_tokens: Hierarchical only - child chunk size in tokens
+            child_chunk_overlap_tokens: Hierarchical only - child overlap in tokens
+            breakpoint_threshold: Semantic only - similarity threshold (0.0-1.0)
+            max_buffer_size: Semantic only - units buffered before forcing a split
             
         Returns:
             List of chunk dictionaries with metadata
@@ -187,27 +198,35 @@ class EnhancedChunkingService:
         if base_metadata is None:
             base_metadata = {}
         
+        # Normalize strategy so callers may pass an equivalent enum or raw string
+        strategy = self._coerce_strategy(strategy)
+        
         logger.info(f"Chunking document using {strategy.value} strategy ({len(markdown_text)} characters)...")
         
         # Route to appropriate chunking strategy
-        if strategy == ChunkingStrategy.DEFAULT:
+        if strategy == ChunkingStrategy.NO_CHUNKING:
+            chunks = self._chunk_whole_document(markdown_text, base_metadata)
+        elif strategy == ChunkingStrategy.DEFAULT:
             chunks = self._chunk_default_size(markdown_text, base_metadata)
         elif strategy == ChunkingStrategy.FIXED_SIZE:
             chunks = self._chunk_fixed_size(markdown_text, base_metadata)
         elif strategy == ChunkingStrategy.HIERARCHICAL:
-            chunks = self._chunk_hierarchical(markdown_text, base_metadata)
-        # elif strategy == ChunkingStrategy.SENTENCE:
-        #     chunks = self._chunk_by_sentence(markdown_text, base_metadata)
-        # elif strategy == ChunkingStrategy.PARAGRAPH:
-        #     chunks = self._chunk_by_paragraph(markdown_text, base_metadata)
-        # elif strategy == ChunkingStrategy.SLIDING_WINDOW:
-        #     chunks = self._chunk_sliding_window(markdown_text, base_metadata)
-        # elif strategy == ChunkingStrategy.RECURSIVE:
-        #     chunks = self._chunk_recursive(markdown_text, base_metadata)
+            chunks = self._chunk_hierarchical(
+                markdown_text,
+                base_metadata,
+                max_parent_tokens=parent_chunk_tokens,
+                max_child_tokens=child_chunk_tokens,
+                child_overlap_tokens=child_chunk_overlap_tokens
+            )
         elif strategy == ChunkingStrategy.SEMANTIC:
-            chunks = self._chunk_semantic(markdown_text, base_metadata)
+            chunks = self._chunk_semantic(
+                markdown_text,
+                base_metadata,
+                breakpoint_threshold=breakpoint_threshold,
+                max_buffer_size=max_buffer_size
+            )
         else:
-            logger.warning(f"Unknown strategy {strategy}, falling back to fixed_size")
+            logger.warning(f"Unknown strategy {strategy}, falling back to default")
             chunks = self._chunk_default_size(markdown_text, base_metadata)
         
         if not chunks:
@@ -217,6 +236,50 @@ class EnhancedChunkingService:
         logger.info(f"✅ Created {len(chunks)} chunks using {strategy.value}")
         
         return chunks
+    
+    @staticmethod
+    def _coerce_strategy(strategy: Any) -> ChunkingStrategy:
+        """
+        Accept this module's enum, an equivalent enum from another module,
+        or a plain string, and return this module's enum.
+        """
+        if isinstance(strategy, ChunkingStrategy):
+            return strategy
+        
+        raw = getattr(strategy, 'value', strategy)
+        try:
+            return ChunkingStrategy(str(raw))
+        except ValueError:
+            logger.warning(f"Unrecognized chunking strategy '{raw}', using default")
+            return ChunkingStrategy.DEFAULT
+    
+    # ==================== STRATEGY: No Chunking ====================
+    def _chunk_whole_document(
+        self,
+        text: str,
+        base_metadata: Dict
+    ) -> List[Dict[str, Any]]:
+        """
+        Index the document as a single chunk.
+        
+        Useful for short documents where splitting would destroy context.
+        """
+        stripped = text.strip()
+        if not stripped:
+            return []
+        
+        chunk = self._create_chunk(stripped, 1, base_metadata, chunk_type="document")
+        
+        token_count = chunk['token_count']
+        if token_count > self.max_chunk_tokens:
+            logger.warning(
+                f"no_chunking produced a {token_count}-token chunk which exceeds "
+                f"the embedding limit ({self.max_chunk_tokens}); it will be "
+                f"truncated at embedding time"
+            )
+            chunk['metadata']['oversized'] = True
+        
+        return [chunk]
     
     # ==================== STRATEGY 0: Default Size (Legacy) ====================
     def _chunk_default_size(
@@ -543,6 +606,7 @@ class EnhancedChunkingService:
     max_parent_tokens: Optional[int] = None,
     max_child_tokens: Optional[int] = None,
     parent_overlap_tokens: Optional[int] = None,
+    child_overlap_tokens: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
         """
         Hierarchical chunking with configurable parent / child sizes and parent overlap.
@@ -628,6 +692,14 @@ class EnhancedChunkingService:
                 child_index_start=child_index
             )
 
+            # Apply overlap between adjacent children of the same parent
+            if child_overlap_tokens and child_overlap_tokens > 0:
+                child_chunks = self._apply_child_overlap(
+                    child_chunks,
+                    child_overlap_tokens,
+                    max_child_tokens
+                )
+
             final_chunks.extend(child_chunks)
             child_index += len(child_chunks)
 
@@ -635,10 +707,58 @@ class EnhancedChunkingService:
             f"Hierarchical chunking → "
             f"{len(parent_chunks)} parents, "
             f"{len(final_chunks)} child chunks "
-            f"(parent overlap: {parent_overlap_tokens} tokens)"
+            f"(parent overlap: {parent_overlap_tokens} tokens, "
+            f"child overlap: {child_overlap_tokens or 0} tokens)"
         )
 
         return final_chunks
+
+    def _apply_child_overlap(
+        self,
+        children: List[Dict[str, Any]],
+        overlap_tokens: int,
+        max_child_tokens: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        Prepend the tail of each child to the following child.
+
+        Children produced by recursive splitting are disjoint; this restores a
+        configurable amount of context continuity between neighbours.
+        """
+        if len(children) < 2 or overlap_tokens <= 0:
+            return children
+
+        # Never let the overlap swallow the whole chunk
+        overlap_tokens = min(overlap_tokens, max(1, max_child_tokens // 2))
+
+        overlapped: List[Dict[str, Any]] = [children[0]]
+
+        for index in range(1, len(children)):
+            current = children[index]
+            previous_text = children[index - 1]["text"]
+
+            previous_tokens = self.token_counter.get_tokens(previous_text)
+            if not previous_tokens:
+                overlapped.append(current)
+                continue
+
+            tail_tokens = previous_tokens[-overlap_tokens:]
+            tail_text = self.token_counter.decode_tokens(tail_tokens).strip()
+
+            if not tail_text:
+                overlapped.append(current)
+                continue
+
+            merged_text = f"{tail_text} {current['text']}"
+
+            current["text"] = merged_text
+            current["char_count"] = len(merged_text)
+            current["token_count"] = self.token_counter.count_tokens(merged_text)
+            current["metadata"]["overlap_tokens"] = overlap_tokens
+
+            overlapped.append(current)
+
+        return overlapped
 
 
     def _recursive_split_children(
@@ -708,7 +828,9 @@ class EnhancedChunkingService:
     def _chunk_semantic(
     self,
     text: str,
-    base_metadata: Dict
+    base_metadata: Dict,
+    breakpoint_threshold: Optional[float] = None,
+    max_buffer_size: Optional[int] = None
     ) -> List[Dict[str, Any]]:
         """
         Improved semantic chunking:
@@ -717,9 +839,20 @@ class EnhancedChunkingService:
         - Enforces minimum chunk size
         - Merges very small chunks with neighbors
         - Preserves structure (headings, code, lists)
+        
+        Args:
+            breakpoint_threshold: Similarity below which a new chunk starts
+                (0.0-1.0, default 0.25). Higher values split more aggressively.
+            max_buffer_size: Maximum number of units accumulated into one chunk
+                before forcing a split (default: unbounded within the token budget).
         """
         if not text.strip():
             return []
+
+        similarity_threshold = (
+            breakpoint_threshold if breakpoint_threshold is not None else 0.25
+        )
+        buffer_limit = max_buffer_size if max_buffer_size and max_buffer_size > 0 else None
 
         chunks = []
         chunk_index = 1
@@ -764,10 +897,15 @@ class EnhancedChunkingService:
                     continue
 
             # Normal text unit (paragraph / sentence group)
-            if current_tokens + unit_tokens <= self.target_chunk_tokens:
+            buffer_full = (
+                buffer_limit is not None
+                and len(current_chunk_sentences) >= buffer_limit
+            )
+
+            if current_tokens + unit_tokens <= self.target_chunk_tokens and not buffer_full:
                 # Try to add to current chunk
                 if not current_chunk_sentences or self._is_semantically_similar(
-                    current_chunk_text, unit_text, threshold=0.25
+                    current_chunk_text, unit_text, threshold=similarity_threshold
                 ):
                     current_chunk_sentences.append(unit_text)
                     current_chunk_text += " " + unit_text

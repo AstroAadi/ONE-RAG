@@ -140,7 +140,9 @@ async def update_embedding_model(request: EmbeddingUpdateRequest):
             "model_id": "BAAI/bge-large-en-v1.5"
         }
     
-    Note: After changing embedding model, you may need to re-index documents
+    The switch is rejected when the new model's vector dimension differs from
+    the one the vector collection was built with, because the existing vectors
+    could not be stored or compared alongside the new ones.
     """
     try:
         # Validate model
@@ -149,20 +151,82 @@ async def update_embedding_model(request: EmbeddingUpdateRequest):
                 status_code=400,
                 detail=f"Invalid model. Available models: {', '.join(settings.available_embedding_models)}"
             )
-        
-        # Update in settings
+
+        if request.model_id == settings.embedding_model_id:
+            return {
+                "message": f"Embedding model is already {request.model_id}",
+                "new_model_id": request.model_id,
+            }
+
+        from app.services.embedding_service import OpenSourceEmbeddings
+        from app.services.vector_store_service import VectorStoreService
+
+        previous_model = settings.embedding_model_id
+        vector_store = VectorStoreService()
+
+        collection_size = vector_store.get_dense_vector_size()
+        new_size = OpenSourceEmbeddings(model_id=request.model_id)._get_embedding_dimension()
+
+        dimension_changes = (
+            collection_size is not None and new_size != collection_size
+        )
+
+        if dimension_changes:
+            indexed = vector_store.count_chunks()
+
+            if indexed > 0:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"'{request.model_id}' produces {new_size}-dimensional "
+                        f"vectors but the collection holds {collection_size}-"
+                        f"dimensional ones for {indexed} indexed chunk(s). "
+                        f"Delete the existing knowledge bases (or reset via "
+                        f"DELETE /api/knowledge-base/reset) before switching, "
+                        f"then re-index your documents."
+                    )
+                )
+
+        # Update the active model. Services read this on every call, so the
+        # change applies to already-constructed instances too.
         settings.embedding_model_id = request.model_id
-        
-        # Note: Existing vector store will need to be re-initialized
-        # Or documents re-indexed with new embeddings
-        
-        return {
+
+        # Constructing the store reconciles the collection with the new model:
+        # an empty collection of the wrong dimension is rebuilt.
+        try:
+            VectorStoreService()
+        except Exception as e:
+            # Roll the setting back so the running system stays consistent.
+            settings.embedding_model_id = previous_model
+            logger.error(f"Could not re-initialize the vector store: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Could not switch the embedding model: {e}. "
+                    f"Reverted to '{previous_model}'."
+                )
+            )
+
+        response = {
             "message": f"Embedding model updated to {request.model_id}",
             "new_model_id": request.model_id,
-            "warning": "Existing documents should be re-indexed with new embedding model for consistency",
-            "note": "This change is temporary. Update .env for permanent change."
+            "embedding_dimension": new_size,
+            "note": "This change is temporary. Update .env for a permanent change.",
         }
-    
+
+        if dimension_changes:
+            response["warning"] = (
+                "The vector collection was rebuilt for the new dimension. "
+                "Re-index your documents."
+            )
+        else:
+            response["warning"] = (
+                "Documents indexed with the previous model should be re-indexed "
+                "for consistent retrieval."
+            )
+
+        return response
+
     except HTTPException:
         raise
     except Exception as e:
@@ -203,7 +267,9 @@ async def update_vision_model(request: VisionUpdateRequest):
         settings.vision_model_id = request.model_id
         
         # Update vision service
-        from app.services.vision_service import get_image_description_service
+        from app.services.image_description_service import (
+            get_image_description_service
+        )
         vision_service = get_image_description_service()
         success = vision_service.update_model(request.model_id)
         

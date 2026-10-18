@@ -28,6 +28,8 @@ from app.api.routes import (
     query,
     task_routes,
     knowledge_base,
+    knowledge_bases,
+    chunking,
     chunk_edit,
     markdown_output,
     settings as settings_route
@@ -188,11 +190,16 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 
-# Include routers
+# Include routers.
+# chunking must be registered before chunk_edit: both live under /api/chunks,
+# and chunk_edit's "/{chunk_id}" would otherwise shadow "/preview", "/create"
+# and "/finalize".
 app.include_router(upload.router)
 app.include_router(query.router)
 app.include_router(task_routes.router)
+app.include_router(knowledge_bases.router)
 app.include_router(knowledge_base.router)
+app.include_router(chunking.router)
 app.include_router(chunk_edit.router)
 app.include_router(markdown_output.router)
 app.include_router(settings_route.router)
@@ -221,10 +228,16 @@ async def root():
         "endpoints": {
             "docs": "/docs",
             "health": "/health",
-            "upload": "/api/upload",
+            "metrics": "/metrics",
+            "upload": "/api/upload/file-upload",
+            "upload_status": "/api/upload/status/{file_id}",
+            "chunks_preview": "/api/chunks/preview",
+            "chunks_create": "/api/chunks/create",
+            "chunks_finalize": "/api/chunks/finalize",
             "query": "/api/query",
             "tasks": "/api/tasks",
-            "knowledge_base": "/api/knowledge-base"
+            "knowledge_bases": "/api/knowledge-bases",
+            "settings": "/api/settings/models"
         }
     }
 

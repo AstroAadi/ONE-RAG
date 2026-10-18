@@ -5,7 +5,8 @@ Updated: Added chunking_strategy field to FileMetadata
 """
 
 from sqlalchemy import (
-    Column, String, Integer, DateTime, Boolean, Float, Text, ForeignKey, Enum
+    Column, String, Integer, DateTime, Boolean, Float, Text, ForeignKey, Enum,
+    UniqueConstraint
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
@@ -38,6 +39,45 @@ class ChunkingStrategyEnum(str, enum.Enum):
     FIXED_SIZE = "fixed_size"
     HIERARCHICAL = "hierarchical"
     SEMANTIC = "semantic"
+    NO_CHUNKING = "no_chunking"
+
+
+class KnowledgeBase(Base):
+    """
+    Knowledge base table with user isolation
+
+    A knowledge base is a named collection of documents. Every uploaded file
+    belongs to exactly one knowledge base, and queries are scoped to one
+    knowledge base at a time.
+    """
+    __tablename__ = "knowledge_bases"
+
+    knowledge_base_id = Column(String(36), primary_key=True, index=True)
+    user_id = Column(String(100), nullable=False, index=True)
+
+    knowledge_base_name = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    updated_at = Column(DateTime, nullable=True)
+    last_accessed = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # Relationships
+    files = relationship(
+        "FileMetadata",
+        back_populates="knowledge_base",
+        cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "knowledge_base_name", name="uq_kb_user_name"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<KnowledgeBase(knowledge_base_id={self.knowledge_base_id}, "
+            f"user_id={self.user_id}, name={self.knowledge_base_name})>"
+        )
 
 
 class FileMetadata(Base):
@@ -51,6 +91,14 @@ class FileMetadata(Base):
     # Primary identifiers
     file_id = Column(String(36), primary_key=True, index=True)
     user_id = Column(String(100), nullable=False, index=True)
+
+    # Owning knowledge base
+    knowledge_base_id = Column(
+        String(36),
+        ForeignKey("knowledge_bases.knowledge_base_id", ondelete="CASCADE"),
+        nullable=True,
+        index=True
+    )
     
     # File information
     original_filename = Column(String(500), nullable=False)
@@ -64,8 +112,12 @@ class FileMetadata(Base):
     markdown_path = Column(String(1000), nullable=True)
     
     # Processing information
+    # `status` tracks the EXTRACTION phase (upload -> extract -> markdown).
+    # Chunking/indexing progress is tracked by chunks_staged / chunks_created.
     status = Column(Enum(ProcessingStatus), default=ProcessingStatus.UPLOADED, index=True)
     chunks_created = Column(Integer, default=0)
+    chunks_staged = Column(Integer, default=0)
+    indexed_at = Column(DateTime, nullable=True)
     total_pages = Column(Integer, default=0)
     
     # NEW: Chunking strategy
@@ -93,6 +145,7 @@ class FileMetadata(Base):
     
     # Relationships
     chunks = relationship("ChunkMetadata", back_populates="file", cascade="all, delete-orphan")
+    knowledge_base = relationship("KnowledgeBase", back_populates="files")
     
     def __repr__(self) -> str:
         return f"<FileMetadata(file_id={self.file_id}, user_id={self.user_id}, filename={self.original_filename})>"
@@ -102,12 +155,15 @@ class FileMetadata(Base):
         return {
             "file_id": self.file_id,
             "user_id": self.user_id,
+            "knowledge_base_id": self.knowledge_base_id,
             "original_filename": self.original_filename,
             "file_extension": self.file_extension,
             "file_type": self.file_type.value if self.file_type else None,
             "file_size_bytes": self.file_size_bytes,
             "status": self.status.value if self.status else None,
             "chunks_created": self.chunks_created,
+            "chunks_staged": self.chunks_staged,
+            "indexed_at": self.indexed_at.isoformat() if self.indexed_at else None,
             "total_pages": self.total_pages,
             "chunking_strategy": self.chunking_strategy.value if self.chunking_strategy else None,
             "target_chunk_tokens": self.target_chunk_tokens,

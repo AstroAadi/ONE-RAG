@@ -185,65 +185,110 @@ class VectorStoreService:
             raise VectorStoreException(f"Failed to initialize vector store: {str(e)}")
     
     def _initialize_collection(self):
-        """Create collection if it doesn't exist"""
+        """
+        Create the collection if missing, and reconcile its vector dimension
+        with the active embedding model.
+
+        A mismatch between the two makes every search fail with an opaque
+        Qdrant "Vector dimension error", so it is resolved here: an empty
+        collection is rebuilt at the correct size, and a populated one raises
+        with instructions rather than failing later on every request.
+        """
         try:
             collections = self.client.get_collections().collections
             collection_names = [col.name for col in collections]
-            
-            if self.collection_name not in collection_names:
-                dense_dim = self.dense_embeddings._get_embedding_dimension()
-                
-                self.client.create_collection(
-                    collection_name=self.collection_name,
-                    vectors_config={
-                        "dense": VectorParams(
-                            size=dense_dim,
-                            distance=Distance.COSINE
+
+            dense_dim = self.dense_embeddings._get_embedding_dimension()
+
+            if self.collection_name in collection_names:
+                existing_dim = self.get_dense_vector_size()
+
+                if existing_dim is not None and existing_dim != dense_dim:
+                    indexed = self.count_chunks()
+
+                    if indexed > 0:
+                        raise VectorStoreException(
+                            f"Collection '{self.collection_name}' stores "
+                            f"{existing_dim}-dimensional vectors but the active "
+                            f"embedding model '{self.dense_embeddings.model_id}' "
+                            f"produces {dense_dim}. The {indexed} indexed "
+                            f"chunk(s) would be unsearchable. Either set "
+                            f"EMBEDDING_MODEL_ID back to the model that "
+                            f"produced {existing_dim}-dimensional vectors, or "
+                            f"delete the collection and re-index."
                         )
-                    },
-                    sparse_vectors_config={
-                        "sparse": SparseVectorParams(
-                            index=SparseIndexParams()
-                        )
-                    }
-                )
-                
-                self._create_payload_indexes()
-                
-                logger.info(f"✅ Created Qdrant collection: {self.collection_name}")
-                logger.info(f"  - Dense vector size: {dense_dim}")
-            else:
-                logger.info(f"✅ Using existing Qdrant collection: {self.collection_name}")
-                
+
+                    logger.warning(
+                        f"Collection '{self.collection_name}' has dimension "
+                        f"{existing_dim} but the active model needs {dense_dim}. "
+                        f"The collection is empty, so it will be rebuilt."
+                    )
+                    self.client.delete_collection(
+                        collection_name=self.collection_name
+                    )
+                    collection_names.remove(self.collection_name)
+                else:
+                    logger.info(
+                        f"✅ Using existing Qdrant collection: "
+                        f"{self.collection_name} (dimension {existing_dim})"
+                    )
+                    # Backfill any indexes added after the collection was created
+                    self._create_payload_indexes()
+                    return
+
+            self.client.create_collection(
+                collection_name=self.collection_name,
+                vectors_config={
+                    "dense": VectorParams(
+                        size=dense_dim,
+                        distance=Distance.COSINE
+                    )
+                },
+                sparse_vectors_config={
+                    "sparse": SparseVectorParams(
+                        index=SparseIndexParams()
+                    )
+                }
+            )
+
+            self._create_payload_indexes()
+
+            logger.info(f"✅ Created Qdrant collection: {self.collection_name}")
+            logger.info(f"  - Dense vector size: {dense_dim}")
+
+        except VectorStoreException:
+            raise
         except Exception as e:
             logger.error(f"Error initializing collection: {e}", exc_info=True)
             raise VectorStoreException(f"Failed to initialize collection: {str(e)}")
     
+    # Payload fields that are filtered on and therefore need an index
+    _INDEXED_PAYLOAD_FIELDS = ("user_id", "file_id", "chunk_id", "knowledge_base_id")
+    
     def _create_payload_indexes(self):
-        """Create indexes on payload fields"""
-        try:
-            self.client.create_payload_index(
-                collection_name=self.collection_name,
-                field_name="user_id",
-                field_schema="keyword"
-            )
-            
-            self.client.create_payload_index(
-                collection_name=self.collection_name,
-                field_name="file_id",
-                field_schema="keyword"
-            )
-            
-            self.client.create_payload_index(
-                collection_name=self.collection_name,
-                field_name="chunk_id",
-                field_schema="keyword"
-            )
-            
-            logger.info("✅ Created payload indexes for user_id, file_id, and chunk_id")
-            
-        except Exception as e:
-            logger.warning(f"Could not create payload indexes: {e}")
+        """
+        Create indexes on the payload fields used for filtering.
+        
+        Each index is created independently so that an already-existing index
+        does not prevent the remaining ones from being created. This also lets
+        the method run safely against a pre-existing collection.
+        """
+        created = []
+        
+        for field_name in self._INDEXED_PAYLOAD_FIELDS:
+            try:
+                self.client.create_payload_index(
+                    collection_name=self.collection_name,
+                    field_name=field_name,
+                    field_schema="keyword"
+                )
+                created.append(field_name)
+            except Exception as e:
+                # Most commonly "index already exists" - not an error
+                logger.debug(f"Payload index for '{field_name}' not created: {e}")
+        
+        if created:
+            logger.info(f"✅ Created payload indexes for: {', '.join(created)}")
     
     def add_document_chunks(
         self,
@@ -275,6 +320,7 @@ class VectorStoreService:
                 payload = {
                     'file_id': str(metadata.get('file_id', file_id)),
                     'user_id': str(metadata.get('user_id')),
+                    'knowledge_base_id': str(metadata.get('knowledge_base_id', '')),
                     'filename': str(metadata.get('filename', filename)),
                     'chunk_type': str(metadata.get('chunk_type', 'text')),
                     'page_number': int(metadata.get('page_number', 0)),
@@ -310,6 +356,21 @@ class VectorStoreService:
             # Generate dense embeddings via API
             logger.info(f"Generating dense embeddings for {len(truncated_texts)} chunks...")
             dense_embeddings = self.dense_embeddings.embed_documents(truncated_texts)
+            
+            # The embedding service falls back to a zero vector when a call
+            # fails, which would index chunks that can never be retrieved.
+            # Refuse the write instead of reporting a false success.
+            degenerate = [
+                index for index, embedding in enumerate(dense_embeddings)
+                if not embedding or not any(embedding)
+            ]
+            if degenerate:
+                raise VectorStoreException(
+                    f"Embedding failed for {len(degenerate)} of "
+                    f"{len(dense_embeddings)} chunks (the embedding service "
+                    f"returned empty vectors). Nothing was indexed; resolve the "
+                    f"embedding error and retry."
+                )
             
             # Generate sparse embeddings
             logger.info(f"Generating sparse embeddings for {len(truncated_texts)} chunks...")
@@ -354,16 +415,17 @@ class VectorStoreService:
         top_k: int = 5,
         user_id: Optional[str] = None,
         file_id: Optional[str] = None,
-        search_type: Literal["dense", "sparse", "hybrid"] = "hybrid"
+        search_type: Literal["dense", "sparse", "hybrid"] = "hybrid",
+        knowledge_base_id: Optional[str] = None
     ) -> Tuple[List[str], List[Dict[str, Any]], List[float]]:
         """Enhanced search method"""
         try:
             if search_type == "dense":
-                results = self._dense_search(query, top_k, user_id, file_id)
+                results = self._dense_search(query, top_k, user_id, file_id, knowledge_base_id)
             elif search_type == "sparse":
-                results = self._sparse_search(query, top_k, user_id, file_id)
+                results = self._sparse_search(query, top_k, user_id, file_id, knowledge_base_id)
             else:
-                results = self._hybrid_search(query, top_k, user_id, file_id)
+                results = self._hybrid_search(query, top_k, user_id, file_id, knowledge_base_id)
             
             documents, metadatas, scores = results
             
@@ -387,12 +449,13 @@ class VectorStoreService:
         query: str,
         top_k: int,
         user_id: Optional[str] = None,
-        file_id: Optional[str] = None
+        file_id: Optional[str] = None,
+        knowledge_base_id: Optional[str] = None
     ) -> Tuple[List[str], List[Dict[str, Any]], List[float]]:
         """Dense vector search"""
         try:
             query_embedding = self.dense_embeddings.embed_query(query)
-            query_filter = self._build_filter(user_id, file_id)
+            query_filter = self._build_filter(user_id, file_id, knowledge_base_id)
             
             results = self.client.query_points(
                 collection_name=self.collection_name,
@@ -414,16 +477,17 @@ class VectorStoreService:
         query: str,
         top_k: int,
         user_id: Optional[str] = None,
-        file_id: Optional[str] = None
+        file_id: Optional[str] = None,
+        knowledge_base_id: Optional[str] = None
     ) -> Tuple[List[str], List[Dict[str, Any]], List[float]]:
         """Sparse vector search"""
         try:
             if not self.sparse_embeddings.available:
                 logger.warning("Sparse search not available, using dense")
-                return self._dense_search(query, top_k, user_id, file_id)
+                return self._dense_search(query, top_k, user_id, file_id, knowledge_base_id)
             
             query_sparse = self.sparse_embeddings.embed_query(query)
-            query_filter = self._build_filter(user_id, file_id)
+            query_filter = self._build_filter(user_id, file_id, knowledge_base_id)
             
             results = self.client.query_points(
                 collection_name=self.collection_name,
@@ -445,21 +509,22 @@ class VectorStoreService:
         query: str,
         top_k: int,
         user_id: Optional[str] = None,
-        file_id: Optional[str] = None
+        file_id: Optional[str] = None,
+        knowledge_base_id: Optional[str] = None
     ) -> Tuple[List[str], List[Dict[str, Any]], List[float]]:
         """Hybrid search using RRF"""
         try:
             if not self.sparse_embeddings.available:
-                return self._dense_search(query, top_k, user_id, file_id)
+                return self._dense_search(query, top_k, user_id, file_id, knowledge_base_id)
             
             retrieval_k = min(top_k * 3, 50)
             
             dense_docs, dense_metas, dense_scores = self._dense_search(
-                query, retrieval_k, user_id, file_id
+                query, retrieval_k, user_id, file_id, knowledge_base_id
             )
             
             sparse_docs, sparse_metas, sparse_scores = self._sparse_search(
-                query, retrieval_k, user_id, file_id
+                query, retrieval_k, user_id, file_id, knowledge_base_id
             )
             
             fused_results = self._reciprocal_rank_fusion(
@@ -528,7 +593,9 @@ class VectorStoreService:
     def _build_filter(
         self,
         user_id: Optional[str] = None,
-        file_id: Optional[str] = None
+        file_id: Optional[str] = None,
+        knowledge_base_id: Optional[str] = None,
+        chunk_id: Optional[str] = None
     ) -> Optional[Filter]:
         """Build Qdrant filter"""
         must_conditions = []
@@ -541,6 +608,19 @@ class VectorStoreService:
         if file_id:
             must_conditions.append(
                 FieldCondition(key="file_id", match=MatchValue(value=file_id))
+            )
+        
+        if knowledge_base_id:
+            must_conditions.append(
+                FieldCondition(
+                    key="knowledge_base_id",
+                    match=MatchValue(value=knowledge_base_id)
+                )
+            )
+        
+        if chunk_id:
+            must_conditions.append(
+                FieldCondition(key="chunk_id", match=MatchValue(value=chunk_id))
             )
         
         if must_conditions:
@@ -609,14 +689,260 @@ class VectorStoreService:
             logger.error(f"Error deleting document: {str(e)}")
             raise VectorStoreException(f"Failed to delete document: {str(e)}")
     
-    def get_collection_stats(self, user_id: Optional[str] = None) -> Dict[str, Any]:
-        """Get collection statistics"""
+    def get_dense_vector_size(self) -> Optional[int]:
+        """
+        The dense vector dimension the collection was created with.
+
+        Returns None if it cannot be determined. Used to reject an embedding
+        model switch that would produce vectors the collection cannot store.
+        """
         try:
-            query_filter = None
-            if user_id:
-                query_filter = Filter(
-                    must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))]
+            info = self.client.get_collection(collection_name=self.collection_name)
+            vectors = info.config.params.vectors
+
+            # Named vector configs come back as a dict
+            if isinstance(vectors, dict):
+                dense = vectors.get("dense")
+                return int(dense.size) if dense is not None else None
+
+            return int(vectors.size) if vectors is not None else None
+
+        except Exception as e:
+            logger.warning(f"Could not read collection vector size: {e}")
+            return None
+
+    def count_chunks(self, user_id: Optional[str] = None) -> int:
+        """Number of indexed chunks, optionally for a single user."""
+        try:
+            result = self.client.count(
+                collection_name=self.collection_name,
+                count_filter=self._build_filter(user_id=user_id),
+                exact=True,
+            )
+            return int(result.count)
+        except Exception as e:
+            logger.warning(f"Could not count chunks: {e}")
+            return 0
+
+    def delete_by_knowledge_base(
+        self,
+        knowledge_base_id: str,
+        user_id: Optional[str] = None
+    ) -> int:
+        """
+        Delete every chunk belonging to a knowledge base.
+
+        Returns the number of deleted points (0 if the KB had no chunks).
+        """
+        try:
+            query_filter = self._build_filter(
+                user_id=user_id,
+                knowledge_base_id=knowledge_base_id
+            )
+
+            deleted = 0
+            while True:
+                points, _ = self.client.scroll(
+                    collection_name=self.collection_name,
+                    scroll_filter=query_filter,
+                    limit=1000,
+                    with_payload=False,
+                    with_vectors=False
                 )
+
+                if not points:
+                    break
+
+                self.client.delete(
+                    collection_name=self.collection_name,
+                    points_selector=[point.id for point in points]
+                )
+                deleted += len(points)
+
+            logger.info(
+                f"Deleted {deleted} chunks for knowledge base {knowledge_base_id}"
+            )
+            return deleted
+
+        except Exception as e:
+            logger.error(f"Error deleting knowledge base chunks: {str(e)}")
+            raise VectorStoreException(
+                f"Failed to delete knowledge base chunks: {str(e)}"
+            )
+
+    def get_chunk_by_id(
+        self,
+        chunk_id: str,
+        user_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Retrieve a single chunk with its full text and metadata.
+
+        The point ID in Qdrant is a UUID derived from the chunk_id, so the
+        lookup is a direct retrieve rather than a scan. The user_id is still
+        verified against the payload so one user cannot read another's chunk.
+
+        Returns None when the chunk does not exist or is not owned by user_id.
+        """
+        try:
+            point_uuid = string_to_uuid(chunk_id)
+
+            points = self.client.retrieve(
+                collection_name=self.collection_name,
+                ids=[point_uuid],
+                with_payload=True,
+                with_vectors=False
+            )
+
+            if not points:
+                return None
+
+            payload = points[0].payload or {}
+
+            # Enforce user isolation
+            if user_id and str(payload.get('user_id', '')) != str(user_id):
+                logger.warning(
+                    f"Access denied for chunk {chunk_id}: owner mismatch"
+                )
+                return None
+
+            text = payload.get('text', '')
+
+            reserved = {
+                'text', 'chunk_id', 'file_id', 'user_id', 'filename',
+                'chunk_type', 'page_number', 'chunk_index', 'created_at',
+                'updated_at', 'edited'
+            }
+
+            return {
+                'chunk_id': str(payload.get('chunk_id', chunk_id)),
+                'file_id': str(payload.get('file_id', 'unknown')),
+                'text': text,
+                'filename': str(payload.get('filename', 'unknown')),
+                'user_id': str(payload.get('user_id', user_id or 'unknown')),
+                'chunk_type': str(payload.get('chunk_type', 'text')),
+                'page_number': int(payload.get('page_number', 0) or 0),
+                'char_count': len(text),
+                'chunk_index': int(payload.get('chunk_index', 0) or 0),
+                'created_at': str(payload.get('created_at', '')),
+                'updated_at': payload.get('updated_at'),
+                'edited': bool(payload.get('edited', False)),
+                'metadata': {
+                    key: value for key, value in payload.items()
+                    if key not in reserved
+                }
+            }
+
+        except Exception as e:
+            logger.error(f"Error retrieving chunk {chunk_id}: {str(e)}")
+            raise VectorStoreException(f"Failed to retrieve chunk: {str(e)}")
+
+    def update_chunk(
+        self,
+        chunk_id: str,
+        file_id: str,
+        new_text: str,
+        user_id: str,
+        preserve_metadata: bool = True
+    ) -> bool:
+        """
+        Replace a chunk's text and re-embed it in place.
+
+        The point keeps its ID, so the chunk stays addressable and all
+        references to it remain valid. Both dense and sparse vectors are
+        regenerated so search stays consistent with the new text.
+        """
+        if not new_text or not new_text.strip():
+            raise VectorStoreException("Cannot update a chunk to empty text")
+
+        try:
+            existing = self.get_chunk_by_id(chunk_id=chunk_id, user_id=user_id)
+
+            if not existing:
+                logger.warning(f"Chunk not found for update: {chunk_id}")
+                return False
+
+            if existing['file_id'] != file_id:
+                raise VectorStoreException(
+                    f"Chunk {chunk_id} belongs to file {existing['file_id']}, "
+                    f"not {file_id}"
+                )
+
+            point_uuid = string_to_uuid(chunk_id)
+
+            # Rebuild the payload
+            if preserve_metadata:
+                payload = dict(existing['metadata'])
+            else:
+                payload = {}
+
+            payload.update({
+                'chunk_id': chunk_id,
+                'file_id': file_id,
+                'user_id': user_id,
+                'filename': existing['filename'],
+                'chunk_type': existing['chunk_type'],
+                'page_number': existing['page_number'],
+                'chunk_index': existing['chunk_index'],
+                'created_at': existing['created_at'] or datetime.utcnow().isoformat(),
+                'updated_at': datetime.utcnow().isoformat(),
+                'edited': True,
+                'text': new_text
+            })
+
+            # Re-embed, truncating to the embedding model's limit
+            truncated = new_text[:settings.embedding_max_length]
+
+            dense_embedding = self.dense_embeddings.embed_documents([truncated])[0]
+
+            # A zero vector means the embedding call failed; overwriting the
+            # stored vector with it would silently make the chunk unretrievable.
+            if not dense_embedding or not any(dense_embedding):
+                raise VectorStoreException(
+                    "Embedding failed for the edited text (the embedding "
+                    "service returned an empty vector). The chunk was left "
+                    "unchanged; resolve the embedding error and retry."
+                )
+
+            sparse_embedding = self.sparse_embeddings.embed_documents([truncated])[0]
+
+            self.client.upsert(
+                collection_name=self.collection_name,
+                points=[
+                    PointStruct(
+                        id=point_uuid,
+                        vector={
+                            "dense": dense_embedding,
+                            "sparse": sparse_embedding
+                        },
+                        payload=payload
+                    )
+                ]
+            )
+
+            logger.info(
+                f"✅ Updated chunk {chunk_id} "
+                f"({existing['char_count']} -> {len(new_text)} chars)"
+            )
+            return True
+
+        except VectorStoreException:
+            raise
+        except Exception as e:
+            logger.error(f"Error updating chunk {chunk_id}: {str(e)}", exc_info=True)
+            raise VectorStoreException(f"Failed to update chunk: {str(e)}")
+
+    def get_collection_stats(
+        self,
+        user_id: Optional[str] = None,
+        knowledge_base_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Get collection statistics, optionally scoped to one knowledge base"""
+        try:
+            query_filter = self._build_filter(
+                user_id=user_id,
+                knowledge_base_id=knowledge_base_id
+            )
             
             all_points = []
             offset = None

@@ -8,10 +8,13 @@ Knowledge Base Management Route with USER ISOLATION
 from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.orm import Session
 
-from app.models.schemas import KnowledgeBaseStatus, DocumentInfo
+from app.models.schemas import UserDocumentsResponse, DocumentInfo
 from app.services.vector_store_service import VectorStoreService
+from app.services.chunk_staging_service import delete_user_staging
 from app.core.dependencies import get_user_id, get_database_session
-from app.db.models import FileMetadata, ChunkMetadata, ConversationHistory, QueryLog
+from app.db.models import (
+    FileMetadata, ChunkMetadata, ConversationHistory, QueryLog, KnowledgeBase
+)
 from pathlib import Path
 from app.core.config import settings
 import logging
@@ -24,60 +27,58 @@ router = APIRouter(prefix="/api/knowledge-base", tags=["Knowledge Base"])
 vector_store = VectorStoreService()
 
 
-@router.get("/status", response_model=KnowledgeBaseStatus)
-async def get_knowledge_base_status(
+@router.get("/status", response_model=UserDocumentsResponse)
+async def get_all_user_documents(
     user_id: str = Depends(get_user_id),
     db: Session = Depends(get_database_session)
 ):
     """
-    Get current status of the knowledge base for current user
-    
+    List every document the current user owns, across all knowledge bases.
+
+    For a single knowledge base use GET /api/knowledge-bases/{kb_id} instead.
+
     Headers:
         X-User-ID: User identifier (REQUIRED)
-    
-    Returns:
-    - Total number of documents (user-specific)
-    - Total number of chunks (user-specific)
-    - List of documents with their IDs
     """
     try:
-        # Get user's files from database
         files = db.query(FileMetadata).filter(
             FileMetadata.user_id == user_id
-        ).all()
-        
-        # Get vector store stats (user-specific)
-        vector_stats = vector_store.get_collection_stats(user_id=user_id)
-        
-        # Build document list
-        documents = []
-        for file in files:
-            documents.append(DocumentInfo(
+        ).order_by(FileMetadata.uploaded_at.desc()).all()
+
+        documents = [
+            DocumentInfo(
                 file_id=file.file_id,
+                knowledge_base_id=file.knowledge_base_id,
                 filename=file.safe_filename,
                 file_type=file.file_extension,
                 file_size_bytes=file.file_size_bytes,
-                status=file.status,
-                chunks_created=file.chunks_created,
-                total_pages=file.total_pages,
+                status=file.status.value if file.status else "uploaded",
+                chunks_created=file.chunks_created or 0,
+                chunks_staged=file.chunks_staged or 0,
+                total_pages=file.total_pages or 0,
                 uploaded_at=file.uploaded_at,
                 processed_at=file.processed_at,
-                word_count=file.word_count,
-                image_count=file.image_count,
-                table_count=file.table_count
-            ))
-        
-        return KnowledgeBaseStatus(
-            total_documents=len(files),
-            total_chunks=vector_stats.get('total_chunks', 0),
+                word_count=file.word_count or 0,
+                image_count=file.image_count or 0,
+                table_count=file.table_count or 0,
+                chunking_strategy=(
+                    file.chunking_strategy.value if file.chunking_strategy else None
+                ),
+            )
+            for file in files
+        ]
+
+        return UserDocumentsResponse(
+            user_id=user_id,
+            total_documents=len(documents),
             documents=documents
         )
     
     except Exception as e:
-        logger.error(f"Error retrieving knowledge base status: {e}")
+        logger.error(f"Error retrieving user documents: {e}")
         raise HTTPException(
             status_code=500,
-            detail=f"Error retrieving knowledge base status: {str(e)}"
+            detail=f"Error retrieving user documents: {str(e)}"
         )
 
 
@@ -177,7 +178,8 @@ async def reset_user_knowledge_base(
             "chunks_vector": 0,
             "chunks_db": 0,
             "conversations": 0,
-            "query_logs": 0
+            "query_logs": 0,
+            "knowledge_bases": 0
         }
         
         # 1. Get all user's files (for vector store & disk deletion)
@@ -241,16 +243,30 @@ async def reset_user_knowledge_base(
         deleted_counts["query_logs"] = query_count
         logger.info(f"✓ Deleted {query_count} query logs")
         
-        # 7. Delete file metadata (last)
+        # 7. Delete file metadata
         file_count = db.query(FileMetadata).filter(
             FileMetadata.user_id == user_id
         ).delete(synchronize_session=False)
         logger.info(f"✓ Deleted {file_count} file metadata records")
         
+        # 8. Delete the knowledge bases themselves (files are already gone)
+        kb_count = db.query(KnowledgeBase).filter(
+            KnowledgeBase.user_id == user_id
+        ).delete(synchronize_session=False)
+        deleted_counts["knowledge_bases"] = kb_count
+        logger.info(f"✓ Deleted {kb_count} knowledge bases")
+        
         # Commit everything
         db.commit()
         
-        # 8. Cleanup user directories
+        # 9. Drop any chunks staged but never finalized
+        try:
+            delete_user_staging(user_id)
+            logger.info("✓ Deleted staged chunks")
+        except Exception as e:
+            logger.warning(f"Error deleting staged chunks: {e}")
+        
+        # 10. Cleanup user directories
         try:
             user_upload_dir = Path(settings.upload_dir) / user_id
             if user_upload_dir.exists() and user_upload_dir.is_dir():
@@ -267,14 +283,15 @@ async def reset_user_knowledge_base(
             logger.warning(f"Error cleaning up directories: {e}")
         
         message = (
-            f"Knowledge base reset successfully for user {user_id}.\n"
+            f"All data reset successfully for user {user_id}.\n"
             f"Deleted:\n"
             f"  • {deleted_counts['files']} files from disk\n"
             f"  • {deleted_counts['chunks_vector']} chunks from vector store\n"
             f"  • {deleted_counts['chunks_db']} chunk records from database\n"
             f"  • {deleted_counts['conversations']} conversation messages\n"
             f"  • {deleted_counts['query_logs']} query logs\n"
-            f"  • {file_count} file metadata records"
+            f"  • {file_count} file metadata records\n"
+            f"  • {deleted_counts['knowledge_bases']} knowledge bases"
         )
         
         return {

@@ -52,15 +52,19 @@ class Settings(BaseSettings):
     # )
 
     llm_model_id: str = Field(
-        default="meta-llama/Meta-Llama-3-8B-Instruct",
+        default="meta-llama/Llama-3.1-8B-Instruct",
         description="Chat model ID from HuggingFace"
     )
     
+    # Models currently routable through HuggingFace Inference Providers.
+    # The older Meta-Llama-3 / Mistral-v0.2 / zephyr ids are no longer served
+    # and return "not supported by any provider you have enabled".
     available_llm_models: list = Field(
         default=[
-            "meta-llama/Meta-Llama-3-8B-Instruct",
+            "meta-llama/Llama-3.1-8B-Instruct",
+            "meta-llama/Llama-3.3-70B-Instruct",
+            "Qwen/Qwen2.5-72B-Instruct",
             "mistralai/Mistral-7B-Instruct-v0.2",
-            "HuggingFaceH4/zephyr-7b-beta"  # Works better than Gemma with API
         ],
         description="Available LLM models"
     )
@@ -101,6 +105,18 @@ class Settings(BaseSettings):
         ge=128,
         le=8192,
         description="Max tokens for embedding model"
+    )
+    
+    # Where dense embeddings are computed:
+    #   "auto"  - use the hosted API, fall back to local if it rejects us
+    #             (no credits, bad token, model not served)
+    #   "local" - always run the model in-process via sentence-transformers
+    #   "api"   - always use the hosted HuggingFace Inference API
+    # Both backends run the same model id, so switching does not require
+    # re-indexing existing documents.
+    embedding_backend: Literal["auto", "local", "api"] = Field(
+        default="auto",
+        description="Dense embedding backend: auto, local, or api"
     )
     
     
@@ -421,7 +437,8 @@ def print_configuration_summary():
     
     print(f"\n🤖 Models:")
     print(f"  - Chat/LLM: {settings.llm_model_id}")
-    print(f"  - Embedding: {settings.embedding_model_id}")
+    print(f"  - Embedding: {settings.embedding_model_id} "
+          f"(backend: {settings.embedding_backend})")
     print(f"  - Vision: {settings.vision_model_id}")
     
     print(f"\n⚡ Concurrency Settings:")
